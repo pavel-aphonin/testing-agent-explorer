@@ -1,0 +1,52 @@
+=== App Explorer Report ===
+App: org.reactjs.native.example.TestApp
+Screens discovered: 10
+Transitions recorded: 33
+Total actions: 33
+
+--- Screens ---
+  [ccb6591b] Вход (3 interactive, visited 2x)
+  [e49cb524] Профиль (4 interactive, visited 31x)
+  [fd71ee57] Вход (3 interactive, visited 18x)
+  [078569a4] Профиль (7 interactive, visited 82x)
+  [e2fd4cfc] Настройки (5 interactive, visited 8x)
+  [3704b4bc] TestApp (2 interactive, visited 0x)
+  [d05c7d71] TestApp (1 interactive, visited 0x)
+  [6f5dc6fd] TestApp (2 interactive, visited 0x)
+  [9e4261ab] TestApp (1 interactive, visited 0x)
+  [4f53cda1] (unnamed) (0 interactive, visited 908x)
+
+--- Transitions ---
+  Вход --(input [valid])--> Профиль [OK]
+  Профиль --(Вход)--> Вход [OK]
+  Вход --(input [valid])--> Профиль [OK]
+  Профиль --(Редактировать)--> Профиль [OK]
+  Профиль --(Вход)--> Вход [OK]
+  Вход --(input [valid])--> Профиль [OK]
+  Профиль --(Настройки)--> Настройки [OK]
+  Настройки --(Профиль)--> Профиль [OK]
+  Профиль --(Удалить аккаунт)--> TestApp [OK]
+  TestApp --(Отмена)--> Профиль [OK]
+  Профиль --(input [valid])--> Вход [OK]
+  Вход --(input [valid])--> Профиль [OK]
+  Профиль --(input [valid])--> Вход [OK]
+  Вход --(input [valid])--> Профиль [OK]
+  Настройки --(Русский)--> Настройки [OK]
+  Настройки --(English)--> Настройки [OK]
+  Настройки --(Очистить кэш)--> TestApp [OK]
+  TestApp --(OK)--> Настройки [OK]
+  Настройки --(Выйти из аккаунта)--> TestApp [OK]
+  TestApp --(Отмена)--> Настройки [OK]
+  Профиль --(Сохранить)--> TestApp [OK]
+  TestApp --(OK)--> Профиль [OK]
+  Профиль --(Отмена)--> Профиль [OK]
+  Вход --(Войти)--> Профиль [OK]
+  Профиль --(Настройки)--> Настройки [OK]
+  Вход --(input [valid])--> Профиль [OK]
+  Вход --(input [valid])--> Профиль [OK]
+  Вход --(input [valid])--> Профиль [OK]
+  Вход --(input [valid])--> Профиль [OK]
+  Вход --(input [valid])--> Профиль [OK]
+  Вход --(input [valid])--> Профиль [OK]
+  Вход --(input [valid])--> Профиль [OK]
+  Вход --(input [valid])--> Профиль [OK]

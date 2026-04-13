@@ -1,0 +1,10 @@
+=== App Explorer Report ===
+App: org.reactjs.native.example.TestApp
+Screens discovered: 1
+Transitions recorded: 0
+Total actions: 0
+
+--- Screens ---
+  [1dd441f2] (unnamed) (0 interactive, visited 0x)
+
+--- Transitions ---

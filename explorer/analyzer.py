@@ -1,7 +1,7 @@
 """Element classification: convert raw accessibility elements to typed snapshots."""
 
 from explorer.models import ElementKind, ElementSnapshot, ScreenNode
-from explorer.screen_id import KEYBOARD_TYPES, compute_screen_id
+from explorer.screen_id import KEYBOARD_TYPES, SKIP_TYPES, compute_screen_id
 
 # Mapping from iOS accessibility types to ElementKind
 IOS_TYPE_MAP: dict[str, ElementKind] = {
@@ -120,6 +120,29 @@ def analyze_screen(
                     break
     if not name:
         name = app_label or ""
+
+    # Improve naming for popup/alert screens:
+    # If we have few interactive elements (1-3) and the name is just the
+    # app label, this is likely a popup/alert. Use button labels to make
+    # the name more descriptive: "TestApp" → "Диалог: OK" or
+    # "Диалог: Удалить / Отмена"
+    if name == app_label and 0 < len(interactive) <= 3:
+        btn_labels = [s.label for s in interactive if s.label]
+        if btn_labels:
+            name = f"Диалог: {' / '.join(btn_labels)}"
+
+    # For screens with text fields (forms), add context:
+    # If screen has both text fields AND buttons, and name matches
+    # a known screen, append the editable field count to distinguish
+    # view vs edit mode
+    text_field_count = sum(1 for s in interactive if s.kind == ElementKind.TEXT_FIELD)
+    button_count = sum(1 for s in interactive if s.kind == ElementKind.BUTTON or s.element_type == "GenericElement")
+    if text_field_count > 0 and name:
+        # Check if buttons suggest edit mode
+        edit_buttons = [s for s in interactive if s.label and s.label.lower() in
+                        ("сохранить", "save", "отмена", "cancel", "применить", "apply")]
+        if edit_buttons:
+            name = f"{name} (ред.)"
 
     return ScreenNode(
         screen_id=screen_id,

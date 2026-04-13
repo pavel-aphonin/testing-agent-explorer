@@ -1,0 +1,25 @@
+=== App Explorer Report ===
+App: org.reactjs.native.example.TestApp
+Screens discovered: 6
+Transitions recorded: 10
+Total actions: 10
+
+--- Screens ---
+  [fd71ee57] Вход (3 interactive, visited 3x)
+  [00a48bb5] TestApp (1 interactive, visited 0x)
+  [e49cb524] Профиль (4 interactive, visited 2x)
+  [078569a4] Профиль (7 interactive, visited 0x)
+  [e2fd4cfc] Настройки (5 interactive, visited 0x)
+  [6f5dc6fd] TestApp (2 interactive, visited 0x)
+
+--- Transitions ---
+  Вход --(Войти)--> TestApp [OK]
+  TestApp --(OK)--> Вход [OK]
+  Вход --(input [valid])--> Профиль [OK]
+  Профиль --(Вход)--> Вход [OK]
+  Вход --(input [valid])--> Профиль [OK]
+  Профиль --(Редактировать)--> Профиль [OK]
+  Профиль --(Вход)--> Вход [OK]
+  Вход --(input [valid])--> Профиль [OK]
+  Профиль --(Настройки)--> Настройки [OK]
+  Настройки --(Выйти из аккаунта)--> TestApp [OK]

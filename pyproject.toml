@@ -16,6 +16,15 @@ dependencies = [
 [project.scripts]
 explorer = "explorer.cli:app"
 
+[tool.pytest.ini_options]
+# Auto mode removes the need for @pytest.mark.asyncio on every test in
+# the new integration file (and works fine for the existing tests which
+# already have the explicit marker).
+asyncio_mode = "auto"
+markers = [
+    "integration: full-mesh tests that talk to a running backend (auto-skipped if down)",
+]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

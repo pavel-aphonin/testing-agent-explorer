@@ -1,4 +1,31 @@
-"""Main exploration engine: random walk with memory."""
+"""Main exploration engine: PUCT-driven local selection + Go-Explore frontier.
+
+The engine plays the role of an "online MCTS player" against the simulator.
+On every step it:
+
+    1. Asks the PUCT selector which unexplored element on the current screen
+       has the highest score (Q + c_puct * prior * sqrt(N) / (1 + N(s,a))).
+    2. Executes that action via the controller.
+    3. Captures the resulting screen and updates the graph.
+    4. Backs up the PUCT statistics with reward = 1 if the action discovered
+       a brand-new screen, else 0.
+    5. Tells the Go-Explore archive about the new (visit_count, unexplored)
+       state of both the source and target screens.
+
+When the current screen has no unexplored actions left, the engine queries
+the archive for the highest-scoring *frontier* state anywhere in the app
+and uses the navigator to walk back there. This is the global counterpart
+to PUCT's local greediness.
+
+The mode (MC, AI, Hybrid) is just a different ModeConfig — the loop body
+is identical. AI/Hybrid runs may pass a `prior_provider` callable that the
+engine consults whenever a new screen is registered, to seed PUCT priors
+from an LLM. MC runs leave it None and PUCT falls back to uniform priors.
+
+The engine also accepts an `event_callback` for live progress streaming.
+The worker passes its own callback that POSTs each event to the backend's
+internal API; CLI / tests can pass any callable or None.
+"""
 
 from __future__ import annotations
 
@@ -7,9 +34,12 @@ import logging
 import random
 from datetime import datetime
 from pathlib import Path
+from typing import Awaitable, Callable
 
 from explorer.analyzer import analyze_screen
 from explorer.form_filler import FormFiller
+from explorer.go_explore import GoExploreArchive
+from explorer.mcts import PUCTSelector
 from explorer.models import (
     ActionDetail,
     ActionType,
@@ -19,6 +49,7 @@ from explorer.models import (
     GraphEdge,
     ScreenNode,
 )
+from explorer.modes import ExplorationMode, ModeConfig, get_mode_config
 from explorer.navigator import (
     SETTLE_DELAY,
     find_nearest_unexplored,
@@ -28,8 +59,30 @@ from explorer.screen_id import compute_screen_id
 
 logger = logging.getLogger("explorer.engine")
 
-# Max consecutive same-screen detections before declaring stuck
-MAX_STUCK_COUNT = 10
+# Max consecutive same-screen detections before declaring stuck.
+# Was 10, but that wastes too many steps on self-loops. 3 is enough:
+# by the third self-loop, the action is clearly not leading anywhere.
+MAX_STUCK_COUNT = 3
+
+# Type aliases for the optional engine callbacks.
+PriorProvider = Callable[[ScreenNode], "dict[str, float] | Awaitable[dict[str, float]]"]
+EventCallback = Callable[[dict], "None | Awaitable[None]"]
+
+
+def action_id_for(element: ElementSnapshot) -> str:
+    """Stable PUCT action identifier for an element on a screen.
+
+    Matches the signature format that AppGraph.get_unexplored_actions uses
+    internally so that "is this action explored?" agrees between the graph
+    edge log and the PUCT visit table.
+    """
+    frame_key = ""
+    if element.frame:
+        frame_key = (
+            f"{int(element.frame.get('x', 0))},"
+            f"{int(element.frame.get('y', 0))}"
+        )
+    return f"tap|{element.label or ''}|{element.test_id or ''}|{frame_key}"
 
 
 class ExplorationEngine:
@@ -46,15 +99,34 @@ class ExplorationEngine:
         app_bundle_id: str,
         output_dir: str = "explorer_output",
         resume_from: str | None = None,
+        mode: ExplorationMode | str = ExplorationMode.HYBRID,
+        max_steps: int = 200,
+        prior_provider: PriorProvider | None = None,
+        event_callback: EventCallback | None = None,
     ):
         self.controller = controller
         self.app_bundle_id = app_bundle_id
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+        self.mode_config: ModeConfig = get_mode_config(mode)
+        self.max_steps = max_steps
+        self.prior_provider = prior_provider
+        self.event_callback = event_callback
+
         self.form_filler = FormFiller()
         self.current_screen_id: str | None = None
         self._stuck_count = 0
+        self.step_idx = 0
+
+        # PUCT selector and Go-Explore archive are the brains of the loop.
+        # Both are stateful and live for the duration of one engine run.
+        self.puct = PUCTSelector(c_puct=self.mode_config.c_puct)
+        self.archive = GoExploreArchive()
+
+        # action_id -> ElementSnapshot for the *current* screen, rebuilt
+        # each time we land on a new screen. PUCT only knows about IDs.
+        self._action_id_to_element: dict[str, ElementSnapshot] = {}
 
         if resume_from:
             self.graph = AppGraph.load(resume_from)
@@ -63,9 +135,20 @@ class ExplorationEngine:
             self.graph = AppGraph(app_bundle_id=app_bundle_id)
 
     async def run(self) -> AppGraph:
-        """Run the exploration loop until all screens are fully explored."""
+        """Run the PUCT + Go-Explore loop until all frontiers are exhausted.
+
+        Stops when one of the following holds:
+            - max_steps reached;
+            - the current screen has no unexplored actions AND
+              the Go-Explore archive has no remaining frontier states.
+        """
         print(f"\n>>> Starting exploration of {self.app_bundle_id}")
-        logger.info(f"Starting exploration of {self.app_bundle_id}")
+        logger.info(
+            f"Starting exploration of {self.app_bundle_id} "
+            f"(mode={self.mode_config.mode}, c_puct={self.mode_config.c_puct}, "
+            f"max_steps={self.max_steps})"
+        )
+        await self._emit_status("running")
 
         # App is already launched by Appium session. Just wait for UI to settle.
         print(">>> Waiting for app to settle (2s)...")
@@ -73,8 +156,9 @@ class ExplorationEngine:
 
         print(">>> Capturing initial screen...")
         initial_node = await self._capture_screen()
-        self.graph.add_node(initial_node)
+        is_new = self.graph.add_node(initial_node)
         self.current_screen_id = initial_node.screen_id
+        await self._on_screen_landed(initial_node, is_new=is_new, step=0)
         self._save_checkpoint()
 
         print(
@@ -88,79 +172,330 @@ class ExplorationEngine:
             f"({len(initial_node.interactive_elements)} interactive elements)"
         )
 
-        step = 0
-        while True:
-            step += 1
-            unexplored_screens = self.graph.get_screens_with_unexplored()
+        try:
+            while self.step_idx < self.max_steps:
+                self.step_idx += 1
+                step = self.step_idx
 
-            if not unexplored_screens:
-                logger.info("All screens fully explored!")
-                break
+                # Dismiss system popups (Save Password, Allow Notifications,
+                # etc.) BEFORE doing anything else. These create spurious
+                # self-loops and inflate stuck count.
+                await self._dismiss_system_popup()
 
-            # Check if current screen has unexplored actions
-            unexplored = self.graph.get_unexplored_actions(self.current_screen_id)
+                unexplored = self.graph.get_unexplored_actions(self.current_screen_id)
 
-            if not unexplored:
-                # Navigate to nearest screen with unexplored actions
-                target_id = find_nearest_unexplored(
-                    self.graph, self.current_screen_id
-                )
-                if not target_id:
-                    logger.info("No reachable unexplored screens. Done.")
-                    break
-
-                logger.info(
-                    f"[Step {step}] Navigating to screen with unexplored actions: "
-                    f"{target_id[:8]}"
-                )
-                result = await go_back_to_screen(
-                    self.controller,
-                    self.graph,
-                    self.current_screen_id,
-                    target_id,
-                    self._capture_screen_id,
-                )
-                if result:
-                    self.current_screen_id = result
-                else:
-                    logger.warning("Navigation failed, trying next screen")
+                if not unexplored:
+                    # No local frontier — ask Go-Explore for the global best.
+                    frontier = self.archive.best_frontier(
+                        exclude_current=self.current_screen_id
+                    )
+                    if frontier is None:
+                        logger.info("No frontier remaining anywhere. Done.")
+                        break
+                    logger.info(
+                        f"[Step {step}] Local frontier exhausted; "
+                        f"navigating to {frontier.state_id[:8]} "
+                        f"(unexplored={frontier.unexplored_count}, "
+                        f"visits={frontier.visit_count})"
+                    )
+                    result = await go_back_to_screen(
+                        self.controller,
+                        self.graph,
+                        self.current_screen_id,
+                        frontier.state_id,
+                        self._capture_screen_id,
+                    )
+                    if result:
+                        self.current_screen_id = result
+                        # Re-register and refresh archive after the jump.
+                        if result in self.graph.nodes:
+                            await self._on_screen_landed(
+                                self.graph.nodes[result], is_new=False, step=step
+                            )
+                    else:
+                        logger.warning(
+                            f"[Step {step}] Navigation to "
+                            f"{frontier.state_id[:8]} failed; will retry"
+                        )
                     continue
-                continue
 
-            # Prioritize buttons/switches over text fields
-            # (text fields need form-filling logic, buttons are simpler to explore)
-            buttons = [e for e in unexplored if e.kind != ElementKind.TEXT_FIELD]
-            if buttons:
-                element = random.choice(buttons)
-            else:
-                element = random.choice(unexplored)
-            print(
-                f"\n>>> [Step {step}] Screen: {self._screen_name()}, "
-                f"Action: {element.kind} on {element.label!r}, "
-                f"Remaining: {len(unexplored)-1} unexplored on this screen"
-            )
+                # Local frontier exists — pick an action via PUCT, restricted
+                # to the still-unexplored elements on this screen.
+                action_id = self._select_action(self.current_screen_id, unexplored)
+                if action_id is None:
+                    # Defensive: PUCT doesn't know about this screen for some
+                    # reason. Re-register and retry on the next iteration.
+                    logger.warning(
+                        f"[Step {step}] PUCT returned no action despite "
+                        f"{len(unexplored)} unexplored — re-registering"
+                    )
+                    self._register_screen_with_puct(self.graph.nodes[self.current_screen_id])
+                    continue
 
-            if element.kind == ElementKind.TEXT_FIELD:
-                await self._explore_text_field(element)
-            else:
-                await self._explore_tap(element)
+                element = self._action_id_to_element.get(action_id)
+                if element is None:
+                    # Out-of-sync: rebuild the element map and retry.
+                    self._rebuild_action_map(self.graph.nodes[self.current_screen_id])
+                    element = self._action_id_to_element.get(action_id)
+                    if element is None:
+                        logger.error(
+                            f"[Step {step}] Cannot resolve action {action_id}"
+                        )
+                        break
 
-            # Stuck detection
-            if self._stuck_count >= MAX_STUCK_COUNT:
-                logger.warning(
-                    f"Stuck on screen {self.current_screen_id[:8]} "
-                    f"for {MAX_STUCK_COUNT} steps. Marking remaining as explored."
+                print(
+                    f"\n>>> [Step {step}/{self.max_steps}] "
+                    f"Screen: {self._screen_name()}, "
+                    f"Action: {element.kind} on {element.label!r}, "
+                    f"Remaining unexplored: {len(unexplored) - 1}"
                 )
-                self._mark_screen_fully_explored(self.current_screen_id)
-                self._stuck_count = 0
 
+                before_screen = self.current_screen_id
+                known_before: set[str] = set(self.graph.nodes.keys())
+
+                if element.kind == ElementKind.TEXT_FIELD:
+                    await self._explore_text_field(element)
+                else:
+                    await self._explore_tap(element)
+
+                after_screen = self.current_screen_id
+                is_new_screen = (
+                    after_screen != before_screen and after_screen not in known_before
+                )
+
+                # PUCT backup:
+                #   +1.0  discovered a brand-new screen (excellent)
+                #   +0.2  reached a known but different screen (some value)
+                #   -0.5  self-loop: action brought us back to the same screen
+                #         (strong penalty to discourage re-trying)
+                if is_new_screen:
+                    reward = 1.0
+                elif after_screen != before_screen:
+                    reward = 0.2
+                else:
+                    reward = -0.5
+                self.puct.backup(before_screen, action_id, reward)
+
+                # Re-register the new screen with PUCT and update the archive
+                # for both endpoints. The source screen now has one fewer
+                # unexplored action; the target screen may be brand new.
+                if after_screen in self.graph.nodes:
+                    target_node = self.graph.nodes[after_screen]
+                    await self._on_screen_landed(target_node, is_new=is_new_screen, step=step)
+                self._update_archive_for(before_screen)
+
+                # Edge event: the worker writes this to Postgres + Redis.
+                await self._emit_edge(
+                    step=step,
+                    source=before_screen,
+                    target=after_screen,
+                    action_type=ActionType.TAP if element.kind != ElementKind.TEXT_FIELD else ActionType.INPUT,
+                    success=after_screen != before_screen or reward > 0,
+                )
+
+                # Periodic stats update so the UI doesn't have to count events.
+                if step % 5 == 0 or is_new_screen:
+                    await self._emit_stats(step=step)
+
+                # Stuck detection
+                if self._stuck_count >= MAX_STUCK_COUNT:
+                    logger.warning(
+                        f"Stuck on screen {self.current_screen_id[:8]} "
+                        f"for {MAX_STUCK_COUNT} steps. Marking remaining as explored."
+                    )
+                    self._mark_screen_fully_explored(self.current_screen_id)
+                    self._stuck_count = 0
+
+                self._save_checkpoint()
+
+        finally:
+            # Finalize
+            self.graph.exploration_end = datetime.now()
             self._save_checkpoint()
+            await self._emit_stats(step=self.step_idx)
+            logger.info(f"Exploration complete. {self.graph.stats()}")
 
-        # Finalize
-        self.graph.exploration_end = datetime.now()
-        self._save_checkpoint()
-        logger.info(f"Exploration complete. {self.graph.stats()}")
         return self.graph
+
+    # ------------------------------------------------------------------ PUCT
+
+    def _select_action(
+        self,
+        state_id: str,
+        unexplored: list[ElementSnapshot],
+    ) -> str | None:
+        """Pick the best PUCT action restricted to the still-unexplored set."""
+        ss = self.puct.stats_for(state_id)
+        if ss is None:
+            # Should have been registered when we landed; do it now as a fallback.
+            self._register_screen_with_puct(self.graph.nodes[state_id])
+            ss = self.puct.stats_for(state_id)
+            if ss is None:
+                return None
+
+        unexplored_ids = {action_id_for(el) for el in unexplored}
+        # Exclude actions PUCT knows about that are no longer in the unexplored set.
+        excluded = {aid for aid in ss.actions.keys() if aid not in unexplored_ids}
+        return self.puct.select(state_id, exclude=excluded)
+
+    def _register_screen_with_puct(self, node: ScreenNode) -> None:
+        """Register a screen's actions with the PUCT selector (idempotent).
+
+        Also rebuilds the action_id → element map and queries the optional
+        prior_provider when the mode requests LLM priors.
+        """
+        if node.screen_id in self.puct.known_states():
+            # Already registered; just refresh the action map.
+            self._rebuild_action_map(node)
+            return
+
+        action_ids: list[str] = []
+        for el in node.interactive_elements:
+            action_ids.append(action_id_for(el))
+
+        priors: dict[str, float] | None = None
+        if self.mode_config.use_llm_priors and self.prior_provider is not None:
+            try:
+                raw = self.prior_provider(node)
+                if asyncio.iscoroutine(raw):
+                    # The provider is async; we cannot await here. The caller
+                    # should pass an async provider via _on_screen_landed instead.
+                    logger.warning(
+                        "prior_provider returned a coroutine in sync path; "
+                        "ignoring priors. Use _on_screen_landed for async."
+                    )
+                elif isinstance(raw, dict):
+                    priors = raw
+            except Exception:
+                logger.exception("prior_provider failed; falling back to uniform")
+
+        self.puct.register_state(node.screen_id, action_ids, priors=priors)
+        self._rebuild_action_map(node)
+
+    def _rebuild_action_map(self, node: ScreenNode) -> None:
+        """Refresh the local action_id → element table for the current screen."""
+        self._action_id_to_element = {
+            action_id_for(el): el for el in node.interactive_elements
+        }
+
+    async def _on_screen_landed(
+        self,
+        node: ScreenNode,
+        *,
+        is_new: bool,
+        step: int,
+    ) -> None:
+        """Hook called whenever the engine lands on a screen.
+
+        Handles PUCT registration, async LLM prior fetching, archive update,
+        and the screen_discovered event for live progress streaming.
+        """
+        # Async prior fetching path: only when prior_provider is set and the
+        # screen hasn't been registered yet. We do this *before* registration.
+        priors: dict[str, float] | None = None
+        if (
+            is_new
+            and self.mode_config.use_llm_priors
+            and self.prior_provider is not None
+            and node.screen_id not in self.puct.known_states()
+        ):
+            try:
+                raw = self.prior_provider(node)
+                if asyncio.iscoroutine(raw):
+                    raw = await raw
+                if isinstance(raw, dict):
+                    priors = raw
+            except Exception:
+                logger.exception("async prior_provider failed; uniform priors")
+
+        if node.screen_id not in self.puct.known_states():
+            action_ids = [action_id_for(el) for el in node.interactive_elements]
+            self.puct.register_state(node.screen_id, action_ids, priors=priors)
+
+        self._rebuild_action_map(node)
+        self._update_archive_for(node.screen_id)
+
+        if is_new:
+            await self._emit_screen(node, step=step)
+
+    def _update_archive_for(self, screen_id: str) -> None:
+        """Refresh the Go-Explore record for a screen with current PUCT counts."""
+        node = self.graph.nodes.get(screen_id)
+        if node is None:
+            return
+        ss = self.puct.stats_for(screen_id)
+        visit_count = ss.visit_count if ss is not None else 0
+        # Total actions = all interactive elements; explored = those with at
+        # least one outgoing edge in the graph (matches the unexplored query).
+        total = len(node.interactive_elements)
+        unexplored = len(self.graph.get_unexplored_actions(screen_id))
+        explored = max(total - unexplored, 0)
+        self.archive.update(
+            state_id=screen_id,
+            total_actions=total,
+            explored_actions=explored,
+            visit_count=visit_count,
+        )
+
+    # ------------------------------------------------------------------ events
+
+    async def _emit(self, event: dict) -> None:
+        """Send one event to the optional callback. Tolerates sync or async callables."""
+        if self.event_callback is None:
+            return
+        try:
+            result = self.event_callback(event)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:
+            logger.exception("event_callback failed for event=%r", event)
+
+    async def _emit_status(self, new_status: str) -> None:
+        await self._emit({"type": "status_change", "new_status": new_status})
+
+    async def _emit_screen(self, node: ScreenNode, *, step: int) -> None:
+        await self._emit(
+            {
+                "type": "screen_discovered",
+                "step_idx": step,
+                "screen_id_hash": node.screen_id,
+                "screen_name": node.name or node.screen_id[:8],
+                "screenshot_path": None,
+            }
+        )
+
+    async def _emit_edge(
+        self,
+        *,
+        step: int,
+        source: str,
+        target: str,
+        action_type: ActionType,
+        success: bool,
+    ) -> None:
+        await self._emit(
+            {
+                "type": "edge_discovered",
+                "step_idx": step,
+                "source_screen_hash": source,
+                "target_screen_hash": target,
+                "action_type": str(action_type),
+                "success": success,
+            }
+        )
+
+    async def _emit_stats(self, *, step: int) -> None:
+        await self._emit(
+            {
+                "type": "stats_update",
+                "stats": {
+                    "screens": len(self.graph.nodes),
+                    "edges": len(self.graph.edges),
+                    "step": step,
+                    "max_steps": self.max_steps,
+                },
+            }
+        )
 
     async def _explore_tap(self, element: ElementSnapshot) -> None:
         """Execute a tap action and record the transition."""
@@ -224,21 +559,48 @@ class ExplorationEngine:
         self.current_screen_id = new_node.screen_id
 
     async def _explore_text_field(self, element: ElementSnapshot) -> None:
-        """Explore a text field with PBT variants."""
+        """Explore a text field: fill form + submit once, then mark all
+        text fields on this screen as explored.
+
+        The old approach tried every PBT variant for every field, which
+        consumed 10-15 steps per form. The new approach:
+        1. Fill all visible fields with valid data (happy path)
+        2. Tap submit
+        3. Mark ALL text fields on the source screen as explored
+        4. Move on to new screens instead of re-filling the same form
+        """
         before_screen = self.current_screen_id
 
-        # Get all text fields on this screen (for form group detection)
         node = self.graph.nodes[self.current_screen_id]
         text_fields = [
             el for el in node.interactive_elements
             if el.kind == ElementKind.TEXT_FIELD
         ]
 
-        # For form groups: fill all fields with valid data first (happy path)
+        # Fill form with valid data and submit
         if len(text_fields) > 1:
             await self._fill_form_happy_path(text_fields, element)
         else:
             await self._fill_single_field(element)
+
+        # Mark ALL text fields on the source screen as explored so PUCT
+        # doesn't keep selecting them. One valid fill + submit is enough
+        # to discover where the form leads. PBT variants (empty, invalid,
+        # overflow) are useful for testing but waste exploration budget.
+        for field in text_fields:
+            aid = action_id_for(field)
+            if before_screen in self.graph.nodes:
+                # Record a self-loop edge so get_unexplored_actions() skips it
+                self.graph.add_edge(GraphEdge(
+                    source_screen_id=before_screen,
+                    target_screen_id=before_screen,
+                    action=ActionDetail(
+                        action_type=ActionType.INPUT,
+                        target_label=field.label,
+                        target_test_id=field.test_id,
+                        input_category="explored",
+                    ),
+                ))
 
     async def _fill_form_happy_path(
         self,
@@ -418,6 +780,78 @@ class ExplorationEngine:
             print(f"      ! Timed out typing into {element.label}", flush=True)
         except Exception as e:
             print(f"      ! Failed to type into {element.label}: {e}", flush=True)
+
+    # Labels that identify system/OS popup buttons to auto-dismiss.
+    # These bypass the normal exploration loop — the agent taps them
+    # immediately to clear the dialog and continue with the real app.
+    _DISMISS_LABELS = frozenset({
+        # English
+        "Not Now", "Don't Allow", "Cancel", "Dismiss", "Close",
+        "OK", "Later", "Skip", "No Thanks", "Deny",
+        # Russian
+        "Не сейчас", "Не разрешать", "Отмена", "Закрыть",
+        "Позже", "Пропустить", "Отклонить",
+    })
+    # Alert titles that mark system popups (the agent should not explore these)
+    _SYSTEM_ALERT_TITLES = frozenset({
+        "Save Password?", "Сохранить пароль?",
+        "Allow Notifications", "Разрешить уведомления",
+        "Would Like to Send You Notifications",
+        "Would Like to Access Your Location",
+        "Would Like to Use Your Current Location",
+    })
+
+    async def _dismiss_system_popup(self) -> None:
+        """If a system alert (Save Password, Allow Notifications, etc.) is
+        on screen, tap the dismiss button and re-capture."""
+        try:
+            elements = await asyncio.wait_for(
+                self.controller.get_ui_elements(), timeout=5
+            )
+        except Exception:
+            return
+
+        # Collect all labels from the raw element dicts
+        all_labels: list[str] = []
+        for e in elements:
+            label = e.get("label") or e.get("title") or ""
+            all_labels.append(label)
+
+        # Check for dismiss-like buttons regardless of alert type.
+        # System popups on iOS have buttons like "Not Now", "Save",
+        # "Don't Allow" etc. If we see any of these, tap the dismiss one.
+        dismiss_candidates: list[dict] = []
+        for e in elements:
+            label = (e.get("label") or e.get("title") or "").strip()
+            if label in self._DISMISS_LABELS:
+                dismiss_candidates.append(e)
+
+        if not dismiss_candidates:
+            return
+
+        # Prefer "Not Now" / "Не сейчас" / "Cancel" over other options
+        target = dismiss_candidates[0]
+        for c in dismiss_candidates:
+            lbl = (c.get("label") or c.get("title") or "").strip()
+            if lbl in ("Not Now", "Не сейчас", "Cancel", "Отмена", "Don't Allow", "Не разрешать"):
+                target = c
+                break
+
+        frame = target.get("frame")
+        label = (target.get("label") or target.get("title") or "")
+        if frame:
+            x = int(frame.get("x", 0) + frame.get("width", 0) / 2)
+            y = int(frame.get("y", 0) + frame.get("height", 0) / 2)
+            print(f"    [auto-dismiss] Tapping '{label}' at ({x}, {y})", flush=True)
+            try:
+                await asyncio.wait_for(self.controller.tap_at(x, y), timeout=5)
+                await asyncio.sleep(1.0)
+                new_node = await self._capture_screen()
+                self.current_screen_id = new_node.screen_id
+                self.graph.add_node(new_node)
+            except Exception as exc:
+                print(f"    [auto-dismiss] Failed: {exc}", flush=True)
+            return
 
     async def _capture_screen(self) -> ScreenNode:
         """Capture the current screen state from the device."""

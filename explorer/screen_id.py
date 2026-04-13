@@ -1,33 +1,77 @@
-"""Screen fingerprinting: compute a stable hash of the current screen state."""
+"""Screen fingerprinting: compute a stable hash of the current screen state.
+
+The hash should be STABLE across minor UI changes:
+- Error messages appearing/disappearing
+- Keyboard up/down
+- Button enabled/disabled state
+- Text field values changing
+- Loading spinners
+
+It should CHANGE only when the screen STRUCTURE changes:
+- Different set of buttons/fields
+- Navigation to a completely different screen
+- Modal/alert appearing
+
+Strategy: hash only by STRUCTURAL elements (buttons, text fields,
+switches, navigation bars) and their labels. Ignore everything else.
+"""
 
 import hashlib
 import json
 
-# iOS element types that belong to the virtual keyboard
+# Element types that represent STRUCTURE (included in hash)
+STRUCTURAL_TYPES = {
+    "Button", "TextField", "SecureTextField", "Switch", "Slider",
+    "Tab", "TabBar", "SegmentedControl",
+    "NavigationBar", "Toolbar",
+    "Cell", "Link",
+    "GenericElement",  # React Native renders buttons as GenericElement
+}
+
+# Element types to ALWAYS skip (dynamic/decorative)
+# Backward compat: analyzer.py imports this name
 KEYBOARD_TYPES = {"Key", "Keyboard", "KeyboardKey"}
+
+SKIP_TYPES = {
+    "Key", "Keyboard", "KeyboardKey",       # virtual keyboard
+    "StaticText",                             # error messages, labels, dynamic text
+    "Image", "Icon",                          # decorative
+    "ActivityIndicator", "ProgressIndicator", # loading
+    "Window", "Application",                  # container
+    "ScrollView", "Table", "CollectionView",  # layout containers
+    "Group", "Other",                         # generic
+}
 
 
 def compute_screen_id(elements: list[dict]) -> str:
-    """
-    Compute a structural fingerprint hash of the current screen.
+    """Compute a structural fingerprint hash.
 
-    Uses (type, label, enabled) for each element, deliberately excluding
-    value and frame (which change with user input or keyboard state).
+    Only considers STRUCTURAL element types (buttons, fields, switches)
+    and their labels. Deliberately ignores:
+    - StaticText (error messages, dynamic content)
+    - enabled/disabled state
+    - element values (user input)
+    - frames/positions
+    - keyboard presence
 
-    Filters out keyboard elements so the same screen with keyboard
-    up or down produces the same hash.
-
-    Returns a 16-char hex string (64-bit hash).
+    Returns a 16-char hex string.
     """
     fingerprint_parts = []
     for el in elements:
         el_type = el.get("type", "")
-        # Skip keyboard elements
-        if el_type in KEYBOARD_TYPES:
+
+        # Only include structural elements
+        if el_type in SKIP_TYPES:
             continue
-        el_label = el.get("label", "")
-        el_enabled = el.get("enabled", False)
-        fingerprint_parts.append((el_type, el_label, el_enabled))
+        if el_type not in STRUCTURAL_TYPES:
+            # Unknown type — include it to be safe but without label
+            # (so dynamic labels don't change the hash)
+            fingerprint_parts.append((el_type, ""))
+            continue
+
+        # For structural elements: use type + label
+        el_label = el.get("label", "") or ""
+        fingerprint_parts.append((el_type, el_label))
 
     fingerprint_parts.sort()
     canonical = json.dumps(fingerprint_parts, sort_keys=True, separators=(",", ":"))
