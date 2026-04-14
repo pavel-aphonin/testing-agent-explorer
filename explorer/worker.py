@@ -113,14 +113,6 @@ class BackendClient:
                 resp.text,
             )
 
-
-class RunCancelled(Exception):
-    """Raised when the backend reports the run was cancelled mid-flight."""
-
-    def __init__(self, run_id: str, detail: str = "") -> None:
-        super().__init__(f"Run {run_id} was cancelled: {detail}")
-        self.run_id = run_id
-
     async def post_heartbeat(self) -> None:
         """Best-effort liveness ping. Backend uses it for the UI's
         "Connected" indicator. Failure is silent — never blocks the loop.
@@ -151,6 +143,14 @@ class RunCancelled(Exception):
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+
+class RunCancelled(Exception):
+    """Raised when the backend reports the run was cancelled mid-flight."""
+
+    def __init__(self, run_id: str, detail: str = "") -> None:
+        super().__init__(f"Run {run_id} was cancelled: {detail}")
+        self.run_id = run_id
 
 
 # ----------------------------------------------------------------------------
