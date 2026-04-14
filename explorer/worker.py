@@ -121,6 +121,18 @@ class RunCancelled(Exception):
         super().__init__(f"Run {run_id} was cancelled: {detail}")
         self.run_id = run_id
 
+    async def post_heartbeat(self) -> None:
+        """Best-effort liveness ping. Backend uses it for the UI's
+        "Connected" indicator. Failure is silent — never blocks the loop.
+        """
+        try:
+            await self._client.post(
+                f"{self._base_url}/api/internal/worker/heartbeat",
+                headers=self._headers,
+            )
+        except httpx.HTTPError:
+            pass
+
     async def post_defect(self, payload: dict[str, Any]) -> None:
         """Send a detected defect. Best-effort — a failed post shouldn't kill the run."""
         try:
@@ -612,6 +624,10 @@ async def worker_loop(
 
     try:
         while not stop_event.is_set():
+            # Heartbeat — fire-and-forget, the UI uses it for the
+            # "Connected" indicator. Backend stores last seen in Redis.
+            await client.post_heartbeat()
+
             try:
                 config = await client.claim_next()
             except RuntimeError as exc:
