@@ -453,6 +453,7 @@ class RealExecutor:
                     defect_llm_base_url=rag_llm_url,
                     defect_callback=_post_defect,
                     run_id=run_id,
+                    pbt_enabled=bool(config.get("pbt_enabled", False)),
                 )
             else:
                 # MC mode: no LLM, random/PUCT selection

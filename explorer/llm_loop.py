@@ -90,6 +90,7 @@ class LLMExplorationLoop:
         defect_llm_base_url: str | None = None,
         defect_callback: "Callable[[dict], Awaitable[None]] | None" = None,
         run_id: str | None = None,
+        pbt_enabled: bool = False,
     ) -> None:
         self.controller = controller
         self.app_bundle_id = app_bundle_id
@@ -131,6 +132,13 @@ class LLMExplorationLoop:
                 model="rag-chat",
             )
 
+        # Property-based testing: when enabled, the agent's system prompt
+        # includes per-field-type variants (empty / overflow / XSS / SQL
+        # injection / unicode) so the LLM systematically probes form
+        # validation. The DefectDetector then catches "app accepted invalid
+        # input" as a validation defect.
+        self.pbt_enabled = pbt_enabled
+
         self.screens: dict[str, ScreenNode] = {}
         self.edges: list[GraphEdge] = []
         self.action_log: list[dict] = []
@@ -156,13 +164,44 @@ class LLMExplorationLoop:
         text = re.sub(r"\{\{\s*(\w+)\s*\}\}", _repl, text)
         return text
 
+    @staticmethod
+    def _pbt_prompt_section() -> str:
+        """Block of PBT instructions appended to SYSTEM_PROMPT when enabled.
+
+        Lists the variant categories built into PBTInputGenerator so the LLM
+        knows what to try and what counts as a validation bug.
+        """
+        return """
+## PBT (property-based testing) MODE — ENABLED
+
+For every text field you encounter, you should systematically probe its
+validation. After entering a valid value and successfully moving forward,
+COME BACK to the form (use the back button) and try the next variant.
+Repeat until you've covered the categories below.
+
+Per-field-type variants to try:
+- Email: empty, "not-an-email", "<script>alert(1)</script>@test.com",
+  "' OR 1=1 --", very long string (a*500 + @test.com), unicode "ТЕСТ@тест.рф"
+- Password: empty, "ab" (too short), "a"*1000, "<script>alert(1)</script>",
+  "' OR 1=1 --"
+- Phone: empty, "abc", "+7 900 000-00-0" repeated 20×
+- Name: empty, "A" (too short), "А"*1000, "<script>alert(1)</script>"
+- Generic text: empty, "a"*1000, "<script>alert(1)</script>"
+
+After entering each variant, click submit/proceed and observe.
+DEFECTS to flag (the DefectDetector will pick these up):
+- App ACCEPTED clearly invalid input (validation broken) — P1 validation defect
+- App CRASHED on long input or special chars — P0 crash
+- Form looks broken / fields disappear — UI defect"""
+
     def _build_system_prompt(self) -> str:
         """Build the system prompt, injecting test_data and scenario plans.
 
         When test_data is configured we tell the model about keys so it prefers
         them over generic placeholders. When scenarios are configured we list
         the upcoming scripted steps so the model anchors its actions to them
-        before exploring freely.
+        before exploring freely. When PBT is enabled, validation-probing
+        instructions are appended.
         """
         extras: list[str] = []
 
@@ -208,6 +247,9 @@ class LLMExplorationLoop:
                     if expected:
                         parts.append(f"→ expect: {expected}")
                     extras.append("  " + " ".join(parts))
+
+        if self.pbt_enabled:
+            extras.append(self._pbt_prompt_section())
 
         if not extras:
             return SYSTEM_PROMPT
