@@ -35,11 +35,18 @@ class LoopVerdict:
     `pattern_description` is human-readable text we feed to the LLM so it
     knows WHY we think it's stuck. `suggested_strategies` is the toolbox
     we offer — order doesn't imply preference, the LLM picks.
+
+    `escalation` rises with repeated triggers:
+      - "warn"  : first time in a while — soft nudge, let the LLM decide
+      - "force" : already warned recently and the loop continues — the
+                  caller should stop asking the LLM and take a
+                  deterministic action (pick an unused element / swipe).
     """
 
     is_stuck: bool
     pattern_description: str
     suggested_strategies: list[Strategy]
+    escalation: Literal["warn", "force"] = "warn"
 
 
 # Window size = how many recent transitions we look at when deciding

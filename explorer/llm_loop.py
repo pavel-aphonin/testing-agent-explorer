@@ -1065,26 +1065,44 @@ What should I do next? Respond with JSON only."""
         # caller bypasses it we still mask the hash here.
         name = (node.name or "").strip() or "Главный экран"
 
-        # For new screens, ask the vision model for a short unique name.
-        # The heuristic in analyzer.py often returns the bundle's app
-        # label (e.g. "TestApp") for several different screens, which is
-        # useless in lists. Vision LLM disambiguates: it sees the
-        # screenshot and proposes "Login", "Корзина", etc.
-        if is_new and node.screenshot_b64:
-            await self._emit({
-                "type": "log",
-                "step_idx": step,
-                "message": f"🤖 Выбираю название для экрана «{name}»…",
-            })
-            try:
-                better = await self._name_screen_with_vision(node, fallback=name)
-            except Exception as exc:
-                logger.warning("vision naming failed: %s", exc)
-                better = name
-            name = self._make_name_unique(better or name)
-            node.name = name  # propagate so subsequent emits are consistent
-
+        # For new screens we want a unique human-readable name. Strategy:
+        #   1. Ask vision LLM (if we have a screenshot). The prompt already
+        #      lists used names — the model should pick something new.
+        #   2. If the model still returns a duplicate, ask AGAIN with an
+        #      explicit instruction — "name X is taken, pick a different
+        #      descriptor (e.g. 'ред.' vs 'просмотр')". Gives a second
+        #      semantic attempt before we fall back to a counter.
+        #   3. If still a dupe, append "(2)", "(3)" as last resort.
+        # No-screenshot path: skip straight to step 3.
         if is_new:
+            if node.screenshot_b64:
+                await self._emit({
+                    "type": "log",
+                    "step_idx": step,
+                    "message": f"🤖 Выбираю название для экрана «{name}»…",
+                })
+                try:
+                    better = await self._name_screen_with_vision(node, fallback=name)
+                    if better:
+                        name = better
+                    # Second pass if the first suggestion collides. Usually
+                    # happens when the analyzer had already supplied a common
+                    # name (e.g. "Профиль") that the vision model latched
+                    # onto. Re-ask with a tougher constraint.
+                    if name in self._used_screen_names:
+                        retry = await self._name_screen_with_vision(
+                            node,
+                            fallback=name,
+                            forbidden=name,
+                        )
+                        if retry and retry not in self._used_screen_names:
+                            name = retry
+                except Exception as exc:
+                    logger.warning("vision naming failed: %s", exc)
+            # Numeric suffix as final fallback — prefer this over a raw
+            # duplicate in the list.
+            name = self._make_name_unique(name)
+            node.name = name
             self._used_screen_names.add(name)
 
         await self._emit({
@@ -1097,12 +1115,20 @@ What should I do next? Respond with JSON only."""
         })
 
     async def _name_screen_with_vision(
-        self, node: ScreenNode, *, fallback: str,
+        self,
+        node: ScreenNode,
+        *,
+        fallback: str,
+        forbidden: str | None = None,
     ) -> str:
         """Ask the multimodal LLM for a 1-3 word screen name in Russian.
 
         Sends the screenshot + the existing name list so the model
         avoids duplicates on its own. Returns fallback on any error.
+
+        `forbidden` (optional) is the name the model just proposed that
+        collided with an existing one — passed back with a stronger
+        instruction so it doesn't repeat itself on the retry pass.
         """
         if not node.screenshot_b64:
             return fallback
@@ -1110,14 +1136,22 @@ What should I do next? Respond with JSON only."""
             ", ".join(sorted(self._used_screen_names))
             if self._used_screen_names else "(пока ни одного)"
         )
-        prompt = (
+        base_prompt = (
             "Посмотри на скриншот мобильного экрана и придумай для него "
             "ОЧЕНЬ короткое название (1-3 слова) на русском. Если на "
             "экране виден заголовок — используй его. Если нет — назови "
             "по содержимому: «Корзина», «Список товаров», «Профиль»…\n\n"
             f"Уже использованные названия (НЕ повторяй их): {existing}\n\n"
-            "Ответь ТОЛЬКО названием, без пояснений и кавычек."
         )
+        if forbidden:
+            base_prompt += (
+                f"ВАЖНО: название «{forbidden}» УЖЕ занято другим экраном. "
+                f"Дай ДРУГОЕ название, описывающее чем этот экран "
+                f"отличается. Например добавь уточнение в скобках "
+                f"(«{forbidden} (ред.)», «{forbidden} (просмотр)») или "
+                f"переформулируй полностью.\n\n"
+            )
+        prompt = base_prompt + "Ответь ТОЛЬКО названием, без пояснений и кавычек."
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.post(
