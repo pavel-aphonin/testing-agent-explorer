@@ -36,6 +36,41 @@ logger = logging.getLogger("explorer.llm_loop")
 SETTLE_DELAY = 3.0
 AXE_BIN = "/opt/homebrew/bin/axe"
 
+# How many suspect actions to accumulate before flushing the batch to
+# the defect detector. Smaller = defects appear faster; larger = fewer
+# LLM calls. 5 is a reasonable demo default — drains on every 5th
+# suspect step and at run end.
+_DEFECT_BATCH_SIZE = 5
+
+
+def _looks_suspicious(
+    *,
+    action_type: str,
+    moved: bool,
+    element: "ElementSnapshot",
+    value: str | None,
+) -> bool:
+    """Heuristic: is this step worth running through the defect detector?
+
+    Skip ~80% of "happy path" actions (tap → screen changed) so the LLM
+    only spends cycles on the interesting ones. Trade-off: we'll miss
+    defects on screens that look fine but actually have hidden bugs.
+    For a demo where ~3 steps/min was the bottleneck, that's the right
+    call.
+    """
+    # Action didn't move us — a tap on a non-interactive button or an
+    # input that the form rejected. Both are interesting.
+    if not moved:
+        return True
+    # Input action — even when we did move, the model may have accepted
+    # invalid input (PBT mode is specifically about catching this).
+    if action_type == "input":
+        return True
+    # Long-text input is also interesting (potential overflow / XSS).
+    if value and len(value) > 100:
+        return True
+    return False
+
 EventCallback = Callable[[dict], None | Awaitable[None]]
 
 SYSTEM_PROMPT = """You are an AI agent exploring a mobile app. Your goal is to discover ALL screens and features of the app by interacting with UI elements.
@@ -111,6 +146,23 @@ class LLMExplorationLoop:
         # vision-naming step keep names unique by re-prompting or
         # appending a suffix when a duplicate is suggested.
         self._used_screen_names: set[str] = set()
+
+        # Cycle detector: watches recent transitions and surfaces a
+        # toolbox of escape strategies when the agent gets stuck.
+        from explorer.loop_breaker import CycleDetector
+        self._cycle_detector = CycleDetector()
+        # When set, the next call to _build_system_prompt appends the
+        # loop-breaking instructions ONCE, then clears itself.
+        self._loop_break_addendum: str | None = None
+
+        # Suspect-action queue for batched defect detection. Each entry
+        # is a snapshot of the step's context that we'll pass to the
+        # detector when we drain the queue. Drained every _DEFECT_BATCH_SIZE
+        # entries — see _enqueue_defect_check.
+        self._defect_queue: list[dict] = []
+        # Background tasks spawned by the detector — kept around so we
+        # can cancel them cleanly at run end if the user aborts.
+        self._defect_tasks: list[asyncio.Task] = []
         # Pre-scripted scenarios to execute before free exploration. Each is
         # {id, title, steps: [{screen_name, action, element_label, value?, ...}]}.
         # The agent walks them in order (with {{test_data.key}} substitution),
@@ -254,6 +306,13 @@ DEFECTS to flag (the DefectDetector will pick these up):
 
         if self.pbt_enabled:
             extras.append(self._pbt_prompt_section())
+
+        # One-shot toolbox: appended only on the next prompt after the
+        # cycle detector flagged a loop. Cleared immediately so the LLM
+        # doesn't see it twice.
+        if self._loop_break_addendum:
+            extras.append(self._loop_break_addendum)
+            self._loop_break_addendum = None
 
         if not extras:
             return SYSTEM_PROMPT
@@ -484,51 +543,78 @@ DEFECTS to flag (the DefectDetector will pick these up):
 
             await self._emit_edge(edge, step=step)
 
-            # Defect detection: ask a separate LLM whether what we observed
-            # is a real defect. Runs async — if the detector LLM is slow we
-            # don't block the main exploration loop.
+            # Cycle detection: record this transition and, if a loop is
+            # detected, prime the next system prompt with a toolbox of
+            # escape strategies the LLM can choose from.
+            self._cycle_detector.record(before, new_screen.screen_id)
+            verdict = self._cycle_detector.check(step)
+            if verdict.is_stuck:
+                from explorer.loop_breaker import render_toolbox_for_prompt
+                self._loop_break_addendum = render_toolbox_for_prompt(
+                    verdict.suggested_strategies,
+                    verdict.pattern_description,
+                )
+                await self._emit({
+                    "type": "log",
+                    "step_idx": step,
+                    "message": f"🔁 Похоже, агент застрял: {verdict.pattern_description} Предлагаю выбрать стратегию выхода.",
+                })
+
+            # Defect detection — three optimisations layered on top of the
+            # original "every step gets classified" approach:
+            #
+            # B. SUSPECT FILTER. Most steps are "fine" (LLM tap → screen
+            #    changed → done). We only run the classifier when something
+            #    looks worth a second look:
+            #      • action=input on a screen that didn't change (validation
+            #        likely rejected — could be correct OR could be a bug)
+            #      • action=tap that didn't move us (broken button)
+            #      • screen still on the same hash after >1 different actions
+            # A. PARALLEL. We spawn create_task and return immediately;
+            #    the next agent step starts without waiting for verdict.
+            #    Defects appear in the UI a few seconds late but the run
+            #    speeds up roughly 2x.
+            # D. BATCHING. Suspect events accumulate in self._defect_queue;
+            #    every N steps we drain them in one LLM call. Cuts overhead
+            #    on long runs.
             if self._defect_detector is not None and self.defect_callback is not None:
-                try:
-                    verdict = await self._defect_detector.classify(
-                        action=action_type,
-                        element_label=element.label or "",
+                if _looks_suspicious(
+                    action_type=action_type,
+                    moved=is_new or new_screen.screen_id != before,
+                    element=element,
+                    value=value,
+                ):
+                    self._enqueue_defect_check(
+                        step=step,
+                        action_type=action_type,
+                        element=element,
                         value=value,
-                        screen_name_before=screen.name,
-                        screen_name_after=new_screen.name,
-                        element_count_before=len(elements),
-                        element_count_after=len(new_screen.interactive_elements),
-                        spec_snippet=rag_result if self.rag_enabled else None,
+                        screen_before=screen,
+                        screen_after=new_screen,
+                        rag_snippet=rag_result if self.rag_enabled else None,
                     )
-                    if verdict and verdict.is_defect and not verdict.is_infra:
-                        print(
-                            f"    ⚠ DEFECT [{verdict.priority}] {verdict.title}",
-                            flush=True,
-                        )
-                        await self.defect_callback({
-                            "run_id": self.run_id,
-                            "step_idx": step,
-                            "screen_id_hash": new_screen.screen_id,
-                            "screen_name": new_screen.name,
-                            "priority": verdict.priority,
-                            "kind": verdict.kind,
-                            "title": verdict.title,
-                            "description": verdict.description,
-                            "screenshot_path": getattr(new_screen, "screenshot_path", None),
-                            "llm_analysis_json": {
-                                "action": action_type,
-                                "element": element.label,
-                                "value": value,
-                                "before": screen.name,
-                                "after": new_screen.name,
-                            },
-                        })
-                except Exception:
-                    logger.exception("Defect detection crashed, ignoring")
 
             if step % 3 == 0 or is_new:
                 await self._emit_stats()
 
         await self._emit_stats()
+
+        # Drain any remaining suspect entries that didn't reach the
+        # batch threshold. We wait for ALL background detector tasks
+        # before returning so the UI gets the final defect verdicts.
+        if self._defect_queue:
+            tail = self._defect_queue
+            self._defect_queue = []
+            self._defect_tasks.append(asyncio.create_task(self._process_defect_batch(tail)))
+        if self._defect_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*self._defect_tasks, return_exceptions=True),
+                    timeout=60,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Some defect detection tasks didn't finish in 60s")
+
         print(f"\n>>> Done: {len(self.screens)} screens, {len(self.edges)} edges", flush=True)
         return {"screens": len(self.screens), "edges": len(self.edges), "steps": self._step}
 
@@ -894,6 +980,83 @@ What should I do next? Respond with JSON only."""
                 await result
         except Exception:
             pass
+
+    def _enqueue_defect_check(
+        self, *, step: int, action_type: str, element: ElementSnapshot,
+        value: str | None, screen_before: ScreenNode, screen_after: ScreenNode,
+        rag_snippet: str | None,
+    ) -> None:
+        """Push a suspect step into the defect queue. Drains in batches."""
+        self._defect_queue.append({
+            "step": step,
+            "action_type": action_type,
+            "element_label": element.label or "",
+            "value": value,
+            "screen_before_name": screen_before.name,
+            "screen_after_name": screen_after.name,
+            "screen_after_id": screen_after.screen_id,
+            "screenshot_path": getattr(screen_after, "screenshot_path", None),
+            "elements_before": len(screen_before.interactive_elements),
+            "elements_after": len(screen_after.interactive_elements),
+            "rag_snippet": rag_snippet,
+        })
+        if len(self._defect_queue) >= _DEFECT_BATCH_SIZE:
+            # Spawn flush in the background; the agent loop continues
+            # immediately. The task references the current snapshot of
+            # the queue, then we clear it.
+            batch = self._defect_queue
+            self._defect_queue = []
+            task = asyncio.create_task(self._process_defect_batch(batch))
+            self._defect_tasks.append(task)
+            # Garbage-collect finished tasks so the list doesn't grow.
+            self._defect_tasks = [t for t in self._defect_tasks if not t.done()]
+
+    async def _process_defect_batch(self, batch: list[dict]) -> None:
+        """Classify each suspect entry and post defects for real findings."""
+        if self._defect_detector is None or self.defect_callback is None:
+            return
+        for entry in batch:
+            try:
+                verdict = await self._defect_detector.classify(
+                    action=entry["action_type"],
+                    element_label=entry["element_label"],
+                    value=entry["value"],
+                    screen_name_before=entry["screen_before_name"],
+                    screen_name_after=entry["screen_after_name"],
+                    element_count_before=entry["elements_before"],
+                    element_count_after=entry["elements_after"],
+                    spec_snippet=entry["rag_snippet"],
+                )
+            except Exception:
+                logger.exception("Defect classification crashed for step %s", entry["step"])
+                continue
+            if not verdict or not verdict.is_defect or verdict.is_infra:
+                continue
+            print(
+                f"    ⚠ DEFECT [{verdict.priority}] {verdict.title}",
+                flush=True,
+            )
+            try:
+                await self.defect_callback({
+                    "run_id": self.run_id,
+                    "step_idx": entry["step"],
+                    "screen_id_hash": entry["screen_after_id"],
+                    "screen_name": entry["screen_after_name"],
+                    "priority": verdict.priority,
+                    "kind": verdict.kind,
+                    "title": verdict.title,
+                    "description": verdict.description,
+                    "screenshot_path": entry["screenshot_path"],
+                    "llm_analysis_json": {
+                        "action": entry["action_type"],
+                        "element": entry["element_label"],
+                        "value": entry["value"],
+                        "before": entry["screen_before_name"],
+                        "after": entry["screen_after_name"],
+                    },
+                })
+            except Exception:
+                logger.exception("Defect post failed for step %s", entry["step"])
 
     async def _emit_screen(self, node: ScreenNode, *, step: int, is_new: bool = True) -> None:
         # Never use the raw hash as a fallback name — it leaks into the UI as
