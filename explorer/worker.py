@@ -644,12 +644,24 @@ async def worker_loop(
         except Exception:
             logger.exception("Failed to report simulator config or cleanup orphans")
 
+    # Heartbeat runs in its own task so the "Connected" indicator stays
+    # green even while a run is executing. Previously it was inline in the
+    # claim loop, which meant heartbeats stopped flowing for the entire
+    # duration of execute_one_run() — runs take minutes to hours, so the
+    # 60s Redis TTL would expire and the UI would show "Не подключено"
+    # despite the worker doing real work right at that moment.
+    async def _heartbeat_loop() -> None:
+        while not stop_event.is_set():
+            await client.post_heartbeat()
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
+
+    heartbeat_task = asyncio.create_task(_heartbeat_loop())
+
     try:
         while not stop_event.is_set():
-            # Heartbeat — fire-and-forget, the UI uses it for the
-            # "Connected" indicator. Backend stores last seen in Redis.
-            await client.post_heartbeat()
-
             try:
                 config = await client.claim_next()
             except RuntimeError as exc:
@@ -666,6 +678,11 @@ async def worker_loop(
 
             await execute_one_run(client, config, executor)
     finally:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except (asyncio.CancelledError, Exception):
+            pass
         await client.aclose()
         logger.info("Worker stopped.")
 
