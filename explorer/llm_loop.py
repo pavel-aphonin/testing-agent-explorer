@@ -83,6 +83,8 @@ class LLMExplorationLoop:
         rag_enabled: bool = False,
         rag_base_url: str = "http://localhost:8000",
         rag_token: str = "",
+        test_data: dict[str, str] | None = None,
+        scenarios: list[dict] | None = None,
     ) -> None:
         self.controller = controller
         self.app_bundle_id = app_bundle_id
@@ -95,6 +97,15 @@ class LLMExplorationLoop:
         self.rag_enabled = rag_enabled
         self.rag_base_url = rag_base_url.rstrip("/")
         self.rag_token = rag_token
+        # Test data entries — {key: value}. The agent is told about these in
+        # the system prompt and should prefer them over generic placeholders
+        # when filling form fields. Example: {"email": "test@example.com"}.
+        self.test_data: dict[str, str] = test_data or {}
+        # Pre-scripted scenarios to execute before free exploration. Each is
+        # {id, title, steps: [{screen_name, action, element_label, value?, ...}]}.
+        # The agent walks them in order (with {{test_data.key}} substitution),
+        # then falls back to free exploration for remaining steps.
+        self.scenarios: list[dict] = scenarios or []
 
         self.screens: dict[str, ScreenNode] = {}
         self.edges: list[GraphEdge] = []
@@ -105,6 +116,78 @@ class LLMExplorationLoop:
         self._step = 0
         self._current_screen_id = ""
         self._consecutive_no_new = 0  # count steps with no new discoveries
+
+    def _substitute_test_data(self, text: str) -> str:
+        """Replace {{test_data.KEY}} placeholders with configured values."""
+        import re
+        if not text or "{{" not in text:
+            return text
+
+        def _repl(match: "re.Match[str]") -> str:
+            key = match.group(1).strip()
+            return self.test_data.get(key, match.group(0))
+
+        # Supports {{test_data.email}} and shorthand {{email}}
+        text = re.sub(r"\{\{\s*test_data\.(\w+)\s*\}\}", _repl, text)
+        text = re.sub(r"\{\{\s*(\w+)\s*\}\}", _repl, text)
+        return text
+
+    def _build_system_prompt(self) -> str:
+        """Build the system prompt, injecting test_data and scenario plans.
+
+        When test_data is configured we tell the model about keys so it prefers
+        them over generic placeholders. When scenarios are configured we list
+        the upcoming scripted steps so the model anchors its actions to them
+        before exploring freely.
+        """
+        extras: list[str] = []
+
+        if self.test_data:
+            extras.append("")
+            extras.append("## Available test data (prefer these over generic defaults)")
+            extras.append("")
+            extras.append("When filling form fields, use these values whenever the field matches:")
+            extras.append("")
+            for key, value in self.test_data.items():
+                extras.append(f"- `{key}` = `{value}`")
+            extras.append("")
+            extras.append(
+                "For example, if you see an email field and `email` is listed above, "
+                "use THAT value instead of the fallback `test@test.com`."
+            )
+
+        if self.scenarios:
+            extras.append("")
+            extras.append("## Scenarios to follow FIRST (before free exploration)")
+            extras.append("")
+            extras.append(
+                "The user has configured scripted scenarios. Execute each step in "
+                "order. After all scenarios complete, continue with free exploration."
+            )
+            for sc in self.scenarios:
+                extras.append("")
+                extras.append(f"### Scenario: {sc.get('title', '(untitled)')}")
+                for i, step in enumerate(sc.get("steps", []), 1):
+                    screen = step.get("screen_name", "")
+                    action = step.get("action", "tap")
+                    element = step.get("element_label", "")
+                    value = self._substitute_test_data(step.get("value", "") or "")
+                    expected = step.get("expected_result", "")
+                    parts = [f"{i}."]
+                    if screen:
+                        parts.append(f"[{screen}]")
+                    parts.append(f"{action}")
+                    if element:
+                        parts.append(f'"{element}"')
+                    if value:
+                        parts.append(f'with value "{value}"')
+                    if expected:
+                        parts.append(f"→ expect: {expected}")
+                    extras.append("  " + " ".join(parts))
+
+        if not extras:
+            return SYSTEM_PROMPT
+        return SYSTEM_PROMPT + "\n".join(extras)
 
     async def run(self) -> dict:
         await self._emit({"type": "status_change", "new_status": "running"})
@@ -351,7 +434,7 @@ What should I do next? Respond with JSON only."""
                     json={
                         "model": self.llm_model,
                         "messages": [
-                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "system", "content": self._build_system_prompt()},
                             {"role": "user", "content": user_prompt},
                         ],
                         "max_tokens": 256,

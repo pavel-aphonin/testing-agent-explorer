@@ -15,6 +15,7 @@ venv/
 explorer_output/
 explorer_output_*/
 traces/
+worker_runs/
 
 # Environment
 .env

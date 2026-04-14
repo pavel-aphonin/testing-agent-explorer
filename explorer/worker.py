@@ -87,6 +87,12 @@ class BackendClient:
         return None
 
     async def post_event(self, run_id: str, event: dict[str, Any]) -> None:
+        """Send an event to the backend.
+
+        Raises RunCancelled when the backend reports 409 with a terminal
+        status — the run was deleted / cancelled while we were running.
+        The outer loop catches this and stops the executor cleanly.
+        """
         try:
             resp = await self._client.post(
                 f"{self._base_url}/api/internal/runs/{run_id}/event",
@@ -96,6 +102,9 @@ class BackendClient:
         except httpx.HTTPError as exc:
             logger.warning("post_event failed: %s", exc)
             return
+        if resp.status_code == 409:
+            # Run is in a terminal state (CANCELLED / DELETED). Stop cleanly.
+            raise RunCancelled(run_id, resp.text)
         if resp.status_code >= 300:
             logger.warning(
                 "post_event for run %s rejected: %s %s",
@@ -103,6 +112,14 @@ class BackendClient:
                 resp.status_code,
                 resp.text,
             )
+
+
+class RunCancelled(Exception):
+    """Raised when the backend reports the run was cancelled mid-flight."""
+
+    def __init__(self, run_id: str, detail: str = "") -> None:
+        super().__init__(f"Run {run_id} was cancelled: {detail}")
+        self.run_id = run_id
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -404,6 +421,8 @@ class RealExecutor:
                     llm_model=llm_model_name,
                     max_steps=max_steps,
                     event_callback=event_sink,
+                    test_data=config.get("test_data") or {},
+                    scenarios=config.get("scenarios") or [],
                 )
             else:
                 # MC mode: no LLM, random/PUCT selection
@@ -418,8 +437,12 @@ class RealExecutor:
                     event_callback=event_sink,
                 )
 
-            result = await loop.run()
-            logger.info("Loop result: %s", result)
+            try:
+                result = await loop.run()
+                logger.info("Loop result: %s", result)
+            except RunCancelled as exc:
+                # User deleted or cancelled the run — stop cleanly, don't mark failed.
+                logger.info("Run %s cancelled by user, stopping loop", exc.run_id)
         finally:
             # AXe disconnect
             if disconnect_fn is not None:
