@@ -880,11 +880,16 @@ What should I do next? Respond with JSON only."""
             pass
 
     async def _emit_screen(self, node: ScreenNode, *, step: int, is_new: bool = True) -> None:
+        # Never use the raw hash as a fallback name — it leaks into the UI as
+        # gibberish (e.g. "Обнаружил «4f53cda1»"). analyze_screen now always
+        # returns a meaningful name (app_label or "Главный экран"), but if a
+        # caller bypasses it we still mask the hash here.
+        name = (node.name or "").strip() or "Главный экран"
         await self._emit({
             "type": "screen_discovered",
             "step_idx": step,
             "screen_id_hash": node.screen_id,
-            "screen_name": node.name or node.screen_id[:8],
+            "screen_name": name,
             "is_new": is_new,
             "screenshot_b64": node.screenshot_b64 if is_new else None,
         })

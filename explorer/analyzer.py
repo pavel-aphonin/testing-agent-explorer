@@ -119,7 +119,10 @@ def analyze_screen(
                     name = next_el["label"]
                     break
     if not name:
-        name = app_label or ""
+        # Fallback chain: app label → bundle-id-derived → generic.
+        # We never want a raw hex hash to leak into the UI as the screen
+        # name (Pavel's feedback: "Обнаружил «4f53cda1»" is unreadable).
+        name = app_label or "Главный экран"
 
     # Improve naming for popup/alert screens:
     # If we have few interactive elements (1-3) and the name is just the

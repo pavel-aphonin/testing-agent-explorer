@@ -420,17 +420,39 @@ class RealExecutor:
                         / "testing-agent-sim-mirror" / ".build" / "release" / "SimMirror"),
                 )
                 mirror_port = os.environ.get("TA_SIM_MIRROR_PORT", "9999")
+                # Capture SimMirror's output to a log so we can debug death.
+                # Previously stdout/stderr went to DEVNULL and the process
+                # would silently die without telling anyone what window it
+                # tried to bind to.
+                mirror_log_path = Path("/tmp") / "ta-sim-mirror.log"
                 if Path(mirror_bin).exists():
+                    # Wait for the simulator window to appear before binding.
+                    # ScreenCaptureKit needs an existing on-screen window;
+                    # SimMirror exits immediately if it can't find one. Two
+                    # seconds is enough on M2 — adjust if you see it racing.
+                    await asyncio.sleep(2.0)
                     try:
+                        mirror_log = mirror_log_path.open("w")
                         mirror_proc = await asyncio.create_subprocess_exec(
                             mirror_bin,
                             "--port", mirror_port,
                             "--max-width", "480",
                             "--fps", "15",
-                            stdout=asyncio.subprocess.DEVNULL,
-                            stderr=asyncio.subprocess.DEVNULL,
+                            stdout=mirror_log,
+                            stderr=mirror_log,
                         )
-                        logger.info("SimMirror started (pid=%s, port=%s)", mirror_proc.pid, mirror_port)
+                        logger.info(
+                            "SimMirror started (pid=%s, port=%s, log=%s)",
+                            mirror_proc.pid, mirror_port, mirror_log_path,
+                        )
+                        # Sanity check: did it actually stay alive?
+                        await asyncio.sleep(1.0)
+                        if mirror_proc.returncode is not None:
+                            logger.warning(
+                                "SimMirror died immediately (exit=%s). See %s",
+                                mirror_proc.returncode, mirror_log_path,
+                            )
+                            mirror_proc = None
                     except Exception:
                         logger.exception("SimMirror failed to start")
 
