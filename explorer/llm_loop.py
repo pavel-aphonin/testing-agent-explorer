@@ -107,6 +107,10 @@ class LLMExplorationLoop:
         # the system prompt and should prefer them over generic placeholders
         # when filling form fields. Example: {"email": "test@example.com"}.
         self.test_data: dict[str, str] = test_data or {}
+        # Set of screen names already used in this run. Lets the
+        # vision-naming step keep names unique by re-prompting or
+        # appending a suffix when a duplicate is suggested.
+        self._used_screen_names: set[str] = set()
         # Pre-scripted scenarios to execute before free exploration. Each is
         # {id, title, steps: [{screen_name, action, element_label, value?, ...}]}.
         # The agent walks them in order (with {{test_data.key}} substitution),
@@ -856,13 +860,25 @@ What should I do next? Respond with JSON only."""
             elements = await asyncio.wait_for(
                 self.controller.get_ui_elements(), timeout=10
             )
+            # Pavel's complaint: "у некоторых экранов нет скриншотов".
+            # Root cause: a single take_screenshot() failure left the
+            # screen permanently without a thumbnail. Retry up to 3
+            # times with backoff before giving up — most failures are
+            # transient (simctl io transient locks, etc.).
             screenshot = None
-            try:
-                screenshot = await asyncio.wait_for(
-                    self.controller.take_screenshot(), timeout=15
-                )
-            except Exception:
-                pass
+            for attempt in range(3):
+                try:
+                    screenshot = await asyncio.wait_for(
+                        self.controller.take_screenshot(), timeout=15
+                    )
+                    if screenshot:
+                        break
+                except Exception as exc:
+                    logger.warning(
+                        "Screenshot attempt %d/3 failed: %s", attempt + 1, exc,
+                    )
+                if attempt < 2:
+                    await asyncio.sleep(0.5 * (attempt + 1))
             return analyze_screen(elements=elements, screenshot_b64=screenshot)
         except Exception as e:
             return ScreenNode(screen_id=f"error_{hash(str(e))}")
@@ -885,6 +901,29 @@ What should I do next? Respond with JSON only."""
         # returns a meaningful name (app_label or "Главный экран"), but if a
         # caller bypasses it we still mask the hash here.
         name = (node.name or "").strip() or "Главный экран"
+
+        # For new screens, ask the vision model for a short unique name.
+        # The heuristic in analyzer.py often returns the bundle's app
+        # label (e.g. "TestApp") for several different screens, which is
+        # useless in lists. Vision LLM disambiguates: it sees the
+        # screenshot and proposes "Login", "Корзина", etc.
+        if is_new and node.screenshot_b64:
+            await self._emit({
+                "type": "log",
+                "step_idx": step,
+                "message": f"🤖 Выбираю название для экрана «{name}»…",
+            })
+            try:
+                better = await self._name_screen_with_vision(node, fallback=name)
+            except Exception as exc:
+                logger.warning("vision naming failed: %s", exc)
+                better = name
+            name = self._make_name_unique(better or name)
+            node.name = name  # propagate so subsequent emits are consistent
+
+        if is_new:
+            self._used_screen_names.add(name)
+
         await self._emit({
             "type": "screen_discovered",
             "step_idx": step,
@@ -893,6 +932,74 @@ What should I do next? Respond with JSON only."""
             "is_new": is_new,
             "screenshot_b64": node.screenshot_b64 if is_new else None,
         })
+
+    async def _name_screen_with_vision(
+        self, node: ScreenNode, *, fallback: str,
+    ) -> str:
+        """Ask the multimodal LLM for a 1-3 word screen name in Russian.
+
+        Sends the screenshot + the existing name list so the model
+        avoids duplicates on its own. Returns fallback on any error.
+        """
+        if not node.screenshot_b64:
+            return fallback
+        existing = (
+            ", ".join(sorted(self._used_screen_names))
+            if self._used_screen_names else "(пока ни одного)"
+        )
+        prompt = (
+            "Посмотри на скриншот мобильного экрана и придумай для него "
+            "ОЧЕНЬ короткое название (1-3 слова) на русском. Если на "
+            "экране виден заголовок — используй его. Если нет — назови "
+            "по содержимому: «Корзина», «Список товаров», «Профиль»…\n\n"
+            f"Уже использованные названия (НЕ повторяй их): {existing}\n\n"
+            "Ответь ТОЛЬКО названием, без пояснений и кавычек."
+        )
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    f"{self.llm_url}/v1/chat/completions",
+                    json={
+                        "model": self.llm_model,
+                        "messages": [{
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/png;base64,{node.screenshot_b64}",
+                                    },
+                                },
+                            ],
+                        }],
+                        "max_tokens": 30,
+                        "temperature": 0.2,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                raw = (data["choices"][0]["message"].get("content") or "").strip()
+                # Strip thinking tags and quotes.
+                import re
+                raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
+                raw = raw.strip().strip('"').strip("«»").strip()
+                # Take first line only — sometimes the model continues
+                # with a second-line explanation.
+                raw = raw.split("\n")[0].strip()
+                return raw[:60] if raw else fallback
+        except Exception:
+            return fallback
+
+    def _make_name_unique(self, name: str) -> str:
+        """If the name is already used, append a counter suffix."""
+        if name not in self._used_screen_names:
+            return name
+        for i in range(2, 100):
+            candidate = f"{name} ({i})"
+            if candidate not in self._used_screen_names:
+                return candidate
+        return f"{name} ({len(self._used_screen_names) + 1})"
 
     async def _emit_edge(self, edge: GraphEdge, *, step: int) -> None:
         # Bundle the per-action details into a single dict that maps
