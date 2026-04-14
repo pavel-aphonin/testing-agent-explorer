@@ -121,6 +121,22 @@ class RunCancelled(Exception):
         super().__init__(f"Run {run_id} was cancelled: {detail}")
         self.run_id = run_id
 
+    async def post_defect(self, payload: dict[str, Any]) -> None:
+        """Send a detected defect. Best-effort — a failed post shouldn't kill the run."""
+        try:
+            resp = await self._client.post(
+                f"{self._base_url}/api/internal/defects",
+                headers=self._headers,
+                json=payload,
+            )
+        except httpx.HTTPError as exc:
+            logger.warning("post_defect failed: %s", exc)
+            return
+        if resp.status_code >= 300:
+            logger.warning(
+                "post_defect rejected: %s %s", resp.status_code, resp.text,
+            )
+
     async def aclose(self) -> None:
         await self._client.aclose()
 
@@ -414,6 +430,16 @@ class RealExecutor:
                 llm_url = os.environ.get("TA_LLM_BASE_URL", "http://localhost:8080")
                 llm_model_name = os.environ.get("TA_LLM_MODEL_NAME", "embeddings")
 
+                # URL of the RAG LLM — used as the "smart" classifier for
+                # defect detection. Falls back to the agent LLM if not set.
+                rag_llm_url = os.environ.get(
+                    "TA_RAG_LLM_BASE_URL",
+                    os.environ.get("TA_LLM_BASE_URL", "http://localhost:8083"),
+                )
+
+                async def _post_defect(payload: dict) -> None:
+                    await client.post_defect(payload)
+
                 loop = LLMExplorationLoop(
                     controller=client,
                     app_bundle_id=bundle_id,
@@ -423,6 +449,10 @@ class RealExecutor:
                     event_callback=event_sink,
                     test_data=config.get("test_data") or {},
                     scenarios=config.get("scenarios") or [],
+                    defect_detection_enabled=True,
+                    defect_llm_base_url=rag_llm_url,
+                    defect_callback=_post_defect,
+                    run_id=run_id,
                 )
             else:
                 # MC mode: no LLM, random/PUCT selection

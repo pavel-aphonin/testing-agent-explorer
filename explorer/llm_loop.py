@@ -85,6 +85,11 @@ class LLMExplorationLoop:
         rag_token: str = "",
         test_data: dict[str, str] | None = None,
         scenarios: list[dict] | None = None,
+        max_steps_per_screen: int = 20,
+        defect_detection_enabled: bool = True,
+        defect_llm_base_url: str | None = None,
+        defect_callback: "Callable[[dict], Awaitable[None]] | None" = None,
+        run_id: str | None = None,
     ) -> None:
         self.controller = controller
         self.app_bundle_id = app_bundle_id
@@ -106,6 +111,25 @@ class LLMExplorationLoop:
         # The agent walks them in order (with {{test_data.key}} substitution),
         # then falls back to free exploration for remaining steps.
         self.scenarios: list[dict] = scenarios or []
+        # Budget cap: if the agent spends more than this many consecutive steps
+        # on the same screen_id, we force-move it away. Prevents "LLM burns all
+        # tokens typing 1, 2, 3, ... into a number field" (Garri's concern at
+        # the demo). Default 20 ~ enough for typical form fill + submit.
+        self.max_steps_per_screen = max_steps_per_screen
+        self._current_screen_step_count = 0
+
+        # Defect detector: after each action, ask a separate LLM call whether
+        # what we observed is a real defect (vs infra noise) and rank it.
+        # Defects are posted to the backend and surface in the Defects tab.
+        self.defect_callback = defect_callback
+        self.run_id = run_id
+        self._defect_detector = None
+        if defect_detection_enabled and defect_llm_base_url:
+            from explorer.defect_detector import DefectDetector
+            self._defect_detector = DefectDetector(
+                llm_base_url=defect_llm_base_url,
+                model="rag-chat",
+            )
 
         self.screens: dict[str, ScreenNode] = {}
         self.edges: list[GraphEdge] = []
@@ -202,12 +226,35 @@ class LLMExplorationLoop:
 
         print(f">>> Initial: {screen.name!r} ({len(screen.interactive_elements)} elements)", flush=True)
 
+        prev_screen_id = self._current_screen_id
         while self._step < self.max_steps:
             self._step += 1
             step = self._step
 
             screen = await self._capture()
             self.screens[screen.screen_id] = screen
+
+            # Per-screen budget: if we've spent too many steps on the same
+            # screen, force a "go back" to unstick the agent. Prevents LLM
+            # from burning tokens on pathological loops (e.g. "let me try
+            # entering numbers 1..1000 in this number field").
+            if screen.screen_id == prev_screen_id:
+                self._current_screen_step_count += 1
+            else:
+                self._current_screen_step_count = 1
+            prev_screen_id = screen.screen_id
+
+            if self._current_screen_step_count > self.max_steps_per_screen:
+                msg = (
+                    f"Лимит {self.max_steps_per_screen} шагов на одном экране "
+                    f"исчерпан — принудительно возвращаемся назад"
+                )
+                print(f">>> [Step {step}] {msg}", flush=True)
+                await self._emit({"type": "log", "step_idx": step, "message": msg})
+                await self._go_back()
+                self._current_screen_step_count = 0
+                continue
+
             self._current_screen_id = screen.screen_id
             elements = screen.interactive_elements
 
@@ -390,6 +437,48 @@ class LLMExplorationLoop:
                 print(f"    → Same screen", flush=True)
 
             await self._emit_edge(edge, step=step)
+
+            # Defect detection: ask a separate LLM whether what we observed
+            # is a real defect. Runs async — if the detector LLM is slow we
+            # don't block the main exploration loop.
+            if self._defect_detector is not None and self.defect_callback is not None:
+                try:
+                    verdict = await self._defect_detector.classify(
+                        action=action_type,
+                        element_label=element.label or "",
+                        value=value,
+                        screen_name_before=screen.name,
+                        screen_name_after=new_screen.name,
+                        element_count_before=len(elements),
+                        element_count_after=len(new_screen.interactive_elements),
+                        spec_snippet=rag_result if self.rag_enabled else None,
+                    )
+                    if verdict and verdict.is_defect and not verdict.is_infra:
+                        print(
+                            f"    ⚠ DEFECT [{verdict.priority}] {verdict.title}",
+                            flush=True,
+                        )
+                        await self.defect_callback({
+                            "run_id": self.run_id,
+                            "step_idx": step,
+                            "screen_id_hash": new_screen.screen_id,
+                            "screen_name": new_screen.name,
+                            "priority": verdict.priority,
+                            "kind": verdict.kind,
+                            "title": verdict.title,
+                            "description": verdict.description,
+                            "screenshot_path": getattr(new_screen, "screenshot_path", None),
+                            "llm_analysis_json": {
+                                "action": action_type,
+                                "element": element.label,
+                                "value": value,
+                                "before": screen.name,
+                                "after": new_screen.name,
+                            },
+                        })
+                except Exception:
+                    logger.exception("Defect detection crashed, ignoring")
+
             if step % 3 == 0 or is_new:
                 await self._emit_stats()
 
