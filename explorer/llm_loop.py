@@ -895,6 +895,14 @@ What should I do next? Respond with JSON only."""
         })
 
     async def _emit_edge(self, edge: GraphEdge, *, step: int) -> None:
+        # Bundle the per-action details into a single dict that maps
+        # 1:1 to the backend's edge.action_details_json column. The UI
+        # uses these fields when rendering the steps list and the
+        # PathFinder result.
+        details = {
+            "element": edge.action.target_label or edge.action.target_test_id or None,
+            "value": edge.action.input_text,
+        }
         await self._emit({
             "type": "edge_discovered",
             "step_idx": step,
@@ -902,9 +910,7 @@ What should I do next? Respond with JSON only."""
             "target_screen_hash": edge.target_screen_id,
             "action_type": str(edge.action.action_type),
             "success": edge.source_screen_id != edge.target_screen_id,
-            # Include element details for human-readable display
-            "element_label": edge.action.target_label or edge.action.target_test_id or None,
-            "input_text": edge.action.input_text,
+            "action_details": details,
         })
 
     async def _emit_stats(self) -> None:

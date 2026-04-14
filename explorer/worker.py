@@ -471,8 +471,10 @@ class RealExecutor:
                     os.environ.get("TA_LLM_BASE_URL", "http://localhost:8083"),
                 )
 
-                async def _post_defect(payload: dict) -> None:
-                    await client.post_defect(payload)
+                # Defect poster injected by execute_one_run from the
+                # BackendClient. Falls back to a no-op if missing — keeps
+                # tests green when the executor is invoked standalone.
+                _post_defect = config.get("_post_defect") or (lambda _payload: asyncio.sleep(0))
 
                 loop = LLMExplorationLoop(
                     controller=client,
@@ -555,6 +557,13 @@ async def execute_one_run(
     logger.info("Executing run %s (%s)", run_id, config.get("bundle_id"))
 
     sink = _make_event_sink(client, run_id)
+
+    # Inject the BackendClient's defect poster into the config so the
+    # executor can forward it to LLMExplorationLoop. Done at this layer
+    # because RealExecutor.run() already creates its own AXe client and
+    # we don't want to confuse the two — the AXe client talks to AXe,
+    # the BackendClient talks to our backend.
+    config["_post_defect"] = client.post_defect
 
     try:
         await executor.run(config, sink)

@@ -66,6 +66,43 @@ posting noise is not.
 Respond with ONLY the JSON object, no commentary."""
 
 
+def _extract_first_json_object(text: str) -> str | None:
+    """Return the first balanced {...} substring, or None if not found.
+
+    Walks the string tracking nesting depth and string literals. Used to
+    rescue verdicts when the model emits trailing reasoning after the JSON
+    object — json.loads alone would raise "Extra data" and we'd lose the
+    classification.
+    """
+    depth = 0
+    start = -1
+    in_str = False
+    escape = False
+    for i, c in enumerate(text):
+        if in_str:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+            continue
+        if c == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif c == "}":
+            if depth == 0:
+                continue
+            depth -= 1
+            if depth == 0 and start >= 0:
+                return text[start : i + 1]
+    return None
+
+
 @dataclass
 class DefectVerdict:
     """Parsed LLM response. `is_defect=True` means we should post a defect row."""
@@ -147,10 +184,20 @@ class DefectDetector:
                 resp.raise_for_status()
                 data = resp.json()
                 raw = (data["choices"][0]["message"].get("content") or "").strip()
-                # Strip potential thinking tags that leaked through response_format
+                # Qwen3 sometimes ignores response_format and emits things like
+                #   <think>...</think>
+                #   {"is_defect": ...}
+                #   "reasoning": "..."
+                # We need to (a) strip <think> blocks and (b) extract just the
+                # first valid JSON object — json.loads chokes on trailing text.
                 import re
                 raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-                parsed = json.loads(raw)
+                # Extract the first balanced {...} block. Stops at the first
+                # closing brace at depth 0; ignores braces inside strings.
+                first_obj = _extract_first_json_object(raw)
+                if first_obj is None:
+                    raise ValueError(f"no JSON object in response: {raw[:200]}")
+                parsed = json.loads(first_obj)
                 return DefectVerdict(
                     is_defect=bool(parsed.get("is_defect", False)),
                     is_infra=bool(parsed.get("is_infra", False)),
