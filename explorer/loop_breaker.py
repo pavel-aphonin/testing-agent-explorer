@@ -31,21 +31,30 @@ Strategy = Literal[
 class LoopVerdict:
     """Output of CycleDetector.check.
 
-    `is_stuck` flips True once we detect a pathological transition pattern.
-    `pattern_description` is human-readable text we feed to the LLM so it
-    knows WHY we think it's stuck. `suggested_strategies` is the toolbox
-    we offer — order doesn't imply preference, the LLM picks.
-
-    `escalation` rises with repeated triggers:
-      - "warn"  : first time in a while — soft nudge, let the LLM decide
-      - "force" : already warned recently and the loop continues — the
-                  caller should stop asking the LLM and take a
-                  deterministic action (pick an unused element / swipe).
+    `is_stuck`: a pathological transition pattern detected.
+    `pattern_kind`: what TYPE of loop — self_loop (A→A: action didn't
+       change screen) vs ping_pong (A↔B: bouncing between two screens)
+       vs repeat_edge (A→B→A→B→…: long cycle repeating).
+    `offending_ids`: the screen ids involved, so the caller can look
+       up pretty names before rendering.
+    `pattern_description`: pre-formatted Russian text for logs. The
+       caller typically replaces the ids with real screen names
+       before showing it to the user.
+    `suggested_strategies`: toolbox offered to the LLM.
+    `escalation`:
+       - "warn"  : first time in a while — soft nudge, let the LLM pick.
+       - "force" : loop persisted despite the previous warn — the
+                   caller should stop asking the LLM and take a
+                   deterministic action (pick an unused element /
+                   swipe / back-navigate).
     """
 
     is_stuck: bool
     pattern_description: str
     suggested_strategies: list[Strategy]
+    pattern_kind: Literal["self_loop", "ping_pong", "repeat_edge"] = "repeat_edge"
+    offending_ids: tuple[str, ...] = ()
+    repeat_count: int = 0
     escalation: Literal["warn", "force"] = "warn"
 
 
@@ -65,24 +74,24 @@ class CycleDetector:
 
     def __init__(self) -> None:
         self._buffer: deque[tuple[str, str]] = deque(maxlen=_WINDOW)
-        # Steps we already nagged about, so we don't surface the toolbox
-        # over and over for the same loop instance.
         self._last_alerted_at: int = -100
+        self._last_alerted_pattern: tuple[str, ...] = ()
 
     def record(self, source_id: str, target_id: str) -> None:
         self._buffer.append((source_id, target_id))
 
     def check(self, current_step: int) -> LoopVerdict:
         """Inspect the buffer, return a verdict."""
-        # Don't re-trigger within 5 steps of the last alert — the LLM
-        # needs time to actually try the strategy it picked.
-        if current_step - self._last_alerted_at < 5:
+        # Don't re-trigger within 3 steps of the last alert — gives the
+        # LLM time to try its chosen strategy. Shorter than the original
+        # 5 because ESCALATION to force-break needs to happen faster than
+        # the user can lose patience.
+        if current_step - self._last_alerted_at < 3:
             return LoopVerdict(False, "", [])
 
         if len(self._buffer) < _REPEAT_THRESHOLD:
             return LoopVerdict(False, "", [])
 
-        # Count occurrences of each transition.
         counts: dict[tuple[str, str], int] = {}
         for pair in self._buffer:
             counts[pair] = counts.get(pair, 0) + 1
@@ -91,23 +100,43 @@ class CycleDetector:
         if worst < _REPEAT_THRESHOLD:
             return LoopVerdict(False, "", [])
 
-        # Find the repeating pair for the description.
         offending = next(p for p, c in counts.items() if c == worst)
-        # Detect ping-pong A↔B specifically.
-        if (offending[1], offending[0]) in counts and counts[(offending[1], offending[0])] >= 2:
+
+        # Classify the pattern — three kinds need different responses.
+        if offending[0] == offending[1]:
+            kind = "self_loop"
             description = (
-                f"ты {worst} раза подряд переходил между двумя экранами "
-                f"({_short(offending[0])} ↔ {_short(offending[1])}). "
-                "Скорее всего, ожидаемого элемента на этих экранах нет."
+                f"ты {worst} раз подряд оставался на одном экране — "
+                f"действие не меняет состояние приложения."
             )
+            offending_ids = (offending[0],)
+        elif (
+            (offending[1], offending[0]) in counts
+            and counts[(offending[1], offending[0])] >= 2
+        ):
+            kind = "ping_pong"
+            description = (
+                f"ты {worst} раз подряд прыгал между двумя экранами. "
+                f"Скорее всего, нужного элемента ни на одном из них нет."
+            )
+            offending_ids = (offending[0], offending[1])
         else:
+            kind = "repeat_edge"
             description = (
-                f"один и тот же переход ({_short(offending[0])} → "
-                f"{_short(offending[1])}) повторился {worst} раз — это "
-                "циклическое поведение."
+                f"один и тот же переход повторился {worst} раз — "
+                f"похоже, ты в цикле."
             )
+            offending_ids = (offending[0], offending[1])
+
+        # ESCALATION: if we alerted the same pattern recently, we already
+        # gave the LLM a chance and it didn't work. Tell the caller to
+        # stop asking and take over deterministically.
+        escalation: Literal["warn", "force"] = "warn"
+        if offending_ids == self._last_alerted_pattern:
+            escalation = "force"
 
         self._last_alerted_at = current_step
+        self._last_alerted_pattern = offending_ids
         return LoopVerdict(
             is_stuck=True,
             pattern_description=description,
@@ -118,6 +147,10 @@ class CycleDetector:
                 "fuzzy_lookup",
                 "abandon_scenario",
             ],
+            pattern_kind=kind,
+            offending_ids=offending_ids,
+            repeat_count=worst,
+            escalation=escalation,
         )
 
 

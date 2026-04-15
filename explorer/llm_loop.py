@@ -154,6 +154,15 @@ class LLMExplorationLoop:
         # When set, the next call to _build_system_prompt appends the
         # loop-breaking instructions ONCE, then clears itself.
         self._loop_break_addendum: str | None = None
+        # Set by the cycle detector when a WARN escalated to FORCE.
+        # On the next iteration we skip the LLM call entirely and
+        # pick an unused element from the current screen. Cleared
+        # after one forced step.
+        self._force_break: bool = False
+        # Per-screen set of (action_type, element_label) we've already
+        # tried. Used for the forced-break fallback to find something
+        # new to poke.
+        self._tried_per_screen: dict[str, set[tuple[str, str]]] = {}
 
         # Suspect-action queue for batched defect detection. Each entry
         # is a snapshot of the step's context that we'll pass to the
@@ -410,8 +419,54 @@ DEFECTS to flag (the DefectDetector will pick these up):
                     await self._swipe_back()
                     continue
 
-            # Ask LLM what to do
-            decision = await self._ask_llm(screen, elements)
+            # Forced cycle-break: previous iteration ESCALATED to force.
+            # Skip the LLM entirely and pick an element the agent hasn't
+            # tried on this screen. If everything's been tried, go back.
+            decision = None
+            if self._force_break:
+                self._force_break = False
+                tried = self._tried_per_screen.setdefault(
+                    self._current_screen_id, set(),
+                )
+                _BACK = {"Вход", "Back", "Назад", "<", "‹", "Close", "Закрыть", "Профиль"}
+                chosen_idx: int | None = None
+                for i, el in enumerate(elements):
+                    label = (el.label or "").strip()
+                    if label in _BACK:
+                        continue
+                    key = (el.kind.value if hasattr(el.kind, "value") else str(el.kind), label)
+                    if key not in tried:
+                        chosen_idx = i
+                        break
+                if chosen_idx is not None:
+                    chosen_el = elements[chosen_idx]
+                    decision = {
+                        "action": "input" if chosen_el.kind == ElementKind.TEXT_FIELD else "tap",
+                        "element_index": chosen_idx,
+                        "value": (
+                            "test@test.com" if "email" in ((chosen_el.test_id or "") + (chosen_el.label or "")).lower()
+                            else "password123" if "password" in ((chosen_el.test_id or "") + (chosen_el.label or "")).lower()
+                            else None
+                        ),
+                        "reasoning": "Force cycle-break: picking an element I haven't tried on this screen yet.",
+                    }
+                    print(
+                        f">>> [Step {step}] FORCE-BREAK: picking untried element {chosen_idx} ({chosen_el.label!r})",
+                        flush=True,
+                    )
+                else:
+                    # Everything tried — swipe up to reveal hidden elements,
+                    # then let the next iteration resume normal behaviour.
+                    print(f">>> [Step {step}] FORCE-BREAK: all tried, swiping up", flush=True)
+                    try:
+                        await self._swipe("up")
+                    except Exception:
+                        pass
+                    continue
+
+            # Ask LLM what to do (unless force-break already decided)
+            if decision is None:
+                decision = await self._ask_llm(screen, elements)
             if decision is None:
                 # Fallback: tap first untried element, SKIPPING back buttons
                 _BACK_LABELS = {"Вход", "Back", "Назад", "<", "‹", "Close", "Закрыть"}
@@ -543,22 +598,53 @@ DEFECTS to flag (the DefectDetector will pick these up):
 
             await self._emit_edge(edge, step=step)
 
-            # Cycle detection: record this transition and, if a loop is
-            # detected, prime the next system prompt with a toolbox of
-            # escape strategies the LLM can choose from.
+            # Cycle detection — two-stage:
+            #   warn  → prompt gets a toolbox of strategies for next turn
+            #   force → we take over, pick an unused element ourselves
             self._cycle_detector.record(before, new_screen.screen_id)
             verdict = self._cycle_detector.check(step)
             if verdict.is_stuck:
                 from explorer.loop_breaker import render_toolbox_for_prompt
-                self._loop_break_addendum = render_toolbox_for_prompt(
-                    verdict.suggested_strategies,
-                    verdict.pattern_description,
-                )
+                # Substitute pretty screen names for the raw hashes in the
+                # user-facing message. The prompt addendum for the LLM
+                # keeps the analyser text as-is (it's already decent).
+                pretty_ids = [
+                    (self.screens[sid].name if sid in self.screens else sid[:8])
+                    for sid in verdict.offending_ids
+                ]
+                if verdict.pattern_kind == "self_loop":
+                    user_message = (
+                        f"🔁 Агент застрял: уже {verdict.repeat_count} раз "
+                        f"подряд не смог уйти с экрана «{pretty_ids[0]}»."
+                    )
+                elif verdict.pattern_kind == "ping_pong" and len(pretty_ids) == 2:
+                    user_message = (
+                        f"🔁 Агент застрял: {verdict.repeat_count} раз "
+                        f"прыгает между «{pretty_ids[0]}» и «{pretty_ids[1]}»."
+                    )
+                else:
+                    user_message = f"🔁 Агент застрял: {verdict.pattern_description}"
+                if verdict.escalation == "force":
+                    user_message += " Беру управление на себя — пробую новые элементы."
+                else:
+                    user_message += " Предлагаю модели выбрать стратегию выхода."
                 await self._emit({
                     "type": "log",
                     "step_idx": step,
-                    "message": f"🔁 Похоже, агент застрял: {verdict.pattern_description} Предлагаю выбрать стратегию выхода.",
+                    "message": user_message,
                 })
+
+                if verdict.escalation == "warn":
+                    # Soft mode: nudge the LLM with a toolbox next turn.
+                    self._loop_break_addendum = render_toolbox_for_prompt(
+                        verdict.suggested_strategies,
+                        verdict.pattern_description,
+                    )
+                else:
+                    # Hard mode: the warn didn't help. Override the agent
+                    # plan on the next iteration by picking an unused
+                    # element from the current screen ourselves.
+                    self._force_break = True
 
             # Defect detection — three optimisations layered on top of the
             # original "every step gets classified" approach:
@@ -1184,7 +1270,28 @@ What should I do next? Respond with JSON only."""
                 # Take first line only — sometimes the model continues
                 # with a second-line explanation.
                 raw = raw.split("\n")[0].strip()
-                return raw[:60] if raw else fallback
+                # VALIDATION: the model occasionally echoes the prompt
+                # back ("Вопрос: Посмотри на скриншот..."). Reject any
+                # output that:
+                #   - is empty after cleanup
+                #   - is suspiciously long (> 6 words or > 40 chars)
+                #   - contains phrases from the prompt itself
+                if not raw:
+                    return fallback
+                word_count = len(raw.split())
+                lowered = raw.lower()
+                banned = (
+                    "посмотри", "придумай", "вопрос:", "скриншот",
+                    "ответь", "название", "мобильного", "экрана:",
+                )
+                if (
+                    len(raw) > 40
+                    or word_count > 6
+                    or any(b in lowered for b in banned)
+                ):
+                    logger.warning("vision returned unusable name: %r", raw[:80])
+                    return fallback
+                return raw
         except Exception:
             return fallback
 
