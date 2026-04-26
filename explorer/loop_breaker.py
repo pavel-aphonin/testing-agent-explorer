@@ -58,15 +58,43 @@ class LoopVerdict:
     escalation: Literal["warn", "force"] = "warn"
 
 
+import os as _os
+
+
+def _env_int(name: str, default: int, lo: int, hi: int) -> int:
+    """Read an int env var, clamp to [lo, hi]; fall back to ``default``
+    on missing / unparseable / out-of-range — never crash a worker on
+    a malformed config string."""
+    raw = _os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        v = int(raw)
+    except ValueError:
+        return default
+    return max(lo, min(hi, v))
+
+
 # Window size = how many recent transitions we look at when deciding
 # "is this a loop". Small enough that one-off retries don't trigger,
 # large enough to catch A↔B↔A↔B oscillation across 4-6 steps.
-_WINDOW = 8
+# Default lowered from 8 to 5 (PER-23): ~3-step worse-case detection
+# instead of ~24 steps. Override via TA_LOOP_WINDOW for noisy apps.
+_WINDOW = _env_int("TA_LOOP_WINDOW", 5, 3, 30)
 
 # How many times the SAME (source_hash, target_hash) pair must repeat in
-# the window before we shout "loop". 3 is a good balance: 2 might be a
-# normal back-navigation, 4+ wastes too many steps.
-_REPEAT_THRESHOLD = 3
+# the window before we shout "loop". Lowered from 3 to 2 (PER-23):
+# reacts after the first repeat instead of waiting for two — the
+# escalation to force-break still gives the LLM one chance to fix
+# itself before we take over. Override via TA_LOOP_REPEAT_THRESHOLD.
+_REPEAT_THRESHOLD = _env_int("TA_LOOP_REPEAT_THRESHOLD", 2, 2, 10)
+
+# Self-loop guard: ANY two consecutive identical (source, target)
+# transitions where source == target trigger an immediate force-break
+# on the third occurrence — no need to fill the window. This catches
+# the "tap on a no-op button 50 times" failure mode that the windowed
+# heuristic only catches after multiple cycles.
+_SELF_LOOP_FAST_PATH = _env_int("TA_LOOP_SELFLOOP_FASTPATH", 2, 1, 10)
 
 
 class CycleDetector:
@@ -88,6 +116,28 @@ class CycleDetector:
         # the user can lose patience.
         if current_step - self._last_alerted_at < 3:
             return LoopVerdict(False, "", [])
+
+        # Fast-path: N consecutive self-loops (A→A→A…) at the tail of
+        # the buffer mean the agent is hammering an inert element. Fire
+        # immediately at force-level, don't wait to fill the window.
+        if len(self._buffer) >= _SELF_LOOP_FAST_PATH + 1:
+            tail = list(self._buffer)[-(_SELF_LOOP_FAST_PATH + 1):]
+            if all(s == t for (s, t) in tail) and len({p for p in tail}) == 1:
+                node = tail[0][0]
+                self._last_alerted_at = current_step
+                self._last_alerted_pattern = (node,)
+                return LoopVerdict(
+                    is_stuck=True,
+                    pattern_description=(
+                        f"{len(tail)} раза подряд экран не сменился — "
+                        f"действие не работает, переключаюсь на другую стратегию."
+                    ),
+                    suggested_strategies=["skip_step", "swipe_to_find"],
+                    pattern_kind="self_loop",
+                    offending_ids=(node,),
+                    repeat_count=len(tail),
+                    escalation="force",
+                )
 
         if len(self._buffer) < _REPEAT_THRESHOLD:
             return LoopVerdict(False, "", [])
