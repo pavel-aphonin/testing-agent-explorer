@@ -510,6 +510,25 @@ class RealExecutor:
                     event_callback=event_sink,
                 )
 
+            # PER-18: explicit scenario runner walks the configured
+            # scenario steps deterministically before handing off to
+            # free exploration. Runs in HYBRID/AI/MC alike — works
+            # purely off the controller and emits scenario.* events.
+            scenarios_cfg = config.get("scenarios") or []
+            if scenarios_cfg:
+                try:
+                    from explorer.scenario_runner import ScenarioRunner
+                    sr = ScenarioRunner(
+                        controller=client,
+                        scenarios=scenarios_cfg,
+                        test_data=config.get("test_data") or {},
+                        event_callback=event_sink,
+                    )
+                    sr_summary = await sr.run_all()
+                    logger.info("[scenario] summary: %s", sr_summary)
+                except Exception:
+                    logger.exception("Scenario runner crashed — continuing to free exploration")
+
             try:
                 result = await loop.run()
                 logger.info("Loop result: %s", result)

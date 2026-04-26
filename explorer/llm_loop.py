@@ -310,11 +310,12 @@ DEFECTS to flag (the DefectDetector will pick these up):
 
         if self.scenarios:
             extras.append("")
-            extras.append("## Scenarios to follow FIRST (before free exploration)")
+            extras.append("## Scenarios already executed before you started (context only)")
             extras.append("")
             extras.append(
-                "The user has configured scripted scenarios. Execute each step in "
-                "order. After all scenarios complete, continue with free exploration."
+                "The deterministic ScenarioRunner has already attempted these steps. "
+                "Use the list as context — DO NOT repeat them. Pick up free "
+                "exploration from wherever the app is right now."
             )
             for sc in self.scenarios:
                 extras.append("")
