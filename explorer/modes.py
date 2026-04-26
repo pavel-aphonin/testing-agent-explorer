@@ -72,6 +72,14 @@ class ModeConfig:
     # screen but makes the resulting graph much more readable.
     llm_screen_naming: bool = True
 
+    # If True, attach the current screenshot to LLM calls so vision-
+    # capable models (Gemma 4 / Qwen 3.5) can see the actual UI in
+    # addition to the textual a11y tree. Default OFF so the legacy
+    # "text-only" behaviour holds for anyone with a non-vision model.
+    # Set per-mode below; opt-in via TA_LLM_VISION env var as the
+    # global override (truthy → force-on, falsy → force-off).
+    vision_enabled: bool = False
+
 
 MODE_CONFIGS: dict[ExplorationMode, ModeConfig] = {
     ExplorationMode.MC: ModeConfig(
@@ -91,6 +99,7 @@ MODE_CONFIGS: dict[ExplorationMode, ModeConfig] = {
         llm_per_step=True,
         rollout_depth=0,  # LLM provides value through reasoning, not rollouts
         llm_screen_naming=True,
+        vision_enabled=True,  # AI mode: pay the latency, gain visual bug detection
     ),
     ExplorationMode.HYBRID: ModeConfig(
         mode=ExplorationMode.HYBRID,
@@ -100,6 +109,7 @@ MODE_CONFIGS: dict[ExplorationMode, ModeConfig] = {
         llm_per_step=False,  # PUCT picks; LLM only sets priors at first sight
         rollout_depth=5,
         llm_screen_naming=True,
+        vision_enabled=True,  # one screenshot per new screen — cheap with caching
     ),
 }
 

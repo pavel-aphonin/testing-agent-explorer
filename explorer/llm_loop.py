@@ -126,6 +126,7 @@ class LLMExplorationLoop:
         defect_callback: "Callable[[dict], Awaitable[None]] | None" = None,
         run_id: str | None = None,
         pbt_enabled: bool = False,
+        vision_enabled: bool = True,
     ) -> None:
         self.controller = controller
         self.app_bundle_id = app_bundle_id
@@ -133,6 +134,11 @@ class LLMExplorationLoop:
         self.llm_model = llm_model
         self.max_steps = max_steps
         self.event_callback = event_callback
+        # Whether to attach the screen's screenshot to LLM "what next"
+        # calls (PER-22). Defaults to ON because both Gemma 4 and Qwen
+        # 3.5 are vision-capable through llama-server's mmproj sidecar.
+        # Override per-call via the TA_LLM_VISION env var.
+        self.vision_enabled = vision_enabled
         self.capture_retries = capture_retries
         self.capture_retry_delay = capture_retry_delay
         self.rag_enabled = rag_enabled
@@ -752,6 +758,33 @@ Recent history:
 
 What should I do next? Respond with JSON only."""
 
+        # Vision payload (PER-22): if the screen carries a screenshot
+        # AND the per-loop ``vision_enabled`` flag (or the global env
+        # override) is on, send the screenshot as an OpenAI vision
+        # content-list. This catches visual bugs (cropped text, wrong
+        # icons, contrast issues) that don't show up in the a11y tree.
+        # Skipped for screens without a screenshot — the loop falls
+        # back to the text-only prompt.
+        import os as _os
+        env_vision = _os.environ.get("TA_LLM_VISION")
+        if env_vision is not None:
+            vision_on = env_vision.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            vision_on = bool(getattr(self, "vision_enabled", True))
+        screenshot_b64 = screen.screenshot_b64 if vision_on else None
+        if screenshot_b64:
+            user_msg_content: Any = [
+                {"type": "text", "text": user_prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{screenshot_b64}",
+                    },
+                },
+            ]
+        else:
+            user_msg_content = user_prompt
+
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
                 resp = await client.post(
@@ -760,7 +793,7 @@ What should I do next? Respond with JSON only."""
                         "model": self.llm_model,
                         "messages": [
                             {"role": "system", "content": self._build_system_prompt()},
-                            {"role": "user", "content": user_prompt},
+                            {"role": "user", "content": user_msg_content},
                         ],
                         "max_tokens": 256,
                         "temperature": 0.3,

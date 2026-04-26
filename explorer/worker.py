@@ -328,8 +328,13 @@ class RealExecutor:
                 from explorer.llm_client import LLMClient, LLMPriorProvider
 
                 llm = LLMClient(base_url=llm_url, model_name=llm_model)
-                prior_provider = LLMPriorProvider(llm)
-                logger.info("LLM prior provider enabled (mode=%s)", mode.value)
+                prior_provider = LLMPriorProvider(
+                    llm, vision_enabled=mode_config.vision_enabled
+                )
+                logger.info(
+                    "LLM prior provider enabled (mode=%s, vision=%s)",
+                    mode.value, mode_config.vision_enabled,
+                )
             except Exception:
                 logger.exception("LLM prior provider failed — uniform priors")
 
@@ -490,6 +495,7 @@ class RealExecutor:
                     defect_callback=_post_defect,
                     run_id=run_id,
                     pbt_enabled=bool(config.get("pbt_enabled", False)),
+                    vision_enabled=mode_config.vision_enabled,
                 )
             else:
                 # MC mode: no LLM, random/PUCT selection

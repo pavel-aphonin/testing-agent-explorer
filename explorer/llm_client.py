@@ -75,9 +75,33 @@ class LLMClient:
         self.timeout = timeout
 
     async def chat(
-        self, system: str, user: str, max_tokens: int = MAX_TOKENS
+        self,
+        system: str,
+        user: str,
+        max_tokens: int = MAX_TOKENS,
+        screenshot_b64: str | None = None,
     ) -> str | None:
-        """Single-shot chat completion. Returns the assistant's text, or None on error."""
+        """Single-shot chat completion. Returns the assistant's text, or None on error.
+
+        When ``screenshot_b64`` is provided the user message is sent as
+        an OpenAI vision content-list — text + image_url(data:image/png;
+        base64,…). Both Gemma 4 E4B and Qwen 3.5 35B-A3B are vision-
+        capable through llama-server's mmproj sidecar (PER-22), so this
+        unlocks "agent looks at the screen" mode without changing the
+        infrastructure.
+        """
+        if screenshot_b64:
+            user_content: Any = [
+                {"type": "text", "text": user},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{screenshot_b64}",
+                    },
+                },
+            ]
+        else:
+            user_content = user
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.post(
@@ -86,7 +110,7 @@ class LLMClient:
                         "model": self.model_name,
                         "messages": [
                             {"role": "system", "content": system},
-                            {"role": "user", "content": user},
+                            {"role": "user", "content": user_content},
                         ],
                         "max_tokens": max_tokens,
                         "temperature": 0.2,
@@ -168,10 +192,25 @@ class LLMPriorProvider:
 
     The PUCT selector normalizes whatever we return — we don't have to
     make scores sum to 1, just rank them sensibly.
+
+    ``vision_enabled`` (PER-22): when True and the ScreenNode carries
+    a screenshot, send it alongside the textual element list. Visual
+    bugs (cropped text, weird colors, hidden buttons) become catchable;
+    the model can also disambiguate two elements with identical labels
+    by their on-screen position.
     """
 
-    def __init__(self, client: LLMClient) -> None:
+    def __init__(self, client: LLMClient, vision_enabled: bool = False) -> None:
         self.client = client
+        # ``TA_LLM_VISION`` overrides the per-mode setting at runtime —
+        # set to "0"/"false" to debug a vision-related model glitch
+        # without touching mode config.
+        import os as _os
+        env = _os.environ.get("TA_LLM_VISION")
+        if env is not None:
+            self.vision_enabled = env.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            self.vision_enabled = vision_enabled
 
     async def __call__(self, node: ScreenNode) -> dict[str, float]:
         elements = node.interactive_elements[:MAX_ELEMENTS_IN_PROMPT]
@@ -179,7 +218,10 @@ class LLMPriorProvider:
             return {}
 
         user_prompt = _build_user_prompt(elements)
-        raw = await self.client.chat(SYSTEM_PROMPT, user_prompt)
+        # Only attach the screenshot if the mode wants it AND we have
+        # one — passing None is cheaper than sending a placeholder.
+        screenshot = node.screenshot_b64 if self.vision_enabled else None
+        raw = await self.client.chat(SYSTEM_PROMPT, user_prompt, screenshot_b64=screenshot)
         if raw is None:
             logger.info(
                 "LLM returned no priors for screen %r — uniform", node.name
