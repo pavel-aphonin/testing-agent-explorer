@@ -103,6 +103,7 @@ class ExplorationEngine:
         max_steps: int = 200,
         prior_provider: PriorProvider | None = None,
         event_callback: EventCallback | None = None,
+        test_data: dict[str, str] | None = None,
     ):
         self.controller = controller
         self.app_bundle_id = app_bundle_id
@@ -114,7 +115,10 @@ class ExplorationEngine:
         self.prior_provider = prior_provider
         self.event_callback = event_callback
 
-        self.form_filler = FormFiller()
+        # ``test_data`` flows through the form filler as the highest-
+        # priority source for happy-path values — see PER-20. Empty
+        # dict keeps the legacy "use BUILTIN_VARIANTS" behaviour.
+        self.form_filler = FormFiller(test_data=test_data)
         self.current_screen_id: str | None = None
         self._stuck_count = 0
         self.step_idx = 0
