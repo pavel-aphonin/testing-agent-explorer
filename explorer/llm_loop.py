@@ -621,7 +621,17 @@ DEFECTS to flag (the DefectDetector will pick these up):
             else:
                 print(f"    → Same screen", flush=True)
 
-            await self._emit_edge(edge, step=step)
+            # Timeline (PER-25): pass the before- and after-screenshots
+            # plus the LLM's one-line reasoning. ``before`` is the screen
+            # we captured before the action (already has screenshot_b64
+            # cached on screen / ``screen``); ``after`` is new_screen.
+            await self._emit_edge(
+                edge,
+                step=step,
+                screenshot_before_b64=screen.screenshot_b64,
+                screenshot_after_b64=new_screen.screenshot_b64,
+                llm_reasoning=reasoning or None,
+            )
 
             # Cycle detection — two-stage:
             #   warn  → prompt gets a toolbox of strategies for next turn
@@ -1357,16 +1367,25 @@ What should I do next? Respond with JSON only."""
                 return candidate
         return f"{name} ({len(self._used_screen_names) + 1})"
 
-    async def _emit_edge(self, edge: GraphEdge, *, step: int) -> None:
+    async def _emit_edge(
+        self,
+        edge: GraphEdge,
+        *,
+        step: int,
+        screenshot_before_b64: str | None = None,
+        screenshot_after_b64: str | None = None,
+        llm_reasoning: str | None = None,
+    ) -> None:
         # Bundle the per-action details into a single dict that maps
         # 1:1 to the backend's edge.action_details_json column. The UI
         # uses these fields when rendering the steps list and the
-        # PathFinder result.
+        # PathFinder result. Optional ``screenshot_*_b64`` and
+        # ``llm_reasoning`` populate the per-step timeline (PER-25).
         details = {
             "element": edge.action.target_label or edge.action.target_test_id or None,
             "value": edge.action.input_text,
         }
-        await self._emit({
+        payload: dict[str, Any] = {
             "type": "edge_discovered",
             "step_idx": step,
             "source_screen_hash": edge.source_screen_id,
@@ -1374,7 +1393,14 @@ What should I do next? Respond with JSON only."""
             "action_type": str(edge.action.action_type),
             "success": edge.source_screen_id != edge.target_screen_id,
             "action_details": details,
-        })
+        }
+        if screenshot_before_b64:
+            payload["screenshot_before_b64"] = screenshot_before_b64
+        if screenshot_after_b64:
+            payload["screenshot_after_b64"] = screenshot_after_b64
+        if llm_reasoning:
+            payload["llm_reasoning"] = llm_reasoning
+        await self._emit(payload)
 
     async def _emit_stats(self) -> None:
         await self._emit({
