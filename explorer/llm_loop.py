@@ -215,18 +215,36 @@ class LLMExplorationLoop:
         self._consecutive_no_new = 0  # count steps with no new discoveries
 
     def _substitute_test_data(self, text: str) -> str:
-        """Replace {{test_data.KEY}} placeholders with configured values."""
+        """Replace {{test_data.KEY}} placeholders with configured values.
+
+        Logs ``unresolved placeholder`` warnings (PER-21) when the
+        regex matches a key that isn't in ``self.test_data`` — those
+        get returned as the literal placeholder string and would
+        otherwise silently flow into the LLM prompt as junk text."""
         import re
         if not text or "{{" not in text:
             return text
 
+        unresolved: list[str] = []
+
         def _repl(match: "re.Match[str]") -> str:
             key = match.group(1).strip()
-            return self.test_data.get(key, match.group(0))
+            if key not in self.test_data:
+                unresolved.append(key)
+                return match.group(0)
+            return self.test_data[key]
 
         # Supports {{test_data.email}} and shorthand {{email}}
         text = re.sub(r"\{\{\s*test_data\.(\w+)\s*\}\}", _repl, text)
         text = re.sub(r"\{\{\s*(\w+)\s*\}\}", _repl, text)
+        if unresolved:
+            # One log per substitution batch, not per match — keeps the
+            # log readable when a long step uses several placeholders.
+            logger.warning(
+                "[scenario] unresolved placeholders: %s — left as literals "
+                "in the prompt; add them to workspace test_data",
+                ", ".join(sorted(set(unresolved))),
+            )
         return text
 
     @staticmethod
