@@ -150,10 +150,6 @@ async def test_full_run_through_http_mesh(
                 backend_url=backend_url,
                 worker_token=worker_token,
                 poll_interval=WORKER_POLL_INTERVAL,
-                # `executor_kind` is ignored because we're passing an
-                # explicit executor below — we still set it to "real"
-                # so anyone reading logs sees the intent.
-                executor_kind="real",
                 stop_event=worker_stop,
                 executor=executor,
             )

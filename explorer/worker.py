@@ -15,19 +15,12 @@ The worker loop:
     3. On success, post a final status_change to "completed".
        On exception, post status_change to "failed" with error message.
 
-This file ships TWO execution backends:
-
-    SyntheticExecutor    For Block 4a — generates fake screens and
-                         edges with delays so the live progress
-                         pipeline can be validated end-to-end without
-                         a simulator.
-
-    RealExecutor         For Block 4b — calls the actual exploration
-                         engine. Stub today; will be filled in once
-                         engine.py is refactored to PUCT + Go-Explore.
-
-Both executors implement the same `run(config, event_sink)` interface
-so the loop doesn't care which one is in use.
+Worker uses a single execution backend — RealExecutor — that drives the
+PUCT + Go-Explore engine against a real iOS simulator / Android emulator
+through xcrun / Appium / AXe. The synthetic executor that previously
+generated fake screens for pipe-validation was removed in PER-48: it
+silently swallowed real-app uploads when accidentally left enabled and
+confused users about whether their build had actually been explored.
 """
 
 from __future__ import annotations
@@ -35,7 +28,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import random
 import signal
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -154,125 +146,9 @@ class RunCancelled(Exception):
 
 
 # ----------------------------------------------------------------------------
-# Synthetic executor (Block 4a — pipe validation, no simulator)
-# ----------------------------------------------------------------------------
-
-
-class SyntheticExecutor:
-    """Generates a deterministic fake exploration trajectory.
-
-    The point isn't to test the explorer — it's to prove the pipe works:
-    worker → backend → Postgres → Redis → WebSocket → browser.
-
-    Trajectory:
-        - Walks max_steps steps
-        - Discovers a new screen with probability ~0.4 each step
-        - Records an edge from the previous screen to the current one
-        - Sleeps 0.5s between steps so the user actually sees streaming
-        - Halfway through, sends a stats_update event
-    """
-
-    NAMES = [
-        "Login",
-        "HomeScreen",
-        "ProductList",
-        "ProductDetail",
-        "Cart",
-        "Checkout",
-        "Profile",
-        "Settings",
-        "About",
-        "Help",
-        "OrderHistory",
-        "PaymentMethods",
-        "Addresses",
-        "Notifications",
-        "SearchResults",
-    ]
-
-    async def run(self, config: dict[str, Any], event_sink: EventSink) -> None:
-        max_steps = max(int(config.get("max_steps", 20)), 5)
-        steps_to_run = min(max_steps, 30)
-
-        screens_seen: list[str] = []
-        prev_hash: str | None = None
-        new_screens = 0
-        new_edges = 0
-
-        for step in range(1, steps_to_run + 1):
-            await asyncio.sleep(0.5)
-
-            # Decide whether to "discover" a new screen this step
-            should_create_new_screen = (
-                len(screens_seen) == 0 or random.random() < 0.4
-            )
-
-            if should_create_new_screen and len(screens_seen) < len(self.NAMES):
-                idx = len(screens_seen)
-                name = self.NAMES[idx]
-                screen_hash = f"synthetic-{idx:03d}-{name.lower()}"
-                screens_seen.append(screen_hash)
-                new_screens += 1
-                await event_sink(
-                    {
-                        "type": "screen_discovered",
-                        "step_idx": step,
-                        "screen_id_hash": screen_hash,
-                        "screen_name": name,
-                    }
-                )
-            else:
-                # Re-visit a known screen
-                screen_hash = random.choice(screens_seen)
-
-            if prev_hash is not None and prev_hash != screen_hash:
-                action_type = random.choice(["tap", "swipe", "type"])
-                await event_sink(
-                    {
-                        "type": "edge_discovered",
-                        "step_idx": step,
-                        "source_screen_hash": prev_hash,
-                        "target_screen_hash": screen_hash,
-                        "action_type": action_type,
-                        "success": True,
-                    }
-                )
-                new_edges += 1
-
-            prev_hash = screen_hash
-
-            # Halfway-through stats update
-            if step == steps_to_run // 2:
-                await event_sink(
-                    {
-                        "type": "stats_update",
-                        "step_idx": step,
-                        "stats": {
-                            "screens": new_screens,
-                            "edges": new_edges,
-                            "step": step,
-                            "max_steps": steps_to_run,
-                        },
-                    }
-                )
-
-        # Final stats
-        await event_sink(
-            {
-                "type": "stats_update",
-                "step_idx": steps_to_run,
-                "stats": {
-                    "screens": new_screens,
-                    "edges": new_edges,
-                    "step": steps_to_run,
-                    "max_steps": steps_to_run,
-                },
-            }
-        )
-
-
-# ----------------------------------------------------------------------------
-# Real executor (Block 4b — TODO)
+# Real executor — drives the PUCT + Go-Explore engine against iOS/Android.
+# Synthetic executor was removed in PER-48: it generated fake trajectories
+# that silently swallowed real-app uploads and confused users.
 # ----------------------------------------------------------------------------
 
 
@@ -640,7 +516,7 @@ def _make_event_sink(client: BackendClient, run_id: str) -> EventSink:
 async def execute_one_run(
     client: BackendClient,
     config: dict[str, Any],
-    executor: SyntheticExecutor | RealExecutor,
+    executor: RealExecutor,
 ) -> None:
     run_id = str(config["run_id"])
     logger.info("Executing run %s (%s)", run_id, config.get("bundle_id"))
@@ -680,67 +556,63 @@ async def worker_loop(
     backend_url: str,
     worker_token: str,
     poll_interval: float,
-    executor_kind: str,
     stop_event: asyncio.Event,
-    executor: SyntheticExecutor | RealExecutor | None = None,
+    executor: RealExecutor | None = None,
 ) -> None:
     # `executor` is an injection hook for integration tests: pass a
     # pre-built RealExecutor(client_factory=<fake controller>) and the
-    # loop will use it instead of constructing a fresh executor from
-    # `executor_kind`. Production (main()) never passes this — it sticks
-    # to the CLI-string-driven path below.
+    # loop will use it instead of constructing a fresh one. Production
+    # (main()) never passes this.
     client = BackendClient(backend_url, worker_token)
     if executor is None:
-        executor = (
-            SyntheticExecutor() if executor_kind == "synthetic" else RealExecutor()
-        )
+        executor = RealExecutor()
 
     logger.info(
-        "Worker started (backend=%s, poll=%ss, executor=%s)",
+        "Worker started (backend=%s, poll=%ss)",
         backend_url,
         poll_interval,
-        executor_kind,
     )
 
     # Report available simulator/emulator configs to the backend so the
-    # admin UI can show them in the device management page.
-    if executor_kind == "real":
-        try:
-            from explorer.simulator import (
-                AndroidEmulatorManager,
-                IOSSimulatorManager,
-            )
+    # admin UI can show them in the device management page. PER-48: this
+    # used to be gated on `executor_kind == "real"`; with synthetic gone
+    # there's no other branch.
+    try:
+        from explorer.simulator import (
+            AndroidEmulatorManager,
+            IOSSimulatorManager,
+        )
 
-            ios_runtimes = await IOSSimulatorManager.list_runtimes()
-            ios_devices = await IOSSimulatorManager.list_device_types()
-            android_images = await AndroidEmulatorManager.list_system_images()
-            android_devices = await AndroidEmulatorManager.list_device_types()
+        ios_runtimes = await IOSSimulatorManager.list_runtimes()
+        ios_devices = await IOSSimulatorManager.list_device_types()
+        android_images = await AndroidEmulatorManager.list_system_images()
+        android_devices = await AndroidEmulatorManager.list_device_types()
 
-            config_payload = {
-                "runtimes": ios_runtimes + android_images,
-                "device_types": ios_devices + android_devices,
-            }
-            await client._client.post(
-                f"{backend_url}/api/internal/runs/config",
-                headers={"Authorization": f"Bearer {worker_token}"},
-                json=config_payload,
-            )
+        config_payload = {
+            "runtimes": ios_runtimes + android_images,
+            "device_types": ios_devices + android_devices,
+        }
+        await client._client.post(
+            f"{backend_url}/api/internal/runs/config",
+            headers={"Authorization": f"Bearer {worker_token}"},
+            json=config_payload,
+        )
+        logger.info(
+            "Reported simulator config: %d runtimes, %d device types",
+            len(config_payload["runtimes"]),
+            len(config_payload["device_types"]),
+        )
+
+        # Clean up orphan TA-* simulators/AVDs from crashed runs
+        ios_cleaned = await IOSSimulatorManager.cleanup_orphans()
+        android_cleaned = await AndroidEmulatorManager.cleanup_orphans()
+        if ios_cleaned or android_cleaned:
             logger.info(
-                "Reported simulator config: %d runtimes, %d device types",
-                len(config_payload["runtimes"]),
-                len(config_payload["device_types"]),
+                "Cleaned up %d iOS + %d Android orphan simulators",
+                ios_cleaned, android_cleaned,
             )
-
-            # Clean up orphan TA-* simulators/AVDs from crashed runs
-            ios_cleaned = await IOSSimulatorManager.cleanup_orphans()
-            android_cleaned = await AndroidEmulatorManager.cleanup_orphans()
-            if ios_cleaned or android_cleaned:
-                logger.info(
-                    "Cleaned up %d iOS + %d Android orphan simulators",
-                    ios_cleaned, android_cleaned,
-                )
-        except Exception:
-            logger.exception("Failed to report simulator config or cleanup orphans")
+    except Exception:
+        logger.exception("Failed to report simulator config or cleanup orphans")
 
     # Heartbeat runs in its own task so the "Connected" indicator stays
     # green even while a run is executing. Previously it was inline in the
@@ -817,12 +689,7 @@ def main() -> None:
         default=DEFAULT_POLL_INTERVAL,
         help="Seconds between claim attempts when idle (default: %(default)s)",
     )
-    parser.add_argument(
-        "--executor",
-        choices=["synthetic", "real"],
-        default="synthetic",
-        help="Which executor to use (default: synthetic)",
-    )
+    # PER-48: --executor flag removed. Worker has only one mode now (real).
     parser.add_argument("-v", "--verbose", action="store_true")
 
     args = parser.parse_args()
@@ -839,7 +706,6 @@ def main() -> None:
             backend_url=args.backend_url,
             worker_token=args.worker_token,
             poll_interval=args.poll_interval,
-            executor_kind=args.executor,
             stop_event=stop_event,
         )
 
