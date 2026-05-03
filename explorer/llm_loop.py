@@ -625,12 +625,28 @@ DEFECTS to flag (the DefectDetector will pick these up):
             # plus the LLM's one-line reasoning. ``before`` is the screen
             # we captured before the action (already has screenshot_b64
             # cached on screen / ``screen``); ``after`` is new_screen.
+            #
+            # PER-36: also pack the RAG verdict (top match snippet +
+            # distance) into a structured shape. Score is 1 - distance
+            # so larger = more confident, matching how the UI labels it.
+            verdict_payload: dict | None = None
+            if rag_result and rag_result.get("matches"):
+                top = rag_result["matches"][0]
+                dist = float(top.get("distance", 1.0))
+                verdict_payload = {
+                    "matched": dist < 0.7,
+                    "score": round(max(0.0, 1.0 - dist), 3),
+                    "snippet": (top.get("text") or "")[:300],
+                    "document_id": top.get("document_id"),
+                    "document_title": top.get("document_title"),
+                }
             await self._emit_edge(
                 edge,
                 step=step,
                 screenshot_before_b64=screen.screenshot_b64,
                 screenshot_after_b64=new_screen.screenshot_b64,
                 llm_reasoning=reasoning or None,
+                rag_verdict=verdict_payload,
             )
 
             # Cycle detection — two-stage:
@@ -1387,6 +1403,7 @@ What should I do next? Respond with JSON only."""
         screenshot_before_b64: str | None = None,
         screenshot_after_b64: str | None = None,
         llm_reasoning: str | None = None,
+        rag_verdict: dict | None = None,
     ) -> None:
         # Bundle the per-action details into a single dict that maps
         # 1:1 to the backend's edge.action_details_json column. The UI
@@ -1412,6 +1429,8 @@ What should I do next? Respond with JSON only."""
             payload["screenshot_after_b64"] = screenshot_after_b64
         if llm_reasoning:
             payload["llm_reasoning"] = llm_reasoning
+        if rag_verdict:
+            payload["rag_verdict_json"] = rag_verdict
         await self._emit(payload)
 
     async def _emit_stats(self) -> None:
