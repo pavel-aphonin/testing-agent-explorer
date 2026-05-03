@@ -543,6 +543,56 @@ class RealExecutor:
                 except Exception:
                     logger.exception("Scenario runner crashed — continuing to free exploration")
 
+            # PER-40 / PER-41: replay a recorded action chain BEFORE
+            # free exploration. ``replay_actions`` arrives serialised
+            # by app/services/path_finder.py::serialize_action; we
+            # rebuild ActionDetail and call navigator.replay_action()
+            # one step at a time so each can emit its own log event.
+            replay_actions = config.get("replay_actions") or []
+            if replay_actions:
+                from explorer.models import ActionDetail, ActionType
+                from explorer.navigator import replay_action
+                logger.info(
+                    "[replay] playing %d recorded actions before exploration",
+                    len(replay_actions),
+                )
+                _ALLOWED_ATYPES = {at.value for at in ActionType}
+                for i, ra in enumerate(replay_actions):
+                    raw_type = (ra.get("action_type") or "tap").lower()
+                    atype = ActionType(raw_type) if raw_type in _ALLOWED_ATYPES else ActionType.TAP
+                    action = ActionDetail(
+                        action_type=atype,
+                        target_label=ra.get("target_label"),
+                        input_text=ra.get("input_text"),
+                    )
+                    ok = False
+                    try:
+                        ok = await asyncio.wait_for(
+                            replay_action(client, action), timeout=30
+                        )
+                    except Exception:
+                        logger.exception("[replay] action %d crashed", i)
+                    await event_sink({
+                        "type": "log",
+                        "step_idx": i,
+                        "message": (
+                            f"replay {i + 1}/{len(replay_actions)}: "
+                            f"{atype.value if hasattr(atype, 'value') else atype} "
+                            f"'{action.target_label or '—'}' "
+                            f"→ {'ok' if ok else 'FAIL'}"
+                        ),
+                    })
+                    # Settle between actions so each gets its own
+                    # screen capture later in the exploration loop.
+                    await asyncio.sleep(1.2)
+                logger.info("[replay] done — switching to free exploration")
+                # If max_steps == 0 the caller asked for replay-only
+                # mode (PER-40 with continue_after_replay=False).
+                # Skip the main loop in that case.
+                if max_steps <= 0:
+                    logger.info("[replay] max_steps=0 → stopping after replay")
+                    return
+
             try:
                 result = await loop.run()
                 logger.info("Loop result: %s", result)
