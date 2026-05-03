@@ -518,11 +518,25 @@ class RealExecutor:
             if scenarios_cfg:
                 try:
                     from explorer.scenario_runner import ScenarioRunner
+                    # PER-37: pass RAG endpoint + token + defect callback
+                    # so the runner can auto-verify expected_result against
+                    # scenario.rag_document_ids and emit spec_mismatch
+                    # defects without waiting for the LLM detector.
+                    backend_url = config.get("backend_url") or os.environ.get(
+                        "TA_BACKEND_URL", "http://localhost:8000"
+                    )
+                    worker_token = config.get("worker_token") or os.environ.get(
+                        "TA_WORKER_TOKEN", ""
+                    )
                     sr = ScenarioRunner(
                         controller=client,
                         scenarios=scenarios_cfg,
                         test_data=config.get("test_data") or {},
                         event_callback=event_sink,
+                        rag_base_url=backend_url,
+                        rag_token=worker_token,
+                        defect_callback=config.get("_post_defect"),
+                        run_id=run_id,
                     )
                     sr_summary = await sr.run_all()
                     logger.info("[scenario] summary: %s", sr_summary)

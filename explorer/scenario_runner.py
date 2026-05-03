@@ -86,11 +86,30 @@ class ScenarioRunner:
         scenarios: list[dict[str, Any]],
         test_data: dict[str, str] | None = None,
         event_callback: Callable[[dict], Awaitable[None]] | None = None,
+        # PER-37: optional RAG hookup. When all three are provided AND
+        # a step has both ``expected_result`` and the scenario has
+        # ``rag_document_ids``, the runner cross-checks the observed
+        # post-action screen against the spec. Mismatch → step_failed
+        # with reason="spec_mismatch" + a defect callback fires.
+        rag_base_url: str | None = None,
+        rag_token: str | None = None,
+        defect_callback: Callable[[dict], Awaitable[None]] | None = None,
+        run_id: str | None = None,
     ) -> None:
         self.controller = controller
         self.scenarios = scenarios or []
         self.test_data = test_data or {}
         self.event_callback = event_callback
+        self.rag_base_url = (rag_base_url or "").rstrip("/") or None
+        self.rag_token = rag_token or ""
+        self.defect_callback = defect_callback
+        self.run_id = run_id
+        # Cache scenario_id → rag_document_ids so each step doesn't
+        # re-walk the scenarios list.
+        self._docs_by_scenario: dict[str, list[str]] = {
+            str(s.get("id")): [str(d) for d in (s.get("rag_document_ids") or [])]
+            for s in self.scenarios
+        }
 
     async def run_all(self) -> dict[str, Any]:
         """Execute every scenario in order. Returns a summary dict so
@@ -149,6 +168,7 @@ class ScenarioRunner:
         action = (step.get("action") or "tap").lower()
         label = step.get("element_label") or ""
         value = _substitute_test_data(step.get("value") or "", self.test_data)
+        expected = (step.get("expected_result") or "").strip()
         await self._emit({
             "type": "scenario.step_started",
             "scenario_id": scenario_id,
@@ -161,15 +181,113 @@ class ScenarioRunner:
         except Exception as exc:
             logger.exception("[scenario] step crashed")
             ok, reason = False, f"crash: {exc}"
-        await self._emit({
+
+        # PER-37: spec verification. Only runs when the action itself
+        # succeeded — a tap on a missing button shouldn't ALSO get a
+        # spec_mismatch defect on top. Requires expected_result on
+        # the step + rag_document_ids on the scenario + RAG endpoint
+        # configured. Failure here downgrades ok to False with a
+        # specific reason and emits a P1 spec_mismatch defect.
+        rag_verdict: dict | None = None
+        if ok and expected and self.rag_base_url and self._docs_by_scenario.get(scenario_id):
+            rag_verdict = await self._verify_expected_against_rag(
+                expected=expected,
+                step_label=label,
+                step_value=value,
+                document_ids=self._docs_by_scenario[scenario_id],
+            )
+            if rag_verdict is not None and not rag_verdict.get("matched", True):
+                ok = False
+                reason = "spec_mismatch"
+                # Best-effort defect: don't kill the step if the
+                # callback raises (e.g. backend down).
+                try:
+                    if self.defect_callback and self.run_id:
+                        await self.defect_callback({
+                            "run_id": self.run_id,
+                            "step_idx": step_idx,
+                            "screen_name": (step.get("screen_name") or "")[:500] or None,
+                            "priority": "P1",
+                            "kind": "spec_mismatch",
+                            "title": f"Несоответствие спеке на шаге {step_idx + 1}",
+                            "description": (
+                                f"Ожидалось: «{expected}».\n"
+                                f"Найденный фрагмент спеки: «{rag_verdict.get('snippet') or '—'}».\n"
+                                f"Score: {rag_verdict.get('score', 0):.2f}."
+                            ),
+                            "llm_analysis_json": rag_verdict,
+                        })
+                except Exception:
+                    logger.exception("[scenario] defect callback failed")
+
+        evt: dict[str, Any] = {
             "type": "scenario.step_completed" if ok else "scenario.step_failed",
             "scenario_id": scenario_id,
             "step_idx": step_idx,
             "action": action,
             "element_label": label,
             "reason": reason,
-        })
+        }
+        if rag_verdict is not None:
+            evt["rag_verdict"] = rag_verdict
+        await self._emit(evt)
         return ok, reason
+
+    async def _verify_expected_against_rag(
+        self,
+        *,
+        expected: str,
+        step_label: str,
+        step_value: str,
+        document_ids: list[str],
+    ) -> dict | None:
+        """Ask the workspace's RAG corpus whether ``expected`` matches
+        the spec. Returns the structured verdict (same shape as PER-36
+        Edge.rag_verdict_json) or None on transport failure.
+
+        Threshold mirror PER-36: matched=True when distance < 0.7
+        (i.e. score > 0.3). Tighter than the visual ✓/⚠/✗ split
+        because spec verification is harsher — partial matches
+        shouldn't pass."""
+        import httpx
+        # Compose a query that gives the embedder both the user
+        # expectation and the action that produced it. The action
+        # context narrows search to the right section of the spec.
+        query = (
+            f"Expected behaviour after action '{step_label or 'step'}'"
+            + (f" with value '{step_value}'" if step_value else "")
+            + f": {expected}"
+        )
+        payload = {"query": query, "top_k": 3, "document_ids": document_ids}
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    f"{self.rag_base_url}/api/admin/knowledge/query",
+                    headers={"Authorization": f"Bearer {self.rag_token}"},
+                    json=payload,
+                )
+                if resp.status_code != 200:
+                    return None
+                data = resp.json()
+                matches = data.get("matches", [])
+                if not matches:
+                    return {
+                        "matched": False, "score": 0.0,
+                        "snippet": "", "document_id": None,
+                        "document_title": None,
+                    }
+                top = matches[0]
+                dist = float(top.get("distance", 1.0))
+                return {
+                    "matched": dist < 0.7,
+                    "score": round(max(0.0, 1.0 - dist), 3),
+                    "snippet": (top.get("text") or "")[:300],
+                    "document_id": top.get("document_id"),
+                    "document_title": top.get("document_title"),
+                }
+        except Exception as exc:
+            logger.warning("[scenario] RAG verify failed: %s", exc)
+            return None
 
     async def _dispatch(
         self, action: str, label: str, value: str
