@@ -887,12 +887,24 @@ What should I do next? Respond with JSON only."""
             f"Result: navigated to '{target_screen}'. "
             f"Is this expected behavior?"
         )
+        # PER-35: collect doc allow-list across all currently-active
+        # scenarios. If any scenario carries `rag_document_ids`, the
+        # search is restricted to that union; if none do, we fall back
+        # to whole-corpus search (legacy behaviour).
+        doc_ids: list[str] = []
+        for sc in self.scenarios:
+            for d in (sc.get("rag_document_ids") or []):
+                if d not in doc_ids:
+                    doc_ids.append(str(d))
+        payload = {"query": query, "top_k": 3}
+        if doc_ids:
+            payload["document_ids"] = doc_ids
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.post(
                     f"{self.rag_base_url}/api/admin/knowledge/query",
                     headers={"Authorization": f"Bearer {self.rag_token}"},
-                    json={"query": query, "top_k": 3},
+                    json=payload,
                 )
                 if resp.status_code == 200:
                     data = resp.json()
