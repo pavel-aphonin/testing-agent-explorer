@@ -49,12 +49,46 @@ EventSink = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 class BackendClient:
-    """Tiny async HTTP client wrapping the worker's view of the backend."""
+    """Tiny async HTTP client wrapping the worker's view of the backend.
+
+    PER-51: ``trust_env=False`` is critical on corporate macs with security
+    suites (Norton 360, McAfee, Symantec, etc.) that set up a system-wide
+    HTTP proxy via ``scutil --proxy`` — even when the proxy env vars are
+    cleared, httpx with default ``trust_env=True`` reads the macOS system
+    proxy config and routes localhost requests through 127.0.0.1:1082
+    (Norton's inline inspector), which then 503s our internal endpoints.
+
+    Setting ``trust_env=False`` makes httpx ignore both env vars AND the
+    system proxy config, talking directly to the backend over loopback.
+    Confirmed via diagnostic test: with trust_env=True we get 403/503
+    from Norton; with trust_env=False we get 200 from FastAPI.
+
+    Optional UDS fallback: if ``TA_BACKEND_UDS`` is set and points at a
+    Unix socket on the host (e.g. via socat bridge), the client uses
+    that. Useful as defense-in-depth in case some future security suite
+    intercepts even direct localhost TCP — UDS is filesystem IPC and
+    invisible to network filters.
+    """
 
     def __init__(self, base_url: str, worker_token: str):
         self._base_url = base_url.rstrip("/")
         self._headers = {"Authorization": f"Bearer {worker_token}"}
-        self._client = httpx.AsyncClient(timeout=15.0)
+
+        backend_uds = os.environ.get("TA_BACKEND_UDS")
+        if backend_uds and Path(backend_uds).exists():
+            logger.info("Using UDS transport for backend: %s", backend_uds)
+            transport = httpx.AsyncHTTPTransport(uds=backend_uds)
+            self._client = httpx.AsyncClient(
+                transport=transport,
+                timeout=15.0,
+                trust_env=False,  # ← bypass macOS system proxy too
+            )
+            # Override base_url for actual requests — httpx ignores host
+            # when transport is UDS, but the URL must still be well-formed.
+            self._base_url = "http://backend"
+        else:
+            # PER-51: trust_env=False is the actual fix for Norton on dev macs.
+            self._client = httpx.AsyncClient(timeout=15.0, trust_env=False)
 
     async def claim_next(self) -> dict[str, Any] | None:
         """Try to claim the oldest pending run. Returns None if nothing available."""
