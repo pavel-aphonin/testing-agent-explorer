@@ -72,6 +72,10 @@ class BackendClient:
 
     def __init__(self, base_url: str, worker_token: str):
         self._base_url = base_url.rstrip("/")
+        # ``worker_token`` is exposed on the instance so downstream
+        # components (e.g. ScenarioRunner for RAG verification) can
+        # reuse the same auth header without re-fetching from CLI/env.
+        self.worker_token = worker_token
         self._headers = {"Authorization": f"Bearer {worker_token}"}
 
         backend_uds = os.environ.get("TA_BACKEND_UDS")
@@ -432,19 +436,22 @@ class RealExecutor:
                     # so the runner can auto-verify expected_result against
                     # scenario.rag_document_ids and emit spec_mismatch
                     # defects without waiting for the LLM detector.
-                    backend_url = config.get("backend_url") or os.environ.get(
-                        "TA_BACKEND_URL", "http://localhost:8000"
-                    )
-                    worker_token = config.get("worker_token") or os.environ.get(
-                        "TA_WORKER_TOKEN", ""
-                    )
+                    # PER-XX: backend URL + worker token were injected
+                    # into config by execute_one_run from the BackendClient
+                    # before the executor ran. We don't have direct access
+                    # to BackendClient here — `client` in this scope is
+                    # the AXeExplorerClient that drives the simulator.
                     sr = ScenarioRunner(
                         controller=client,
                         scenarios=scenarios_cfg,
                         test_data=config.get("test_data") or {},
                         event_callback=event_sink,
-                        rag_base_url=backend_url,
-                        rag_token=worker_token,
+                        rag_base_url=config.get("_backend_url") or os.environ.get(
+                            "TA_BACKEND_URL", "http://localhost:8000"
+                        ),
+                        rag_token=config.get("_worker_token") or os.environ.get(
+                            "TA_WORKER_TOKEN", ""
+                        ),
                         defect_callback=config.get("_post_defect"),
                         run_id=run_id,
                     )
@@ -563,6 +570,14 @@ async def execute_one_run(
     # we don't want to confuse the two — the AXe client talks to AXe,
     # the BackendClient talks to our backend.
     config["_post_defect"] = client.post_defect
+    # Same idea for the worker token — ScenarioRunner uses it to call
+    # the backend's RAG endpoint to verify expected_result against
+    # linked spec documents. Inject so the executor doesn't have to
+    # rediscover it from CLI/env (which fails when neither is set,
+    # because the Authorization header becomes `Bearer ` and the
+    # backend rejects with 401 - silently dropping all RAG checks).
+    config["_backend_url"] = client._base_url
+    config["_worker_token"] = client.worker_token
 
     try:
         await executor.run(config, sink)
@@ -608,36 +623,50 @@ async def worker_loop(
     )
 
     # Report available simulator/emulator configs to the backend so the
-    # admin UI can show them in the device management page. PER-48: this
-    # used to be gated on `executor_kind == "real"`; with synthetic gone
-    # there's no other branch.
+    # admin UI can show them in the device management page.
+    async def _report_simulator_config() -> bool:
+        """Report once. Returns True on success.
+
+        Cached in Redis with 300s TTL on the backend side, so this needs
+        to be re-called periodically — see refresh in _heartbeat_loop
+        below. Otherwise the admin "Add device" page 503s a few minutes
+        after worker startup.
+        """
+        try:
+            from explorer.simulator import (
+                AndroidEmulatorManager,
+                IOSSimulatorManager,
+            )
+
+            ios_runtimes = await IOSSimulatorManager.list_runtimes()
+            ios_devices = await IOSSimulatorManager.list_device_types()
+            android_images = await AndroidEmulatorManager.list_system_images()
+            android_devices = await AndroidEmulatorManager.list_device_types()
+
+            config_payload = {
+                "runtimes": ios_runtimes + android_images,
+                "device_types": ios_devices + android_devices,
+            }
+            await client._client.post(
+                f"{backend_url}/api/internal/runs/config",
+                headers={"Authorization": f"Bearer {worker_token}"},
+                json=config_payload,
+            )
+            return True
+        except Exception:
+            logger.exception("Failed to report simulator config")
+            return False
+
+    if await _report_simulator_config():
+        logger.info("Reported simulator config to backend (initial)")
+
+    # Clean up orphan TA-* simulators/AVDs from crashed runs (one-shot
+    # at startup; not part of the periodic loop).
     try:
         from explorer.simulator import (
             AndroidEmulatorManager,
             IOSSimulatorManager,
         )
-
-        ios_runtimes = await IOSSimulatorManager.list_runtimes()
-        ios_devices = await IOSSimulatorManager.list_device_types()
-        android_images = await AndroidEmulatorManager.list_system_images()
-        android_devices = await AndroidEmulatorManager.list_device_types()
-
-        config_payload = {
-            "runtimes": ios_runtimes + android_images,
-            "device_types": ios_devices + android_devices,
-        }
-        await client._client.post(
-            f"{backend_url}/api/internal/runs/config",
-            headers={"Authorization": f"Bearer {worker_token}"},
-            json=config_payload,
-        )
-        logger.info(
-            "Reported simulator config: %d runtimes, %d device types",
-            len(config_payload["runtimes"]),
-            len(config_payload["device_types"]),
-        )
-
-        # Clean up orphan TA-* simulators/AVDs from crashed runs
         ios_cleaned = await IOSSimulatorManager.cleanup_orphans()
         android_cleaned = await AndroidEmulatorManager.cleanup_orphans()
         if ios_cleaned or android_cleaned:
@@ -646,7 +675,7 @@ async def worker_loop(
                 ios_cleaned, android_cleaned,
             )
     except Exception:
-        logger.exception("Failed to report simulator config or cleanup orphans")
+        logger.exception("Failed to clean up orphan simulators")
 
     # Heartbeat runs in its own task so the "Connected" indicator stays
     # green even while a run is executing. Previously it was inline in the
@@ -654,9 +683,22 @@ async def worker_loop(
     # duration of execute_one_run() — runs take minutes to hours, so the
     # 60s Redis TTL would expire and the UI would show "Не подключено"
     # despite the worker doing real work right at that moment.
+    #
+    # Also refreshes the simulator-config Redis cache every ~3 minutes
+    # (well under its 300s TTL) so the admin UI's "Add device" page
+    # keeps working long after worker startup.
+    SIMCONFIG_REFRESH_EVERY = 36  # 36 × 5s heartbeat = 3 min
+
     async def _heartbeat_loop() -> None:
+        tick = 0
         while not stop_event.is_set():
             await client.post_heartbeat()
+            tick += 1
+            if tick % SIMCONFIG_REFRESH_EVERY == 0:
+                # Don't await this — failures are best-effort, and the
+                # heartbeat shouldn't block on simctl. But we DO want to
+                # see exceptions in the log.
+                asyncio.create_task(_report_simulator_config())
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=5.0)
             except asyncio.TimeoutError:
