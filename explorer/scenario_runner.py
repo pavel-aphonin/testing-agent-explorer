@@ -33,6 +33,8 @@ import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from explorer.expression import ExprError, evaluate as eval_expr
+
 logger = logging.getLogger("explorer.scenario_runner")
 
 
@@ -109,6 +111,15 @@ class ScenarioRunner:
         self._docs_by_scenario: dict[str, list[str]] = {
             str(s.get("id")): [str(d) for d in (s.get("rag_document_ids") or [])]
             for s in self.scenarios
+        }
+        # PER-83: rolling context fed to edge-condition evaluator. Lives
+        # at instance scope so a decision node can read state from the
+        # action that ran upstream of it. Reset between scenarios in
+        # ``_run_graph``.
+        self._cond_ctx: dict[str, Any] = {
+            "test_data": dict(self.test_data),
+            "last_action_result": None,
+            "last_screen": None,
         }
 
     async def run_all(self) -> dict[str, Any]:
@@ -208,6 +219,13 @@ class ScenarioRunner:
         action_count = sum(
             1 for n in nodes_by_id.values() if n.get("type") == "action"
         )
+        # PER-83: reset rolling context per scenario so a previous
+        # scenario's last_screen doesn't leak into this one's branches.
+        self._cond_ctx = {
+            "test_data": dict(self.test_data),
+            "last_action_result": None,
+            "last_screen": None,
+        }
         await self._emit({
             "type": "scenario.started",
             "scenario_id": sid,
@@ -283,14 +301,25 @@ class ScenarioRunner:
                         "[scenario] action %s failed (%s) — continuing",
                         current, reason,
                     )
+                # PER-83: feed the action's outcome into the rolling
+                # context so a downstream decision can branch on it.
+                self._cond_ctx["last_action_result"] = {
+                    "ok": ok,
+                    "reason": reason,
+                    "action": (step.get("action") or "tap").lower(),
+                    "element_label": step.get("element_label") or "",
+                }
                 action_idx += 1
                 await asyncio.sleep(_ACTION_SETTLE_SEC)
-            elif ntype in ("start",):
+            elif ntype in ("start", "decision"):
+                # Decision nodes don't *do* anything by themselves —
+                # the branching happens on outgoing edges via
+                # _pick_edge below. start is a no-op.
                 pass
             else:
-                # decision / wait / screen_check / loop_back — full
-                # semantics land in PER-83/84/85. For now just announce
-                # we saw the node and keep walking the first edge.
+                # wait / screen_check / loop_back — full semantics
+                # land in PER-84/85. For now announce we saw the node
+                # and keep walking the first edge.
                 await self._emit({
                     "type": "scenario.node_skipped",
                     "scenario_id": sid,
@@ -311,8 +340,23 @@ class ScenarioRunner:
                 failed += 1
                 break
 
-            # PER-83 will replace this with condition-aware edge picking.
-            picked = outgoing[0]
+            # PER-83: condition-aware edge picking.
+            #
+            # An edge with an empty / missing condition is the
+            # ``default`` branch — used when no other edge matches and
+            # also as the only sensible pick on plain action → action
+            # transitions where authoring conditions makes no sense.
+            #
+            # Walk outgoing in order; first edge with a truthy
+            # condition wins. If every edge has a condition and none
+            # matches, we fall back to the first edge without one. If
+            # there is no default either → step_failed with the list
+            # of conditions tried so the user can debug.
+            picked = await self._pick_edge(outgoing, sid, current)
+            if picked is None:
+                # ``_pick_edge`` already emitted the diagnostic event.
+                failed += 1
+                break
             next_id = picked.get("target") if isinstance(picked, dict) else None
 
             # Per-loop guard — fires when we cross a back-edge twice
@@ -346,6 +390,65 @@ class ScenarioRunner:
             "total_steps": action_count,
         })
         return {"completed": completed, "failed": failed}
+
+    async def _pick_edge(
+        self,
+        outgoing: list[dict[str, Any]],
+        sid: str,
+        from_node: str,
+    ) -> dict[str, Any] | None:
+        """Choose the next edge to traverse from a node with multiple
+        out-edges (PER-83).
+
+        Algorithm:
+          1. Walk outgoing in array order; first edge with a non-empty
+             condition that evaluates truthy wins.
+          2. Failing that, fall back to the first edge with no
+             condition at all (the "default" branch).
+          3. If neither yields a winner, emit a diagnostic
+             ``step_failed`` event with the list of conditions tried
+             and return None — caller stops the scenario.
+        """
+        default_edge: dict[str, Any] | None = None
+        tried: list[str] = []
+        for edge in outgoing:
+            if not isinstance(edge, dict):
+                continue
+            data = edge.get("data") or {}
+            cond = (data.get("condition") or "").strip()
+            if not cond:
+                if default_edge is None:
+                    default_edge = edge
+                continue
+            try:
+                ok = eval_expr(cond, self._cond_ctx)
+            except ExprError as exc:
+                # Bad expressions don't kill the scenario — log,
+                # remember as tried, and keep walking. If every other
+                # edge also fails to match we'll fall through to the
+                # default (or step_failed below).
+                logger.warning(
+                    "[scenario] bad condition on edge from %s: %r — %s",
+                    from_node, cond, exc,
+                )
+                tried.append(f"{cond!r} (parse error: {exc})")
+                continue
+            tried.append(f"{cond!r} → {ok}")
+            if ok:
+                return edge
+        if default_edge is not None:
+            return default_edge
+        # No condition matched and there's no default — emit a
+        # diagnostic event so the user can see WHICH conditions ran
+        # before the run summary.
+        await self._emit({
+            "type": "scenario.step_failed",
+            "scenario_id": sid,
+            "node_id": from_node,
+            "reason": "no_branch_matched",
+            "tried": tried,
+        })
+        return None
 
     async def _run_step(
         self,
