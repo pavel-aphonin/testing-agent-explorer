@@ -444,6 +444,9 @@ class RealExecutor:
                     sr = ScenarioRunner(
                         controller=client,
                         scenarios=scenarios_cfg,
+                        # PER-86: linked-only library for sub_scenario
+                        # resolution; worker doesn't run these on its own.
+                        linked_scenarios=config.get("linked_scenarios") or [],
                         test_data=config.get("test_data") or {},
                         event_callback=event_sink,
                         rag_base_url=config.get("_backend_url") or os.environ.get(

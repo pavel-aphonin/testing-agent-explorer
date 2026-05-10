@@ -88,6 +88,11 @@ class ScenarioRunner:
         scenarios: list[dict[str, Any]],
         test_data: dict[str, str] | None = None,
         event_callback: Callable[[dict], Awaitable[None]] | None = None,
+        # PER-86: scenarios referenced via sub_scenario nodes but not
+        # executed as entry points. The runner mixes these into its
+        # by-id lookup table for sub-call resolution but never runs
+        # them at the top level.
+        linked_scenarios: list[dict[str, Any]] | None = None,
         # PER-37: optional RAG hookup. When all three are provided AND
         # a step has both ``expected_result`` and the scenario has
         # ``rag_document_ids``, the runner cross-checks the observed
@@ -124,6 +129,20 @@ class ScenarioRunner:
             str(s.get("id")): [str(d) for d in (s.get("rag_document_ids") or [])]
             for s in self.scenarios
         }
+        # Same lookup for the full scenario payload, keyed by id, used
+        # by sub_scenario nodes to find the linked graph at runtime.
+        # Includes BOTH entry-point scenarios and the linked-only
+        # library so sub-calls can resolve either way.
+        self._scenarios_by_id: dict[str, dict[str, Any]] = {
+            str(s.get("id")): s for s in self.scenarios if s.get("id")
+        }
+        for s in linked_scenarios or []:
+            sid = str(s.get("id") or "")
+            if sid and sid not in self._scenarios_by_id:
+                self._scenarios_by_id[sid] = s
+        # Sub-scenario call stack — protects against direct or
+        # transitive recursion (A links to B, B links back to A).
+        self._sub_call_stack: list[str] = []
         # PER-83: rolling context fed to edge-condition evaluator. Lives
         # at instance scope so a decision node can read state from the
         # action that ran upstream of it. Reset between scenarios in
@@ -233,6 +252,9 @@ class ScenarioRunner:
         )
         # PER-83: reset rolling context per scenario so a previous
         # scenario's last_screen doesn't leak into this one's branches.
+        # Sub-scenario calls preserve the parent's last_action_result
+        # / last_screen on the way IN by snapshotting them; this is the
+        # default reset for top-level entry.
         self._cond_ctx = {
             "test_data": dict(self.test_data),
             "last_action_result": None,
@@ -377,6 +399,75 @@ class ScenarioRunner:
                     # Match the runner's "keep going on soft failure"
                     # philosophy from action steps — the user can wire
                     # a decision node downstream if they want a hard stop.
+            elif ntype == "sub_scenario":
+                target_id = ((node.get("data") or {}).get("linked_scenario_id") or "").strip()
+                if not target_id:
+                    await self._emit({
+                        "type": "scenario.step_failed",
+                        "scenario_id": sid,
+                        "node_id": current,
+                        "reason": "sub_scenario_link_missing",
+                    })
+                    failed += 1
+                    break
+                # Direct + transitive recursion guard. We don't want
+                # A → B → A to spin until the global node-visit cap
+                # kicks in — be loud about it instead.
+                if target_id in self._sub_call_stack or target_id == sid:
+                    await self._emit({
+                        "type": "scenario.step_failed",
+                        "scenario_id": sid,
+                        "node_id": current,
+                        "reason": f"sub_scenario_cycle: {' -> '.join(self._sub_call_stack + [sid, target_id])}",
+                    })
+                    failed += 1
+                    break
+                target = self._scenarios_by_id.get(target_id)
+                if target is None:
+                    await self._emit({
+                        "type": "scenario.step_failed",
+                        "scenario_id": sid,
+                        "node_id": current,
+                        "reason": f"sub_scenario_not_loaded: {target_id}",
+                    })
+                    failed += 1
+                    break
+                await self._emit({
+                    "type": "scenario.sub_started",
+                    "scenario_id": sid,
+                    "node_id": current,
+                    "sub_scenario_id": target_id,
+                    "sub_scenario_title": target.get("title") or target_id,
+                })
+                # Run the linked scenario inline with full traversal.
+                # _run_one will reset _cond_ctx; we snapshot the
+                # parent's so condition data lives on after we return.
+                ctx_snapshot = dict(self._cond_ctx)
+                self._sub_call_stack.append(sid)
+                try:
+                    sub_summary = await self._run_one(target)
+                finally:
+                    self._sub_call_stack.pop()
+                # Restore parent context + remember the sub's outcome
+                # for downstream decisions to branch on.
+                self._cond_ctx = ctx_snapshot
+                self._cond_ctx["last_sub_scenario"] = {
+                    "id": target_id,
+                    "title": target.get("title"),
+                    "completed": sub_summary.get("completed", 0),
+                    "failed": sub_summary.get("failed", 0),
+                }
+                await self._emit({
+                    "type": "scenario.sub_finished",
+                    "scenario_id": sid,
+                    "node_id": current,
+                    "sub_scenario_id": target_id,
+                    **sub_summary,
+                })
+                if sub_summary.get("failed", 0) > 0:
+                    failed += 1
+                else:
+                    completed += 1
             else:
                 # Unknown node type — should be impossible after
                 # backend validation, but emit a diagnostic instead of
