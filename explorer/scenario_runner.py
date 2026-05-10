@@ -359,17 +359,37 @@ class ScenarioRunner:
                 break
             next_id = picked.get("target") if isinstance(picked, dict) else None
 
-            # Per-loop guard — fires when we cross a back-edge twice
-            # before PER-84's max_iterations support arrives.
+            # PER-84: per-loop iteration guard. Three places provide
+            # the cap, in order of precedence:
+            #   1. ``data.max_iterations`` on the back-edge itself
+            #   2. ``data.max_iterations`` on the target loop_back node
+            #   3. default 10
+            # Crossing the loop edge ``max_iterations`` times in a row
+            # without finding an exit emits a ``scenario.loop_exceeded``
+            # event and stops the scenario.
             if isinstance(picked, dict) and (picked.get("data") or {}).get("loop"):
+                edge_cap = (picked.get("data") or {}).get("max_iterations")
+                target_node = nodes_by_id.get(next_id or "")
+                node_cap = (
+                    (target_node.get("data") or {}).get("max_iterations")
+                    if target_node
+                    else None
+                )
+                cap = (
+                    edge_cap if isinstance(edge_cap, int) and edge_cap > 0
+                    else node_cap if isinstance(node_cap, int) and node_cap > 0
+                    else 10
+                )
                 loop_visits[next_id or ""] = loop_visits.get(next_id or "", 0) + 1
-                if loop_visits[next_id or ""] > 1:
+                if loop_visits[next_id or ""] > cap:
                     await self._emit({
                         "type": "scenario.loop_exceeded",
                         "scenario_id": sid,
                         "node_id": next_id,
-                        "reason": "loop_iteration_limit_pre_per84",
+                        "max_iterations": cap,
+                        "reason": "loop_iteration_limit",
                     })
+                    failed += 1
                     break
 
             current = next_id
