@@ -345,10 +345,11 @@ class ScenarioRunner:
                 }
                 action_idx += 1
                 await asyncio.sleep(_ACTION_SETTLE_SEC)
-            elif ntype in ("start", "decision", "loop_back"):
+            elif ntype in ("start", "decision", "loop_back", "group"):
                 # Decision nodes don't *do* anything by themselves —
                 # the branching happens on outgoing edges via
-                # _pick_edge below. start and loop_back are no-ops.
+                # _pick_edge below. start, loop_back, and group are
+                # no-ops at runtime (group is purely a UI affordance).
                 pass
             elif ntype == "wait":
                 # PER-85 (cheap): honor a ``ms`` field on wait nodes.
