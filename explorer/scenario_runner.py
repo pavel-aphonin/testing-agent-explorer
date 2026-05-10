@@ -97,6 +97,13 @@ class ScenarioRunner:
         rag_token: str | None = None,
         defect_callback: Callable[[dict], Awaitable[None]] | None = None,
         run_id: str | None = None,
+        # PER-85: optional LLM client for semantic screen matching.
+        # When provided AND a node carries ``screen_description``, the
+        # runner asks the LLM whether the current screen matches the
+        # description before executing the action. Without this client
+        # ``screen_description`` is silently ignored — backwards-compat
+        # with scenarios authored before the feature shipped.
+        llm_client: Any | None = None,
     ) -> None:
         self.controller = controller
         self.scenarios = scenarios or []
@@ -106,6 +113,11 @@ class ScenarioRunner:
         self.rag_token = rag_token or ""
         self.defect_callback = defect_callback
         self.run_id = run_id
+        self.llm_client = llm_client
+        # PER-85: cache (screen-fingerprint, description) → (matches, reason)
+        # so each unique description is only verified once per visited
+        # screen. Reset per scenario in _run_graph.
+        self._screen_match_cache: dict[tuple[str, str], tuple[bool, str]] = {}
         # Cache scenario_id → rag_document_ids so each step doesn't
         # re-walk the scenarios list.
         self._docs_by_scenario: dict[str, list[str]] = {
@@ -311,21 +323,70 @@ class ScenarioRunner:
                 }
                 action_idx += 1
                 await asyncio.sleep(_ACTION_SETTLE_SEC)
-            elif ntype in ("start", "decision"):
+            elif ntype in ("start", "decision", "loop_back"):
                 # Decision nodes don't *do* anything by themselves —
                 # the branching happens on outgoing edges via
-                # _pick_edge below. start is a no-op.
+                # _pick_edge below. start and loop_back are no-ops.
                 pass
+            elif ntype == "wait":
+                # PER-85 (cheap): honor a ``ms`` field on wait nodes.
+                ms = (node.get("data") or {}).get("ms")
+                try:
+                    seconds = max(0.0, float(ms or 0) / 1000.0)
+                except (TypeError, ValueError):
+                    seconds = 0.0
+                if seconds > 0:
+                    await asyncio.sleep(seconds)
+            elif ntype == "screen_check":
+                # PER-85: dedicated assertion node. Mandatory
+                # ``screen_description`` — fail fast if missing rather
+                # than silently passing the check.
+                desc = ((node.get("data") or {}).get("screen_description") or "").strip()
+                if not desc:
+                    await self._emit({
+                        "type": "scenario.step_failed",
+                        "scenario_id": sid,
+                        "node_id": current,
+                        "reason": "screen_check_missing_description",
+                    })
+                    failed += 1
+                    break
+                ok, reason = await self._check_screen_with_retries(
+                    desc, sid, current,
+                )
+                # Surface a step_completed/step_failed so the timeline
+                # treats the check the same as an action would.
+                self._cond_ctx["last_screen"] = {
+                    "matches": ok,
+                    "reason": reason,
+                    "description": desc,
+                }
+                evt: dict[str, Any] = {
+                    "type": "scenario.step_completed" if ok else "scenario.step_failed",
+                    "scenario_id": sid,
+                    "node_id": current,
+                    "action": "screen_check",
+                    "element_label": desc,
+                    "reason": None if ok else f"screen_mismatch: {reason}",
+                }
+                await self._emit(evt)
+                if ok:
+                    completed += 1
+                else:
+                    failed += 1
+                    # Match the runner's "keep going on soft failure"
+                    # philosophy from action steps — the user can wire
+                    # a decision node downstream if they want a hard stop.
             else:
-                # wait / screen_check / loop_back — full semantics
-                # land in PER-84/85. For now announce we saw the node
-                # and keep walking the first edge.
+                # Unknown node type — should be impossible after
+                # backend validation, but emit a diagnostic instead of
+                # crashing the worker.
                 await self._emit({
                     "type": "scenario.node_skipped",
                     "scenario_id": sid,
                     "node_id": current,
                     "node_type": ntype,
-                    "reason": "not_implemented_yet",
+                    "reason": "unknown_node_type",
                 })
 
             outgoing = edges_from.get(current, [])
@@ -493,6 +554,31 @@ class ScenarioRunner:
             # node — propagate the id when we're walking a graph.
             started_evt["node_id"] = node_id
         await self._emit(started_evt)
+
+        # PER-85: optional pre-flight screen check. When the action
+        # node has a ``screen_description``, ask the LLM to confirm
+        # we're on the expected screen before we tap. Three retries
+        # absorb async navigation; final mismatch fails the step
+        # cleanly with the LLM's own reason in the log.
+        screen_desc = (step.get("screen_description") or "").strip()
+        if screen_desc:
+            ok, reason = await self._check_screen_with_retries(
+                screen_desc, scenario_id, node_id,
+            )
+            if not ok:
+                fail_evt: dict[str, Any] = {
+                    "type": "scenario.step_failed",
+                    "scenario_id": scenario_id,
+                    "step_idx": step_idx,
+                    "action": action,
+                    "element_label": label,
+                    "reason": f"screen_mismatch: {reason}",
+                }
+                if node_id is not None:
+                    fail_evt["node_id"] = node_id
+                await self._emit(fail_evt)
+                return False, f"screen_mismatch: {reason}"
+
         try:
             ok, reason = await self._dispatch(action, label, value)
         except Exception as exc:
@@ -612,6 +698,122 @@ class ScenarioRunner:
         except Exception as exc:
             logger.warning("[scenario] RAG verify failed: %s", exc)
             return None
+
+    # ─────────────────────────────────────── PER-85: screen match
+
+    # How many times to wait for the screen to settle before deciding
+    # the LLM-rendered "no" is final. Async navigation animations and
+    # loaders take a moment; without a retry the very first frame
+    # after a tap loses the verdict.
+    _SCREEN_MATCH_RETRIES = 3
+    _SCREEN_MATCH_DELAY_SEC = 1.0
+
+    async def _verify_screen(
+        self, description: str
+    ) -> tuple[bool, str]:
+        """Ask the LLM whether the current screen matches the user's
+        free-form ``description``. Returns (matches, reason).
+
+        Caches per (fingerprint, description) so a multi-step scenario
+        on the same screen pays the LLM cost only once. ``reason`` is a
+        short sentence the editor can surface in run logs.
+        """
+        if not self.llm_client:
+            # Without an LLM we can't reason about descriptions. Treat
+            # as match so legacy scenarios that filled in
+            # ``screen_description`` still run.
+            return True, "no LLM configured"
+
+        try:
+            elements = await asyncio.wait_for(
+                self.controller.get_ui_elements(), timeout=10
+            )
+        except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
+            logger.warning("[scenario] get_ui_elements failed: %s", exc)
+            return False, f"could not read screen ({exc})"
+
+        # Cheap stable fingerprint of the visible screen state. Order
+        # of elements typically reflects render order, which we keep.
+        fingerprint = "|".join(
+            f"{(getattr(el, 'kind', None) or '?')}:{(el.get('label') if isinstance(el, dict) else getattr(el, 'label', '')) or ''}"
+            for el in elements[:50]
+        )
+        cached = self._screen_match_cache.get((fingerprint, description))
+        if cached is not None:
+            return cached
+
+        prompt_lines = ["Текущий экран:"]
+        for i, el in enumerate(elements[:25]):
+            if isinstance(el, dict):
+                label = el.get("label") or "(без подписи)"
+                kind = el.get("kind") or "element"
+            else:
+                label = getattr(el, "label", "") or "(без подписи)"
+                kind = getattr(el, "kind", "element")
+                if hasattr(kind, "value"):
+                    kind = kind.value
+            prompt_lines.append(f"  {i + 1}. [{kind}] {label}")
+        if len(elements) > 25:
+            prompt_lines.append(f"  …и ещё {len(elements) - 25}.")
+        prompt_lines.append("")
+        prompt_lines.append(f'Ожидание пользователя: "{description}"')
+        prompt_lines.append(
+            'Это тот же экран? Ответь строго в формате: первая строка "yes" или "no", '
+            "вторая строка — короткое объяснение (не больше одного предложения, любой язык)."
+        )
+        user_prompt = "\n".join(prompt_lines)
+        system_prompt = (
+            "Ты помогаешь автотесту проверять, что приложение находится на ожидаемом "
+            "экране. Сравнивай по смыслу, а не по точному совпадению слов. Имена "
+            "элементов могут быть на разных языках. Отвечай кратко."
+        )
+
+        try:
+            resp = await self.llm_client.chat(
+                system=system_prompt, user=user_prompt, max_tokens=80
+            )
+        except Exception as exc:
+            logger.warning("[scenario] LLM screen-match failed: %s", exc)
+            return False, f"LLM error: {exc}"
+
+        if not resp:
+            return False, "LLM returned no response"
+
+        # Parse: first non-empty line is the verdict, rest is the reason.
+        parts = [line.strip() for line in resp.strip().splitlines() if line.strip()]
+        if not parts:
+            return False, "empty LLM response"
+        verdict_raw = parts[0].lower().rstrip(".:")
+        matches = verdict_raw.startswith("yes") or verdict_raw.startswith("да")
+        reason = " ".join(parts[1:])[:200] or parts[0][:200]
+        result = (matches, reason)
+        self._screen_match_cache[(fingerprint, description)] = result
+        return result
+
+    async def _check_screen_with_retries(
+        self, description: str, sid: str, node_id: str | None
+    ) -> tuple[bool, str]:
+        """Wrap ``_verify_screen`` with the retry policy: try N times
+        with a delay so navigation animations and loaders get a chance
+        to finish before we decide the screen is wrong."""
+        last_reason = ""
+        for attempt in range(self._SCREEN_MATCH_RETRIES):
+            ok, reason = await self._verify_screen(description)
+            last_reason = reason
+            if ok:
+                return True, reason
+            if attempt < self._SCREEN_MATCH_RETRIES - 1:
+                await asyncio.sleep(self._SCREEN_MATCH_DELAY_SEC)
+        # Final mismatch — emit a diagnostic event so it shows in the
+        # timeline alongside the failure.
+        await self._emit({
+            "type": "scenario.screen_mismatch",
+            "scenario_id": sid,
+            "node_id": node_id,
+            "description": description,
+            "reason": last_reason,
+        })
+        return False, last_reason
 
     async def _dispatch(
         self, action: str, label: str, value: str

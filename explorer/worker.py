@@ -454,6 +454,11 @@ class RealExecutor:
                         ),
                         defect_callback=config.get("_post_defect"),
                         run_id=run_id,
+                        # PER-85: pass the same LLM client we already
+                        # wired up for free-exploration priors. None
+                        # is fine — semantic checks just no-op when
+                        # the LLM isn't available.
+                        llm_client=llm if "llm" in locals() else None,
                     )
                     sr_summary = await sr.run_all()
                     logger.info("[scenario] summary: %s", sr_summary)
