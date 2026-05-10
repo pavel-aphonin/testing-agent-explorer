@@ -130,9 +130,31 @@ class ScenarioRunner:
         return summary
 
     async def _run_one(self, scenario: dict[str, Any]) -> dict[str, int]:
+        """PER-81 dispatcher. Picks the graph traversal when the
+        scenario carries a v2 ``graph`` payload, otherwise falls back
+        to the legacy linear walk over ``steps``."""
         sid = scenario.get("id", "?")
         title = scenario.get("title") or "(без названия)"
-        steps = scenario.get("steps") or []
+
+        graph = scenario.get("graph")
+        if (
+            isinstance(graph, dict)
+            and isinstance(graph.get("nodes"), list)
+            and isinstance(graph.get("edges"), list)
+        ):
+            return await self._run_graph(sid, title, graph)
+
+        # Legacy linear path — kept around so an old worker config
+        # without ``graph`` still works (and so freshly-flattened v2
+        # scenarios from internal_runs.py keep running while we roll
+        # out the graph traversal end-to-end).
+        return await self._run_linear(sid, title, scenario.get("steps") or [])
+
+    # ---------------------------------------------------------------- linear
+
+    async def _run_linear(
+        self, sid: str, title: str, steps: list[dict[str, Any]]
+    ) -> dict[str, int]:
         await self._emit({
             "type": "scenario.started",
             "scenario_id": sid,
@@ -162,20 +184,192 @@ class ScenarioRunner:
         })
         return {"completed": completed, "failed": failed}
 
+    # ---------------------------------------------------------------- graph
+
+    # Hard cap on total node visits per scenario, regardless of loops or
+    # branching. A degenerate cycle with no exit would otherwise spin
+    # the worker forever. PER-84 will let users tune per-loop iteration
+    # limits; this top-level cap stays as a safety net.
+    _MAX_NODE_VISITS = 200
+
+    async def _run_graph(
+        self, sid: str, title: str, graph: dict[str, Any]
+    ) -> dict[str, int]:
+        nodes_by_id: dict[str, dict[str, Any]] = {
+            n["id"]: n
+            for n in graph.get("nodes", [])
+            if isinstance(n, dict) and isinstance(n.get("id"), str)
+        }
+        edges_from: dict[str, list[dict[str, Any]]] = {}
+        for e in graph.get("edges", []):
+            if isinstance(e, dict) and isinstance(e.get("source"), str):
+                edges_from.setdefault(e["source"], []).append(e)
+
+        action_count = sum(
+            1 for n in nodes_by_id.values() if n.get("type") == "action"
+        )
+        await self._emit({
+            "type": "scenario.started",
+            "scenario_id": sid,
+            "title": title,
+            # ``total_steps`` stays the field name the UI already binds
+            # to. For graphs it's the count of action nodes (upper
+            # bound — branching may execute fewer).
+            "total_steps": action_count,
+        })
+
+        # Find start node. We accept any node with type=start; if there
+        # are several (the schema validator should have caught this on
+        # save) we pick the first.
+        start_id = next(
+            (nid for nid, n in nodes_by_id.items() if n.get("type") == "start"),
+            None,
+        )
+        if start_id is None:
+            await self._emit({
+                "type": "scenario.step_failed",
+                "scenario_id": sid,
+                "reason": "no_start_node",
+            })
+            await self._emit({
+                "type": "scenario.finished",
+                "scenario_id": sid,
+                "completed_steps": 0,
+                "failed_steps": 1,
+                "total_steps": action_count,
+            })
+            return {"completed": 0, "failed": 1}
+
+        completed = 0
+        failed = 0
+        # action_idx assigns a stable monotonic 0..N-1 to action node
+        # executions so the existing UI (which still keys on step_idx)
+        # keeps lining up timeline rows. node_id is also propagated so
+        # PER-82's UI can highlight the live node.
+        action_idx = 0
+        # Per-node loop counter. PER-84 will read max_iterations from
+        # the node payload; for now we just trip after the first repeat
+        # via a loop-edge so misconfigured cycles stop early instead of
+        # spinning all the way to _MAX_NODE_VISITS.
+        loop_visits: dict[str, int] = {}
+
+        current = start_id
+        visits = 0
+        while current is not None and visits < self._MAX_NODE_VISITS:
+            visits += 1
+            node = nodes_by_id.get(current)
+            if node is None:
+                await self._emit({
+                    "type": "scenario.step_failed",
+                    "scenario_id": sid,
+                    "node_id": current,
+                    "reason": "node_id_not_found",
+                })
+                failed += 1
+                break
+
+            ntype = node.get("type")
+            if ntype == "end":
+                break
+
+            if ntype == "action":
+                step = node.get("data") or {}
+                ok, reason = await self._run_step(sid, action_idx, step, node_id=current)
+                if ok:
+                    completed += 1
+                else:
+                    failed += 1
+                    logger.warning(
+                        "[scenario] action %s failed (%s) — continuing",
+                        current, reason,
+                    )
+                action_idx += 1
+                await asyncio.sleep(_ACTION_SETTLE_SEC)
+            elif ntype in ("start",):
+                pass
+            else:
+                # decision / wait / screen_check / loop_back — full
+                # semantics land in PER-83/84/85. For now just announce
+                # we saw the node and keep walking the first edge.
+                await self._emit({
+                    "type": "scenario.node_skipped",
+                    "scenario_id": sid,
+                    "node_id": current,
+                    "node_type": ntype,
+                    "reason": "not_implemented_yet",
+                })
+
+            outgoing = edges_from.get(current, [])
+            if not outgoing:
+                # Nowhere to go and we're not at end → dangling.
+                await self._emit({
+                    "type": "scenario.step_failed",
+                    "scenario_id": sid,
+                    "node_id": current,
+                    "reason": "dangling_node_no_outgoing_edge",
+                })
+                failed += 1
+                break
+
+            # PER-83 will replace this with condition-aware edge picking.
+            picked = outgoing[0]
+            next_id = picked.get("target") if isinstance(picked, dict) else None
+
+            # Per-loop guard — fires when we cross a back-edge twice
+            # before PER-84's max_iterations support arrives.
+            if isinstance(picked, dict) and (picked.get("data") or {}).get("loop"):
+                loop_visits[next_id or ""] = loop_visits.get(next_id or "", 0) + 1
+                if loop_visits[next_id or ""] > 1:
+                    await self._emit({
+                        "type": "scenario.loop_exceeded",
+                        "scenario_id": sid,
+                        "node_id": next_id,
+                        "reason": "loop_iteration_limit_pre_per84",
+                    })
+                    break
+
+            current = next_id
+
+        if visits >= self._MAX_NODE_VISITS:
+            await self._emit({
+                "type": "scenario.step_failed",
+                "scenario_id": sid,
+                "reason": f"max_node_visits ({self._MAX_NODE_VISITS}) exceeded",
+            })
+            failed += 1
+
+        await self._emit({
+            "type": "scenario.finished",
+            "scenario_id": sid,
+            "completed_steps": completed,
+            "failed_steps": failed,
+            "total_steps": action_count,
+        })
+        return {"completed": completed, "failed": failed}
+
     async def _run_step(
-        self, scenario_id: str, step_idx: int, step: dict[str, Any]
+        self,
+        scenario_id: str,
+        step_idx: int,
+        step: dict[str, Any],
+        node_id: str | None = None,
     ) -> tuple[bool, str | None]:
         action = (step.get("action") or "tap").lower()
         label = step.get("element_label") or ""
         value = _substitute_test_data(step.get("value") or "", self.test_data)
         expected = (step.get("expected_result") or "").strip()
-        await self._emit({
+        started_evt: dict[str, Any] = {
             "type": "scenario.step_started",
             "scenario_id": scenario_id,
             "step_idx": step_idx,
             "action": action,
             "element_label": label,
-        })
+        }
+        if node_id is not None:
+            # PER-81: the visual editor wants to highlight the live
+            # node — propagate the id when we're walking a graph.
+            started_evt["node_id"] = node_id
+        await self._emit(started_evt)
         try:
             ok, reason = await self._dispatch(action, label, value)
         except Exception as exc:
@@ -228,6 +422,8 @@ class ScenarioRunner:
             "element_label": label,
             "reason": reason,
         }
+        if node_id is not None:
+            evt["node_id"] = node_id
         if rag_verdict is not None:
             evt["rag_verdict"] = rag_verdict
         await self._emit(evt)
