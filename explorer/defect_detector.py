@@ -126,10 +126,20 @@ class DefectDetector:
         self,
         llm_base_url: str,
         model: str = "rag-chat",
-        timeout: float = 30.0,
+        timeout: float | None = None,
     ) -> None:
         self.llm_url = llm_base_url.rstrip("/")
         self.model = model
+        # 30 s wasn't enough for the larger Qwen / Gemma vision models
+        # running on the local llama-server — every batch flush logged
+        # ReadTimeout. Default bumped to 90 s and made env-overridable
+        # so a slow box can opt in to even longer waits without
+        # patching code. Net cost is bounded: a slow defect-LLM only
+        # adds latency to the optional defect classifier, not to the
+        # main exploration loop.
+        if timeout is None:
+            import os
+            timeout = float(os.environ.get("TA_DEFECT_LLM_TIMEOUT", "90.0"))
         self.timeout = timeout
 
     async def classify(
@@ -206,12 +216,20 @@ class DefectDetector:
                     title=str(parsed.get("title", "")).strip(),
                     description=str(parsed.get("description", "")).strip(),
                 )
+        except httpx.ReadTimeout:
+            # The defect classifier is best-effort. When the LLM is
+            # slow (large vision model + warm-up), don't spam the log
+            # with WARNING — downgrade to DEBUG. The run continues
+            # without that step's defect verdict, which is the
+            # designed fallback behaviour anyway.
+            logger.debug(
+                "Defect classification timed out after %.0fs — skipping",
+                self.timeout,
+            )
+            return None
         except (httpx.HTTPError, json.JSONDecodeError, KeyError, ValueError) as exc:
-            # Include exception type + a non-empty fallback so we can tell
-            # network timeouts apart from JSON parse failures. Previous
-            # form was "Defect classification failed: %s" which logged
-            # blank for any exception whose str() was empty (e.g. some
-            # httpx subclasses, KeyError with no args).
+            # Real errors (HTTP 5xx, malformed JSON, missing keys) stay
+            # at WARNING so they show up in run diagnostics.
             logger.warning(
                 "Defect classification failed: %s: %s",
                 type(exc).__name__,

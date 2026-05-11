@@ -127,6 +127,11 @@ General exploration rules:
 - Prefer untapped buttons over already-explored ones.
 - Go DEEPER into the app — don't stay on one screen.
 
+Skipping internal developer overlays:
+- Some debug builds open a configuration / developer panel BEFORE the real app UI. Recognisable by elements like "Environment type", "Network stubs", "FT*", "PRODUCTION", "Switch to test", "x-feature-name", "idpl", "Login" together on the same screen. This is NOT user-facing.
+- On such a screen, find and tap the button that exits the panel — typically labelled "Готово", "Done", "Continue", "Войти", or "Применить". Do NOT toggle environment switches or input login credentials into the panel itself; the real app login is on a different screen that opens AFTER the panel is dismissed.
+- If exiting the panel returns you to a similar panel (state didn't change), it means an explicit "save" or "apply" is required first — look for it before tapping the exit button.
+
 Avoiding infinite loops on forms:
 - Before you `input` into a text field, CHECK the "Already filled on this screen" block. If the field is already filled with the value you intended, DO NOT input again — pick a DIFFERENT empty field, or tap the submit / "Готово" / "Далее" / "Получить" button.
 - Use the "stable id" of the screen as your anchor — the screen name can drift between turns even when nothing real changed. If the stable id repeats, you are on the SAME screen, even if the name looks different.
@@ -599,8 +604,22 @@ DEFECTS to flag (the DefectDetector will pick these up):
                     await self._go_back()
                     continue
 
-            action_type = decision.get("action", "tap")
-            elem_idx = decision.get("element_index", 0)
+            # LLM JSON sometimes ships `null` for fields the model
+            # didn't decide on — ``dict.get(key, default)`` returns
+            # the explicit None in that case, not ``default``. Coerce
+            # types here so downstream comparisons (``elem_idx < 0``,
+            # ``action_type.lower()``) never trip on NoneType.
+            raw_action = decision.get("action") or "tap"
+            action_type = str(raw_action).lower()
+            raw_idx = decision.get("element_index")
+            try:
+                elem_idx = int(raw_idx) if raw_idx is not None else 0
+            except (TypeError, ValueError):
+                logger.warning(
+                    "LLM returned unparseable element_index=%r — defaulting to 0",
+                    raw_idx,
+                )
+                elem_idx = 0
             value = decision.get("value")
             reasoning = decision.get("reasoning", "")
 

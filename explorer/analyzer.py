@@ -134,18 +134,18 @@ def analyze_screen(
         if btn_labels:
             name = f"Диалог: {' / '.join(btn_labels)}"
 
-    # For screens with text fields (forms), add context:
-    # If screen has both text fields AND buttons, and name matches
-    # a known screen, append the editable field count to distinguish
-    # view vs edit mode
-    text_field_count = sum(1 for s in interactive if s.kind == ElementKind.TEXT_FIELD)
-    button_count = sum(1 for s in interactive if s.kind == ElementKind.BUTTON or s.element_type == "GenericElement")
-    if text_field_count > 0 and name:
-        # Check if buttons suggest edit mode
-        edit_buttons = [s for s in interactive if s.label and s.label.lower() in
-                        ("сохранить", "save", "отмена", "cancel", "применить", "apply")]
-        if edit_buttons:
-            name = f"{name} (ред.)"
+    # NOTE: a previous version appended " (ред.)" to the name whenever
+    # a screen had at least one text field AND a Save/Cancel/Apply
+    # button. That fragmented the dedup state: the same structural
+    # screen would oscillate between "Деньги" and "Деньги (ред.)"
+    # depending on whether the keyboard / save button happened to be
+    # visible, so ``_filled_per_screen[name]`` ended up split across
+    # two buckets and the agent re-typed fields after every popup
+    # dismiss. Removing the suffix here costs us a small bit of
+    # human-readable disambiguation; the gain is stable identity for
+    # forms across keyboard / button visibility changes. If view-vs-
+    # edit mode genuinely needs a distinct identity, the structural
+    # hash (screen_id) already captures it — the name doesn't have to.
 
     return ScreenNode(
         screen_id=screen_id,
