@@ -222,15 +222,29 @@ class RealExecutor:
         run_id = str(config["run_id"])
         bundle_id = config["bundle_id"]
         device_id = config.get("device_id") or "BOOTED"
-        mode_name = (config.get("mode") or "hybrid").lower()
+        # Default mode is AI — the only LLM-driven mode that fully
+        # works today. HYBRID is currently aliased to AI (see modes.py
+        # docstring); preserving the env value lets old runs created
+        # before that change still load. Fallback for unknown values
+        # is also AI, not HYBRID, so a misspelled mode picks the more
+        # useful behaviour instead of an alias.
+        mode_name = (config.get("mode") or "ai").lower()
         max_steps = int(config.get("max_steps") or 200)
         platform = config.get("platform", "ios")
 
         try:
             mode = ExplorationMode(mode_name)
         except ValueError:
-            logger.warning("Unknown mode %r — falling back to hybrid", mode_name)
-            mode = ExplorationMode.HYBRID
+            logger.warning("Unknown mode %r — falling back to AI", mode_name)
+            mode = ExplorationMode.AI
+
+        if mode is ExplorationMode.HYBRID:
+            logger.info(
+                "HYBRID mode is currently an alias for AI (see "
+                "explorer/modes.py docstring). Routing this run "
+                "through LLMExplorationLoop — no functional difference "
+                "from running with mode='ai'."
+            )
 
         # ── LLM prior provider ──
         prior_provider = None

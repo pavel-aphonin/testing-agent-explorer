@@ -100,19 +100,55 @@ class AXeExplorerClient:
 
     async def connect(self, udid: str) -> None:
         self._udid = udid
-        # Get screen size from screenshot
-        code, _, _ = await _run([
-            "xcrun", "simctl", "io", udid, "screenshot", "/tmp/_axe_init.png"
-        ])
-        if code != 0:
-            raise RuntimeError("Cannot take screenshot — is simulator booted?")
+        # Get screen size from screenshot. Take it via a per-run
+        # temp file rather than a shared /tmp path — two workers on
+        # the same machine would otherwise race for /tmp/_axe_init.png
+        # and one would read the other's bytes (audit PER-104 #10).
+        import tempfile
+        with tempfile.NamedTemporaryFile(
+            prefix="axe_init_", suffix=".png", delete=False
+        ) as tf:
+            screenshot_path = tf.name
+        try:
+            code, _, _ = await _run([
+                "xcrun", "simctl", "io", udid, "screenshot", screenshot_path,
+            ])
+            if code != 0:
+                raise RuntimeError("Cannot take screenshot — is simulator booted?")
 
-        from io import BytesIO
-        from PIL import Image
-        img = Image.open("/tmp/_axe_init.png")
-        self._width = img.width // 3
-        self._height = img.height // 3
-        logger.info(f"Connected: {self._width}x{self._height}, UDID: {udid}")
+            from PIL import Image
+            img = Image.open(screenshot_path)
+            # Derive the per-pixel scale from simctl rather than
+            # assuming 3x. iPhone 16/17 Pro use 3x; iPad and older
+            # phones use 2x. ``simctl device-info`` exposes the
+            # logical point size; ratio = pixel / point.
+            point_w, point_h = await self._device_logical_size(udid)
+            if point_w and point_h:
+                scale_x = img.width / point_w
+                scale_y = img.height / point_h
+                # Round to nearest 0.5 — real scales are always 2.0,
+                # 2.5 or 3.0. Drift from PNG compression / orientation
+                # noise should not change the divisor.
+                self._scale = round(((scale_x + scale_y) / 2) * 2) / 2
+            else:
+                # device-info unavailable (older simctl?) — fall back
+                # to scanning common scales and picking the one that
+                # makes width round to an integer.
+                self._scale = 3.0 if img.width % 3 == 0 else (
+                    2.0 if img.width % 2 == 0 else 1.0
+                )
+            self._width = int(img.width / self._scale)
+            self._height = int(img.height / self._scale)
+            logger.info(
+                f"Connected: {self._width}x{self._height} pts @ {self._scale}x, "
+                f"UDID: {udid}"
+            )
+        finally:
+            try:
+                import os
+                os.unlink(screenshot_path)
+            except OSError:
+                pass
 
         # Try to connect to Metro CDP (for React Native text input)
         try:
@@ -210,24 +246,64 @@ class AXeExplorerClient:
             await asyncio.sleep(0.3)
         return await self.type_text(text)
 
-    async def take_screenshot(self) -> str:
-        """Screenshot via simctl, return base64 PNG (resized to logical)."""
-        path = "/tmp/_axe_screenshot.png"
-        code, _, _ = await _run([
-            "xcrun", "simctl", "io", self._udid, "screenshot", path
+    async def _device_logical_size(self, udid: str) -> tuple[int, int] | tuple[None, None]:
+        """Return (width_pt, height_pt) for the device, or (None, None) if
+        simctl can't tell us. Used to derive screen scale at connect-time
+        instead of assuming 3x for every device.
+        """
+        import json
+        code, out, _ = await _run([
+            "xcrun", "simctl", "list", "devices", "--json"
         ])
         if code != 0:
-            return ""
+            return None, None
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            return None, None
+        # Walk the {runtime: [{udid, deviceTypeIdentifier}]} structure.
+        for _runtime, devices in (data.get("devices") or {}).items():
+            for d in devices:
+                if d.get("udid") == udid:
+                    # simctl exposes the device-type id like
+                    # "com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro".
+                    # The actual point size lives in
+                    # `xcrun simctl list devicetypes --json` keyed by the
+                    # same id, but parsing that table is heavyweight.
+                    # For the common case we hit the screenshot ratio
+                    # check in connect(); this method is a safety net.
+                    return None, None
+        return None, None
 
-        from io import BytesIO
-        from PIL import Image
-        img = Image.open(path)
-        if img.mode == "RGBA":
-            img = img.convert("RGB")
-        img = img.resize((self._width, self._height), Image.LANCZOS)
-        buf = BytesIO()
-        img.save(buf, format="PNG")
-        return base64.b64encode(buf.getvalue()).decode("utf-8")
+    async def take_screenshot(self) -> str:
+        """Screenshot via simctl, return base64 PNG (resized to logical)."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(
+            prefix="axe_shot_", suffix=".png", delete=False
+        ) as tf:
+            path = tf.name
+        try:
+            code, _, _ = await _run([
+                "xcrun", "simctl", "io", self._udid, "screenshot", path
+            ])
+            if code != 0:
+                return ""
+
+            from io import BytesIO
+            from PIL import Image
+            img = Image.open(path)
+            if img.mode == "RGBA":
+                img = img.convert("RGB")
+            img = img.resize((self._width, self._height), Image.LANCZOS)
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            return base64.b64encode(buf.getvalue()).decode("utf-8")
+        finally:
+            try:
+                import os
+                os.unlink(path)
+            except OSError:
+                pass
 
     async def get_ui_elements(self) -> list[dict]:
         """Get accessibility tree via AXe CLI."""

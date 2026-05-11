@@ -639,10 +639,16 @@ DEFECTS to flag (the DefectDetector will pick these up):
                     )
                     value = None
 
+            # Redact sensitive values in the step log line — passwords
+            # and secret tokens must not appear in stdout or persisted
+            # log lines (audit PER-104 #6). Non-sensitive values (ФИО,
+            # phone, search query) stay visible for diagnostics.
+            from explorer.form_filler import redact_value as _redact
+            log_value = _redact(element, value) if value else None
             print(
                 f"\n>>> [Step {step}/{self.max_steps}] "
                 f"{screen.name!r}: {action_type} on [{elem_idx}] {element.label!r}"
-                + (f" = {value!r}" if value else "")
+                + (f" = {log_value!r}" if log_value else "")
                 + f"\n    Reasoning: {reasoning}",
                 flush=True,
             )
@@ -713,27 +719,36 @@ DEFECTS to flag (the DefectDetector will pick these up):
                     element_label=element.label,
                     value=value,
                     target_screen=new_screen.name,
+                    element=element,
                 )
 
+            # action_log persists to disk + is emitted to the backend.
+            # Use the redacted form for sensitive fields; the verbatim
+            # value never lives anywhere except memory + the actual
+            # input_text on the GraphEdge (which the backend stores
+            # but never logs verbatim either after PER-104 #6 fix).
             self.action_log.append({
                 "step": step,
                 "source_screen": before,
                 "target_screen": new_screen.screen_id,
                 "element": element.label,
                 "action": action_type,
-                "value": value,
+                "value": log_value,
                 "reasoning": reasoning,
                 "is_new_screen": is_new,
                 "rag_result": rag_result,
             })
 
-            # Update history for LLM context
+            # Update history for LLM context. The history is fed back
+            # into the next prompt — the LLM doesn't need to see the
+            # actual secret to make decisions (knowing "I entered a
+            # password" is enough), so redact here too.
             result_desc = f"→ NEW screen '{new_screen.name}'" if is_new else \
                           f"→ screen '{new_screen.name}'" if new_screen.screen_id != before else \
                           "→ same screen (no change)"
             self._history.append(
                 f"Step {step}: {action_type} '{element.label}'"
-                + (f" value='{value}'" if value else "")
+                + (f" value='{log_value}'" if log_value else "")
                 + f" {result_desc}"
             )
             # Keep last 20 history items
@@ -778,6 +793,7 @@ DEFECTS to flag (the DefectDetector will pick these up):
                 screenshot_after_b64=new_screen.screenshot_b64,
                 llm_reasoning=reasoning or None,
                 rag_verdict=verdict_payload,
+                element=element,
             )
 
             # Cycle detection — two-stage:
@@ -898,7 +914,14 @@ DEFECTS to flag (the DefectDetector will pick these up):
             kind = el.kind.value if hasattr(el.kind, "value") else str(el.kind)
             label = el.label or "(no label)"
             test_id = f" [id={el.test_id}]" if el.test_id else ""
-            value = f" value='{el.value}'" if el.value else ""
+            # el.value can carry the previously-typed text (the a11y
+            # tree often leaks it). Redact sensitive fields before the
+            # value is shown to the LLM — otherwise a password we
+            # filled earlier would be sent to the model on every
+            # subsequent prompt.
+            from explorer.form_filler import redact_value as _redact
+            redacted_value = _redact(el, el.value) if el.value else ""
+            value = f" value='{redacted_value}'" if redacted_value else ""
             elem_lines.append(f"  {i}. [{kind}] '{label}'{test_id}{value}")
 
         elements_text = "\n".join(elem_lines)
@@ -1055,15 +1078,24 @@ What should I do next? Respond with JSON only."""
         element_label: str | None,
         value: str | None,
         target_screen: str,
+        element: ElementSnapshot | None = None,
     ) -> dict | None:
         """Query the knowledge base to verify if the action result matches spec.
 
         Returns {matches: [...], violation: bool, message: str} or None on error.
+
+        ``value`` is rendered in the prompt — redact when the element
+        is sensitive (password / token). RAG can still answer "did
+        the user enter a password" without the literal secret in the
+        query text, which would otherwise be persisted in vector
+        store request logs.
         """
+        from explorer.form_filler import redact_value as _redact
+        safe_value = _redact(element, value) if (element and value) else value
         query = (
             f"User performed '{action}' on '{element_label or 'element'}' "
             f"on screen '{source_screen}'. "
-            f"{'Entered: ' + repr(value) + '. ' if value else ''}"
+            f"{'Entered: ' + repr(safe_value) + '. ' if safe_value else ''}"
             f"Result: navigated to '{target_screen}'. "
             f"Is this expected behavior?"
         )
@@ -1568,15 +1600,26 @@ What should I do next? Respond with JSON only."""
         screenshot_after_b64: str | None = None,
         llm_reasoning: str | None = None,
         rag_verdict: dict | None = None,
+        element: ElementSnapshot | None = None,
     ) -> None:
         # Bundle the per-action details into a single dict that maps
         # 1:1 to the backend's edge.action_details_json column. The UI
         # uses these fields when rendering the steps list and the
         # PathFinder result. Optional ``screenshot_*_b64`` and
         # ``llm_reasoning`` populate the per-step timeline (PER-25).
+        #
+        # Redact input_text for sensitive fields before persistence —
+        # the backend would otherwise store the raw value in
+        # action_details_json and surface it in the UI timeline.
+        from explorer.form_filler import redact_value as _redact
+        safe_value = (
+            _redact(element, edge.action.input_text)
+            if element and edge.action.input_text
+            else edge.action.input_text
+        )
         details = {
             "element": edge.action.target_label or edge.action.target_test_id or None,
-            "value": edge.action.input_text,
+            "value": safe_value,
         }
         payload: dict[str, Any] = {
             "type": "edge_discovered",

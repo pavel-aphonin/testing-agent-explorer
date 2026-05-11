@@ -40,11 +40,21 @@ class AppiumExplorerClient:
         self,
         bundle_id: str,
         udid: str,
-        platform_version: str = "18.2",
+        platform_version: str | None = None,
     ) -> None:
-        """Start an Appium session with XCUITest driver."""
+        """Start an Appium session with XCUITest driver.
+
+        ``platform_version`` defaults to whatever simctl reports for
+        the booted UDID (instead of a hardcoded "18.2"). This used to
+        be a P2 audit finding: the hardcode silently mismatched the
+        actual simulator iOS version on machines running 17.x or 26.x,
+        and Appium then complained or attached to the wrong runtime.
+        """
         from appium import webdriver
         from appium.options.ios import XCUITestOptions
+
+        if platform_version is None:
+            platform_version = await self._detect_ios_version(udid) or "18.2"
 
         options = XCUITestOptions()
         options.platform_name = "iOS"
@@ -324,7 +334,45 @@ class AppiumExplorerClient:
         """Not needed with Appium — clear via element.clear()."""
         return True
 
-    # Context-like properties for compatibility with engine
+    async def _detect_ios_version(self, udid: str) -> str | None:
+        """Return the iOS version string of the booted device, or None.
+
+        Reads simctl's device-list JSON and matches the booted UDID to
+        its runtime identifier (e.g.
+        ``com.apple.CoreSimulator.SimRuntime.iOS-18-2`` →  ``"18.2"``).
+        Falls back to None so the caller can default explicitly rather
+        than guess.
+        """
+        import json
+        import asyncio as _asyncio
+        proc = await _asyncio.create_subprocess_exec(
+            "xcrun", "simctl", "list", "devices", "--json",
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode != 0:
+            return None
+        try:
+            data = json.loads(stdout.decode())
+        except json.JSONDecodeError:
+            return None
+        for runtime_id, devices in (data.get("devices") or {}).items():
+            for d in devices:
+                if d.get("udid") == udid:
+                    # "com.apple.CoreSimulator.SimRuntime.iOS-18-2"
+                    # → split on "iOS-" → "18-2" → "18.2"
+                    if "iOS-" in runtime_id:
+                        ver = runtime_id.rsplit("iOS-", 1)[1].replace("-", ".")
+                        return ver
+                    return None
+        return None
+
+    # Context-like properties for compatibility with engine.
+    # ``_udid``, ``_width``, ``_height`` are initialised in __init__
+    # to None so the properties never raise AttributeError before
+    # start_session() runs. Audit PER-104 #10 noted callers reading
+    # these too early on an unstarted client.
     @property
     def ctx(self):
         return self
@@ -334,13 +382,13 @@ class AppiumExplorerClient:
         return self
 
     @property
-    def device_id(self):
-        return self._udid
+    def device_id(self) -> str | None:
+        return getattr(self, "_udid", None)
 
     @property
-    def device_width(self):
-        return self._width
+    def device_width(self) -> int | None:
+        return getattr(self, "_width", None)
 
     @property
-    def device_height(self):
-        return self._height
+    def device_height(self) -> int | None:
+        return getattr(self, "_height", None)

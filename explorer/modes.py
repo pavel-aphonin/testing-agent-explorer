@@ -1,20 +1,26 @@
-"""Three exploration modes — all parameterizations of the same engine.
+"""Exploration modes — parameterizations of the same engine.
 
 The engine itself doesn't branch on mode. It reads a ModeConfig and
 behaves accordingly. This means new modes can be added without touching
 the engine, and bugs in one mode can't accidentally regress the others.
 
-Mode summary:
+Mode summary (as actually implemented in the worker):
 
 | Mode    | c_puct | LLM priors      | LLM per step | MC rollouts |
 |---------|--------|-----------------|--------------|-------------|
 | MC      | 1.4    | no (uniform)    | no           | depth 10    |
 | AI      | 0.0    | yes (re-asked)  | yes          | depth 0     |
-| Hybrid  | 2.0    | yes (cached)    | no           | depth 5     |
+| HYBRID  | 0.0    | yes (re-asked)  | yes          | depth 0     |
 
-In Hybrid mode the LLM is consulted exactly once per newly-discovered
-screen — to assign priors over the visible elements. After that, PUCT
-makes all the decisions for that screen for the rest of the run.
+HYBRID currently has the same ModeConfig as AI — the worker routes
+both through `LLMExplorationLoop` where the LLM picks every action.
+The originally-designed HYBRID (LLM priors cached per screen + PUCT
+selection from those priors, no per-step LLM call) is a deferred
+implementation: doing it properly requires hooking the cached priors
+into engine.py's PUCT selection rather than routing through the AI
+loop. Until that work lands, calling HYBRID a separate mode would be
+a contract lie — so this file keeps it as a registered alias of AI
+and the public UIs no longer offer it as a distinct option.
 
 In AI mode the LLM is in the driver's seat: it sees fresh elements and
 makes a fresh decision on every step, with PUCT used only as a fallback
@@ -101,15 +107,22 @@ MODE_CONFIGS: dict[ExplorationMode, ModeConfig] = {
         llm_screen_naming=True,
         vision_enabled=True,  # AI mode: pay the latency, gain visual bug detection
     ),
+    # HYBRID is currently an alias of AI — see the module docstring.
+    # The original design (cached priors + PUCT, no per-step LLM) is
+    # not yet wired into engine.py, and routing through it as if it
+    # were would silently behave like AI while reporting a different
+    # mode. Until the implementation lands, mirror AI exactly so a
+    # legacy run created with mode='hybrid' behaves identically to a
+    # fresh AI run.
     ExplorationMode.HYBRID: ModeConfig(
         mode=ExplorationMode.HYBRID,
-        c_puct=2.0,
+        c_puct=0.0,
         use_llm_priors=True,
-        llm_priors_cache=True,  # one LLM call per new screen, then never again
-        llm_per_step=False,  # PUCT picks; LLM only sets priors at first sight
-        rollout_depth=5,
+        llm_priors_cache=False,
+        llm_per_step=True,
+        rollout_depth=0,
         llm_screen_naming=True,
-        vision_enabled=True,  # one screenshot per new screen — cheap with caching
+        vision_enabled=True,
     ),
 }
 

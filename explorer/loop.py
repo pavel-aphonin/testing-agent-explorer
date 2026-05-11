@@ -233,9 +233,9 @@ class ExplorationLoop:
                 self.screens[new_screen.screen_id] = new_screen
                 self._current_screen_id = new_screen.screen_id
 
-                self._record(before, text_fields[0], ActionType.INPUT,
-                             self.pbt.valid_input(text_fields[0]), "valid",
-                             new_screen, is_new)
+                await self._record(before, text_fields[0], ActionType.INPUT,
+                                   self.pbt.valid_input(text_fields[0]), "valid",
+                                   new_screen, is_new)
 
                 if is_new:
                     back_stack.append(before)
@@ -272,8 +272,8 @@ class ExplorationLoop:
                 self.screens[new_screen.screen_id] = new_screen
                 self._current_screen_id = new_screen.screen_id
 
-                self._record(before, btn, ActionType.TAP, None, None,
-                             new_screen, is_new)
+                await self._record(before, btn, ActionType.TAP, None, None,
+                                   new_screen, is_new)
 
                 if is_new:
                     back_stack.append(before)
@@ -398,8 +398,8 @@ class ExplorationLoop:
                     self.screens[result.screen_id] = result
                     self._current_screen_id = result.screen_id
 
-                    self._record(before, field, ActionType.INPUT, value,
-                                 category, result, is_new)
+                    await self._record(before, field, ActionType.INPUT, value,
+                                       category, result, is_new)
 
                     if is_new:
                         print(f"    → NEW: {result.name!r} (PBT found new path!)", flush=True)
@@ -409,7 +409,7 @@ class ExplorationLoop:
 
     # ═══════════════════════════ Helpers ═══════════════════
 
-    def _record(
+    async def _record(
         self,
         source_id: str,
         element: ElementSnapshot,
@@ -419,7 +419,11 @@ class ExplorationLoop:
         target_screen: ScreenNode,
         is_new: bool,
     ) -> None:
-        """Record a transition to the graph + data layer + emit events."""
+        """Record a transition to the graph + data layer + emit events.
+
+        Now async because event emission is awaited (PER-104 #7) —
+        callers must use `await self._record(...)`.
+        """
         tkey = _transition_key(source_id, element)
         is_new_transition = tkey not in self.visited_transitions
         self.visited_transitions.add(tkey)
@@ -457,12 +461,19 @@ class ExplorationLoop:
             target_screen.screen_id, is_new,
         )
 
-        # Emit
+        # Emit. Audit PER-104 #7: the previous code used
+        # asyncio.ensure_future and never awaited the resulting tasks
+        # — callback failures vanished and the run could finish
+        # before backend events flushed (race between run-end status
+        # and the last edge event). Awaiting each emit blocks the
+        # loop for the duration of the HTTP POST, but the events are
+        # small and the backend is local; the predictability is
+        # worth more than the few-ms parallelism we lose.
         if is_new:
-            asyncio.ensure_future(self._emit_screen(target_screen, step=self._step))
-        asyncio.ensure_future(self._emit_edge(edge, step=self._step))
+            await self._emit_screen(target_screen, step=self._step)
+        await self._emit_edge(edge, step=self._step)
         if self._step % 5 == 0 or is_new:
-            asyncio.ensure_future(self._emit_stats())
+            await self._emit_stats()
 
     async def _navigate_to(self, target_id: str) -> bool:
         """Try to navigate to a specific screen. Simple strategy:
@@ -476,10 +487,15 @@ class ExplorationLoop:
                 if self._current_screen_id == target_id:
                     return True
 
-        # Relaunch — most apps return to their start screen
+        # Relaunch — most apps return to their start screen. Audit
+        # PER-104 #8: returning True when we land on the start screen
+        # (instead of target) silently lied to callers — Phase B then
+        # ran PBT variants against the wrong screen, marking
+        # validations as "passed on screen X" when they were actually
+        # observed on Y. Now: report success only if we actually
+        # reached the requested target.
         await self._relaunch()
-        return self._current_screen_id == target_id or \
-               self._current_screen_id == self._start_screen_id
+        return self._current_screen_id == target_id
 
     async def _relaunch(self) -> None:
         """Terminate + relaunch the app for clean state."""

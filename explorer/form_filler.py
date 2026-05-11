@@ -41,6 +41,70 @@ FIELD_PATTERNS: list[tuple[str, re.Pattern]] = [
 ]
 
 
+# Field-type categories whose values must never appear unmasked in
+# logs or persisted run events. Audit (PER-104 #6) flagged the prior
+# behaviour where input values were logged verbatim — exposing the
+# workspace's password / API token to anyone with log access.
+SENSITIVE_FIELD_TYPES: frozenset[str] = frozenset({"password"})
+
+# Substring tokens (case-insensitive) that mark a field as sensitive
+# even when its classification is "generic". Catches custom labels
+# like "API key" or "auth token" that don't hit FIELD_PATTERNS.
+_SENSITIVE_LABEL_TOKENS: tuple[str, ...] = (
+    "secret", "token", "api_key", "api-key", "apikey",
+    "auth", "credential",
+    "пароль", "секрет", "токен",
+)
+
+
+def is_sensitive_field(element: ElementSnapshot) -> bool:
+    """True if values for this element should be masked in logs.
+
+    Decision order:
+      1. classify_field() returns a type from SENSITIVE_FIELD_TYPES
+         (today: ``password``).
+      2. The element's label or test_id contains any sensitive token
+         (``secret``, ``token``, ``api_key`` and friends). Whitespace
+         and hyphen/underscore separators are stripped from the
+         haystack so "API Key", "api-key", "api_key" all match the
+         same ``apikey`` token.
+      3. The element exposes itself as a ``SecureTextField`` — iOS's
+         own signal that the value is sensitive.
+    """
+    if classify_field(element) in SENSITIVE_FIELD_TYPES:
+        return True
+    raw = " ".join(
+        filter(None, [element.label, element.test_id])
+    ).lower()
+    # Normalise separators so "API Key" / "api-key" / "api_key" all
+    # collapse to "apikey".
+    normalised = "".join(c for c in raw if c.isalnum())
+    haystack = normalised + " " + raw  # match both forms
+    if any(tok.replace("_", "").replace("-", "") in normalised for tok in _SENSITIVE_LABEL_TOKENS):
+        return True
+    if any(tok in haystack for tok in _SENSITIVE_LABEL_TOKENS):
+        return True
+    if element.element_type == "SecureTextField":
+        return True
+    return False
+
+
+def redact_value(element: ElementSnapshot, value: str | None) -> str:
+    """Return a safe representation of ``value`` for logs / persistence.
+
+    For sensitive fields returns a mask preserving only the length
+    (e.g. ``***<8>``) so an operator can still tell "I typed 8
+    characters" without leaking the secret. For non-sensitive fields
+    returns the value as-is (so log diagnostics stay useful for
+    ФИО / phone / search / etc.).
+    """
+    if value is None:
+        return ""
+    if not is_sensitive_field(element):
+        return value
+    return f"***<{len(value)}>"
+
+
 def classify_field(element: ElementSnapshot) -> str:
     """Classify a text field by its label/testID using heuristics."""
     text_to_check = " ".join(
@@ -152,13 +216,23 @@ def get_valid_value(
     obvious whether form filling came from the workspace's test_data
     or fell back to the built-in defaults (e.g. ``test@test.com``).
     """
+    # All log calls below redact the value when field_type is in
+    # SENSITIVE_FIELD_TYPES (today: 'password') — operators see the
+    # source and length but not the secret itself. Non-sensitive
+    # fields (name / phone / search / etc.) log verbatim because
+    # debugging form fills needs to see what was typed.
+    is_secret = field_type in SENSITIVE_FIELD_TYPES
+
+    def _log_value(v: str) -> str:
+        return f"***<{len(v)}>" if is_secret else repr(v)
+
     if test_data:
         # 1. Exact key match.
         if field_type in test_data:
             value = test_data[field_type]
             logger.info(
-                "[form_filler] field=%s source=test_data:%s value=%r",
-                field_type, field_type, value,
+                "[form_filler] field=%s source=test_data:%s value=%s",
+                field_type, field_type, _log_value(value),
             )
             return value
         # 2. Alias chain.
@@ -166,16 +240,16 @@ def get_valid_value(
             if alias in test_data and alias != field_type:
                 value = test_data[alias]
                 logger.info(
-                    "[form_filler] field=%s source=test_data:%s (alias) value=%r",
-                    field_type, alias, value,
+                    "[form_filler] field=%s source=test_data:%s (alias) value=%s",
+                    field_type, alias, _log_value(value),
                 )
                 return value
     # 3. Built-in fallback.
     variants = BUILTIN_VARIANTS.get(field_type, BUILTIN_VARIANTS["generic"])
     fallback = variants[0][0]  # First variant is always valid
     logger.info(
-        "[form_filler] field=%s source=builtin value=%r",
-        field_type, fallback,
+        "[form_filler] field=%s source=builtin value=%s",
+        field_type, _log_value(fallback),
     )
     return fallback
 
