@@ -12,11 +12,40 @@ import asyncio
 import base64
 import json
 import logging
+import os
+import shutil
 from dataclasses import dataclass
 
 logger = logging.getLogger("explorer.axe_client")
 
-AXE = "/opt/homebrew/bin/axe"
+
+def _resolve_axe_binary() -> str:
+    """Locate the AXe CLI binary.
+
+    Lookup order (first hit wins):
+      1. ``TA_AXE_BIN`` environment variable — explicit override, lets
+         a user point at a custom build or an installed-elsewhere copy.
+      2. ``shutil.which("axe")`` — the system PATH. Works on Intel
+         Macs (``/usr/local/bin/axe``), Apple Silicon Macs
+         (``/opt/homebrew/bin/axe``), and Linux installs alike.
+      3. The Homebrew Apple-Silicon default — kept only as a last
+         resort so existing dev machines don't break if PATH isn't
+         set up; a missing binary at exec time still surfaces a
+         clean error.
+
+    Resolution happens at import time once, not on every subprocess
+    call — restart the worker after changing the binary location.
+    """
+    explicit = os.environ.get("TA_AXE_BIN")
+    if explicit:
+        return explicit
+    found = shutil.which("axe")
+    if found:
+        return found
+    return "/opt/homebrew/bin/axe"
+
+
+AXE = _resolve_axe_binary()
 
 
 async def _run(args: list[str], timeout: float = 15) -> tuple[int, str, str]:

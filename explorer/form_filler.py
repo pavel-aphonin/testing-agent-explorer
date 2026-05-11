@@ -26,12 +26,15 @@ _TEST_DATA_ALIASES: dict[str, tuple[str, ...]] = {
     "url":      ("url", "link", "website"),
 }
 
-# Field type classification by label/testID keywords
+# Field type classification by label/testID keywords. Single source of
+# truth across the explorer — anything else that needs to map field
+# labels to types must call `classify_field()` rather than maintain its
+# own regex table. Patterns are ordered first-match-wins.
 FIELD_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("email", re.compile(r"email|mail|e-mail|почта", re.IGNORECASE)),
     ("password", re.compile(r"password|pass|пароль", re.IGNORECASE)),
-    ("phone", re.compile(r"phone|tel|телефон|мобильный", re.IGNORECASE)),
-    ("name", re.compile(r"name|имя|фамилия|фио|user.?name", re.IGNORECASE)),
+    ("phone", re.compile(r"phone|tel\b|тел\b|телефон|мобильный", re.IGNORECASE)),
+    ("name", re.compile(r"name|имя|фамилия|фио|lastname|firstname|user.?name", re.IGNORECASE)),
     ("search", re.compile(r"search|поиск|найти|query", re.IGNORECASE)),
     ("number", re.compile(r"number|amount|количество|число|age|возраст", re.IGNORECASE)),
     ("url", re.compile(r"url|link|ссылка|адрес|website", re.IGNORECASE)),
@@ -57,37 +60,59 @@ def classify_field(element: ElementSnapshot) -> str:
     return "generic"
 
 
-# Pre-defined test data variants per field type
-# Each variant: (value, category_name)
-# "valid" is always first — used for happy-path form filling
+# Pre-defined test data variants per field type.
+#
+# Single source of truth for default field values across the explorer.
+# When a workspace has not provided a value via test_data, this table
+# supplies the placeholder. Anything that needs to know about per-type
+# variants (including the legacy PUCT/MC strategy and the PBT prompt
+# section in llm_loop) imports from here — no parallel copy lives in
+# other modules.
+#
+# Each variant: (value, category_name). "valid" is always first — used
+# for happy-path form filling. Categories beyond "valid" cover negative
+# / boundary cases that property-based testing mode probes; the
+# "Security" and "Boundary" categories below are what the PBT prompt
+# enumerates when PBT mode is enabled.
 BUILTIN_VARIANTS: dict[str, list[tuple[str, str]]] = {
     "email": [
         ("test@test.com", "valid"),
         ("", "empty"),
-        ("notanemail", "invalid_format"),
-        ("a" * 200 + "@test.com", "overflow"),
+        ("not-an-email", "invalid_format"),
+        ("a" * 500 + "@test.com", "overflow"),
+        ("<script>alert(1)</script>@test.com", "xss"),
+        ("' OR 1=1 --", "sql_injection"),
+        ("test@test.com test@test.com", "duplicate"),
+        ("ТЕСТ@тест.рф", "unicode"),
     ],
     "password": [
         ("password123", "valid"),
         ("", "empty"),
         ("ab", "too_short"),
-        ("a" * 200, "overflow"),
+        ("a" * 1000, "overflow"),
+        ("<script>alert(1)</script>", "xss"),
+        ("' OR 1=1 --", "sql_injection"),
     ],
     "phone": [
         ("+7 900 000-00-00", "valid"),
         ("", "empty"),
         ("abc", "non_numeric"),
         ("12", "too_short"),
+        ("+7 900 000-00-0" * 20, "overflow"),
     ],
     "name": [
         ("Test User", "valid"),
         ("", "empty"),
         ("  ", "whitespace_only"),
-        ("A" * 200, "overflow"),
+        ("A", "too_short"),
+        ("A" * 1000, "overflow"),
+        ("<script>alert(1)</script>", "xss"),
     ],
     "search": [
         ("test query", "valid"),
         ("", "empty"),
+        ("<script>alert(1)</script>", "xss"),
+        ("' OR 1=1 --", "sql_injection"),
     ],
     "number": [
         ("42", "valid"),
@@ -104,7 +129,8 @@ BUILTIN_VARIANTS: dict[str, list[tuple[str, str]]] = {
     "generic": [
         ("test value", "valid"),
         ("", "empty"),
-        ("a" * 200, "overflow"),
+        ("a" * 1000, "overflow"),
+        ("<script>alert(1)</script>", "xss"),
     ],
 }
 

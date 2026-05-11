@@ -299,10 +299,14 @@ class ScenarioRunner:
         # keeps lining up timeline rows. node_id is also propagated so
         # PER-82's UI can highlight the live node.
         action_idx = 0
-        # Per-node loop counter. PER-84 will read max_iterations from
-        # the node payload; for now we just trip after the first repeat
-        # via a loop-edge so misconfigured cycles stop early instead of
-        # spinning all the way to _MAX_NODE_VISITS.
+        # Per-node loop-edge visit counter. When traversal crosses an
+        # edge with ``data.loop = True`` (or ``data.max_iterations``
+        # set), we increment this map keyed by the edge's target and
+        # cap the count using the resolved max_iterations (edge first,
+        # node second — see the resolution block ~line 520). The
+        # counter never spins to ``_MAX_NODE_VISITS`` for a properly
+        # configured loop edge; that ceiling is the safety net for
+        # cycles WITHOUT a loop-edge cap.
         loop_visits: dict[str, int] = {}
 
         current = start_id

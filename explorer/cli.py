@@ -188,8 +188,9 @@ async def _diagnose(bundle_id: str, device_id: str):
     print("[3/5] axe describe-ui...", end="  ", flush=True)
     t0 = time.time()
     try:
+        from explorer.axe_client import AXE
         proc = await asyncio.create_subprocess_exec(
-            "/opt/homebrew/bin/axe", "describe-ui", "--udid", device_id,
+            AXE, "describe-ui", "--udid", device_id,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)

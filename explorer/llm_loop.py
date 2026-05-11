@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -33,8 +34,16 @@ from explorer.models import (
 
 logger = logging.getLogger("explorer.llm_loop")
 
-SETTLE_DELAY = 3.0
-AXE_BIN = "/opt/homebrew/bin/axe"
+# Settle delay after an action (tap/input) before re-capturing the
+# screen. Lets the app finish navigating / animating. Configurable
+# via TA_SETTLE_DELAY env var for very slow / very fast apps.
+SETTLE_DELAY = float(os.environ.get("TA_SETTLE_DELAY", "3.0"))
+
+# AXe CLI binary — resolved via env var / PATH / Homebrew fallback in
+# axe_client (single source of truth). Imported here so the few direct
+# subprocess callsites in this file use the same resolved path instead
+# of maintaining their own copy.
+from explorer.axe_client import AXE as AXE_BIN  # noqa: E402
 
 # Labels that classify an element as a "navigate-back" affordance.
 # Used by the force-break and fallback paths to skip back buttons
@@ -56,9 +65,8 @@ NAV_BACK_LABELS: frozenset[str] = frozenset({
 
 # How many suspect actions to accumulate before flushing the batch to
 # the defect detector. Smaller = defects appear faster; larger = fewer
-# LLM calls. 5 is a reasonable demo default — drains on every 5th
-# suspect step and at run end.
-_DEFECT_BATCH_SIZE = 5
+# LLM calls. Override via TA_DEFECT_BATCH_SIZE.
+_DEFECT_BATCH_SIZE = int(os.environ.get("TA_DEFECT_BATCH_SIZE", "5"))
 
 
 def _looks_suspicious(
@@ -299,25 +307,47 @@ class LLMExplorationLoop:
     def _pbt_prompt_section() -> str:
         """Block of PBT instructions appended to SYSTEM_PROMPT when enabled.
 
-        Lists the variant categories built into PBTInputGenerator so the LLM
-        knows what to try and what counts as a validation bug.
+        The per-type variant list is rendered from form_filler.BUILTIN_VARIANTS
+        — the single source of truth for default field values across the
+        explorer. Adding a new category there (e.g. a new "ddos" probe for
+        password fields) makes it appear here automatically; no parallel
+        copy of the variant table lives in this module.
         """
-        return """
+        from explorer.form_filler import BUILTIN_VARIANTS
+
+        def _summarise(value: str) -> str:
+            """Compact representation for the prompt — long strings become
+            'a*N' notation, short strings get quoted."""
+            if not value:
+                return '""  (empty)'
+            if len(value) > 40 and len(set(value)) <= 2:
+                # Looks like a repeat (e.g. "a" * 1000)
+                char = value[0]
+                return f'"{char}"*{len(value)}'
+            return f'"{value}"' if len(value) <= 60 else f'"{value[:57]}..." ({len(value)} chars)'
+
+        type_lines: list[str] = []
+        for field_type, variants in BUILTIN_VARIANTS.items():
+            # Skip the "valid" variant in the prompt — that's the happy
+            # path used for form fill, not a probe. Probes are the rest.
+            probes = [(v, cat) for v, cat in variants if cat != "valid"]
+            if not probes:
+                continue
+            probe_text = "; ".join(f"{cat}={_summarise(v)}" for v, cat in probes)
+            type_lines.append(f"- {field_type}: {probe_text}")
+
+        variants_block = "\n".join(type_lines)
+
+        return f"""
 ## PBT (property-based testing) MODE — ENABLED
 
-For every text field you encounter, you should systematically probe its
-validation. After entering a valid value and successfully moving forward,
-COME BACK to the form (use the back button) and try the next variant.
-Repeat until you've covered the categories below.
+For every text field you encounter, systematically probe its validation.
+After entering a valid value and successfully moving forward, COME BACK
+to the form (use the back button) and try the next variant. Repeat until
+you've covered the categories below.
 
 Per-field-type variants to try:
-- Email: empty, "not-an-email", "<script>alert(1)</script>@test.com",
-  "' OR 1=1 --", very long string (a*500 + @test.com), unicode "ТЕСТ@тест.рф"
-- Password: empty, "ab" (too short), "a"*1000, "<script>alert(1)</script>",
-  "' OR 1=1 --"
-- Phone: empty, "abc", "+7 900 000-00-0" repeated 20×
-- Name: empty, "A" (too short), "А"*1000, "<script>alert(1)</script>"
-- Generic text: empty, "a"*1000, "<script>alert(1)</script>"
+{variants_block}
 
 After entering each variant, click submit/proceed and observe.
 DEFECTS to flag (the DefectDetector will pick these up):

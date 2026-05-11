@@ -18,96 +18,39 @@ import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
+from explorer.form_filler import BUILTIN_VARIANTS, classify_field
 from explorer.models import ActionType, ElementKind, ElementSnapshot, ScreenNode
 
 
 # ─────────────────────────────── data input generation ──
-
-# Map element labels/test_ids to likely data categories
-_EMAIL_HINTS = ("email", "e-mail", "почта", "mail")
-_PASSWORD_HINTS = ("password", "пароль", "pass")
-_PHONE_HINTS = ("phone", "телефон", "тел")
-_NAME_HINTS = ("name", "имя", "фамилия", "фио", "lastname", "firstname")
-
-_PBT_VARIANTS: dict[str, list[tuple[str, str]]] = {
-    "email": [
-        ("test@test.com", "valid"),
-        ("", "empty"),
-        ("not-an-email", "invalid_format"),
-        ("a" * 500 + "@test.com", "overflow"),
-        ("<script>alert(1)</script>@test.com", "xss"),
-        ("' OR 1=1 --", "sql_injection"),
-        ("test@test.com test@test.com", "duplicate"),
-        ("ТЕСТ@тест.рф", "unicode"),
-    ],
-    "password": [
-        ("password123", "valid"),
-        ("", "empty"),
-        ("ab", "too_short"),
-        ("a" * 1000, "overflow"),
-        ("<script>alert(1)</script>", "xss"),
-        ("' OR 1=1 --", "sql_injection"),
-    ],
-    "phone": [
-        ("+7 900 000-00-00", "valid"),
-        ("", "empty"),
-        ("abc", "invalid_format"),
-        ("+7 900 000-00-0" * 20, "overflow"),
-    ],
-    "name": [
-        ("Иван Иванов", "valid"),
-        ("", "empty"),
-        ("A", "too_short"),
-        ("А" * 1000, "overflow"),
-        ("<script>alert(1)</script>", "xss"),
-    ],
-    "generic": [
-        ("test value", "valid"),
-        ("", "empty"),
-        ("a" * 1000, "overflow"),
-        ("<script>alert(1)</script>", "xss"),
-    ],
-}
-
-
-def _classify_field(element: ElementSnapshot) -> str:
-    """Guess what kind of data a text field expects from its label/test_id/value."""
-    hints = " ".join(filter(None, [
-        element.label,
-        element.test_id,
-        element.value,
-        # Also check element_type for clues
-        element.element_type,
-    ])).lower()
-    if any(h in hints for h in _EMAIL_HINTS):
-        return "email"
-    if any(h in hints for h in _PASSWORD_HINTS):
-        return "password"
-    if "secure" in hints:  # SecureTextField = password
-        return "password"
-    if any(h in hints for h in _PHONE_HINTS):
-        return "phone"
-    if any(h in hints for h in _NAME_HINTS):
-        return "name"
-    return "generic"
+#
+# Field classification and value variants live in form_filler.py — the
+# single source of truth for "what value goes into what kind of field".
+# This module is the legacy PUCT / Monte-Carlo loop; it must never grow
+# its own copy of those tables. Use classify_field() and BUILTIN_VARIANTS
+# directly so updating defaults in one place propagates everywhere.
 
 
 class PBTInputGenerator:
     """Property-based testing input generator.
 
-    For each text field, generates all variants (valid, empty, overflow,
-    XSS, SQL injection...). Tracks which variants have been tried on
-    which field so successive calls return the NEXT untried variant.
+    For each text field, walks BUILTIN_VARIANTS in order (valid, empty,
+    overflow, xss, sql_injection...). Tracks which variants have been
+    tried on which field so successive calls return the NEXT untried
+    variant.
     """
 
     def __init__(self) -> None:
         self._tried: dict[str, int] = {}  # element_key → next variant index
 
+    def _variants_for(self, element: ElementSnapshot) -> list[tuple[str, str]]:
+        category = classify_field(element)
+        return BUILTIN_VARIANTS.get(category, BUILTIN_VARIANTS["generic"])
+
     def next_input(self, element: ElementSnapshot) -> tuple[str, str] | None:
         """Return (value, category) for the next untried PBT variant.
         Returns None if all variants exhausted for this field."""
-        category = _classify_field(element)
-        variants = _PBT_VARIANTS.get(category, _PBT_VARIANTS["generic"])
+        variants = self._variants_for(element)
         key = _element_key(element)
         idx = self._tried.get(key, 0)
         if idx >= len(variants):
@@ -117,14 +60,12 @@ class PBTInputGenerator:
 
     def valid_input(self, element: ElementSnapshot) -> str:
         """Return the valid-case value for a field (for form fill)."""
-        category = _classify_field(element)
-        variants = _PBT_VARIANTS.get(category, _PBT_VARIANTS["generic"])
+        variants = self._variants_for(element)
         return variants[0][0]  # first variant is always "valid"
 
     def remaining_count(self, element: ElementSnapshot) -> int:
         """How many untried variants remain for this field."""
-        category = _classify_field(element)
-        variants = _PBT_VARIANTS.get(category, _PBT_VARIANTS["generic"])
+        variants = self._variants_for(element)
         key = _element_key(element)
         idx = self._tried.get(key, 0)
         return max(0, len(variants) - idx)
@@ -132,8 +73,9 @@ class PBTInputGenerator:
 
 def generate_input(element: ElementSnapshot) -> str:
     """Return a sensible value to type into a text field (simple version)."""
-    category = _classify_field(element)
-    return _PBT_VARIANTS.get(category, _PBT_VARIANTS["generic"])[0][0]
+    category = classify_field(element)
+    variants = BUILTIN_VARIANTS.get(category, BUILTIN_VARIANTS["generic"])
+    return variants[0][0]
 
 
 # ─────────────────────────────── action selection ──

@@ -49,7 +49,10 @@ MAX_BACK_ATTEMPTS = 3
 
 EventCallback = Callable[[dict], None | Awaitable[None]]
 
-AXE_BIN = "/opt/homebrew/bin/axe"
+# AXe CLI binary path — resolved by axe_client (env var → PATH →
+# Homebrew fallback). Single source so this legacy loop honours the
+# same TA_AXE_BIN override as the LLM-driven path.
+from explorer.axe_client import AXE as AXE_BIN  # noqa: E402
 
 
 async def _axe_key_combo(udid: str, key: str, modifier: str) -> None:

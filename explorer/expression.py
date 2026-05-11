@@ -81,7 +81,12 @@ def _tokenize(src: str) -> list[Token]:
             tokens.append(Token("VAR", path, i))
             i = j + 2
             continue
-        # String literal — single or double quotes, no escapes for now.
+        # String literal — single or double quotes. Backslash is a
+        # LITERAL character, not an escape: ``'a\\b'`` lexes to the
+        # three-char string ``a\b``. This is intentional — scenario
+        # condition expressions don't need string-internal escapes
+        # (use ``{{var}}`` interpolation for dynamic content), and
+        # the simpler lexer makes the rule easier to remember.
         if ch in ("'", '"'):
             quote = ch
             j = i + 1
