@@ -222,12 +222,9 @@ class RealExecutor:
         run_id = str(config["run_id"])
         bundle_id = config["bundle_id"]
         device_id = config.get("device_id") or "BOOTED"
-        # Default mode is AI — the only LLM-driven mode that fully
-        # works today. HYBRID is currently aliased to AI (see modes.py
-        # docstring); preserving the env value lets old runs created
-        # before that change still load. Fallback for unknown values
-        # is also AI, not HYBRID, so a misspelled mode picks the more
-        # useful behaviour instead of an alias.
+        # Default mode is AI — most capable for demo / first-run scenarios.
+        # Each mode routes to a distinct runtime; see the branch below
+        # and explorer/modes.py for the full mode table.
         mode_name = (config.get("mode") or "ai").lower()
         max_steps = int(config.get("max_steps") or 200)
         platform = config.get("platform", "ios")
@@ -237,14 +234,6 @@ class RealExecutor:
         except ValueError:
             logger.warning("Unknown mode %r — falling back to AI", mode_name)
             mode = ExplorationMode.AI
-
-        if mode is ExplorationMode.HYBRID:
-            logger.info(
-                "HYBRID mode is currently an alias for AI (see "
-                "explorer/modes.py docstring). Routing this run "
-                "through LLMExplorationLoop — no functional difference "
-                "from running with mode='ai'."
-            )
 
         # ── LLM prior provider ──
         prior_provider = None
@@ -404,25 +393,35 @@ class RealExecutor:
                     except Exception:
                         logger.exception("SimMirror failed to start")
 
-            # ── Exploration ──
-            if mode in (ExplorationMode.HYBRID, ExplorationMode.AI):
-                # LLM-driven: model decides every action
+            # ── Exploration runtime ──
+            # Three modes, three execution paths. Each one is the
+            # documented runtime for that mode (see modes.py). No
+            # silent aliasing.
+            llm_url = os.environ.get("TA_LLM_BASE_URL", "http://localhost:8080")
+            llm_model_name = os.environ.get("TA_LLM_MODEL_NAME", "embeddings")
+
+            if mode is ExplorationMode.AI:
+                # AI: LLM picks every action. Routes through
+                # LLMExplorationLoop, which sees the full element list
+                # + screenshot + history on every step.
                 from explorer.llm_loop import LLMExplorationLoop
 
-                llm_url = os.environ.get("TA_LLM_BASE_URL", "http://localhost:8080")
-                llm_model_name = os.environ.get("TA_LLM_MODEL_NAME", "embeddings")
-
-                # URL of the RAG LLM — used as the "smart" classifier for
-                # defect detection. Falls back to the agent LLM if not set.
+                # URL of the RAG LLM — used as the "smart" classifier
+                # for defect detection. Falls back to the agent LLM
+                # if not set.
                 rag_llm_url = os.environ.get(
                     "TA_RAG_LLM_BASE_URL",
                     os.environ.get("TA_LLM_BASE_URL", "http://localhost:8083"),
                 )
 
                 # Defect poster injected by execute_one_run from the
-                # BackendClient. Falls back to a no-op if missing — keeps
-                # tests green when the executor is invoked standalone.
-                _post_defect = config.get("_post_defect") or (lambda _payload: asyncio.sleep(0))
+                # BackendClient. Falls back to a no-op if missing —
+                # keeps tests green when the executor is invoked
+                # standalone.
+                _post_defect = (
+                    config.get("_post_defect")
+                    or (lambda _payload: asyncio.sleep(0))
+                )
 
                 loop = LLMExplorationLoop(
                     controller=client,
@@ -440,17 +439,47 @@ class RealExecutor:
                     pbt_enabled=bool(config.get("pbt_enabled", False)),
                     vision_enabled=mode_config.vision_enabled,
                 )
-            else:
-                # MC mode: no LLM, random/PUCT selection
-                from explorer.loop import ExplorationLoop
-                from explorer.strategy import MCStrategy
 
-                loop = ExplorationLoop(
+            elif mode is ExplorationMode.HYBRID:
+                # HYBRID: LLM evaluates each NEW screen once to assign
+                # priors over its elements; PUCT picks actions from
+                # those priors on subsequent visits. The prior_provider
+                # is built above (see the `if mode_config.use_llm_priors`
+                # block). ExplorationEngine consumes it via the
+                # ``prior_provider=`` constructor parameter and only
+                # invokes it when entering an unseen screen.
+                from explorer.engine import ExplorationEngine
+
+                loop = ExplorationEngine(
                     controller=client,
-                    strategy=MCStrategy(),
                     app_bundle_id=bundle_id,
+                    output_dir=str(output_dir),
+                    mode=mode,
                     max_steps=max_steps,
+                    prior_provider=prior_provider,
                     event_callback=event_sink,
+                    test_data=config.get("test_data") or {},
+                )
+
+            else:
+                # MC: no LLM. PUCT with uniform priors + Monte-Carlo
+                # rollouts. Same ExplorationEngine as HYBRID — the
+                # mode_config controls c_puct, rollout depth, and the
+                # "skip LLM priors" branch. Keeping MC on the engine
+                # path (instead of the legacy explorer/loop.py) means
+                # form fill, screen identification, event emission,
+                # and scenario runner behave identically across modes.
+                from explorer.engine import ExplorationEngine
+
+                loop = ExplorationEngine(
+                    controller=client,
+                    app_bundle_id=bundle_id,
+                    output_dir=str(output_dir),
+                    mode=mode,
+                    max_steps=max_steps,
+                    prior_provider=None,
+                    event_callback=event_sink,
+                    test_data=config.get("test_data") or {},
                 )
 
             # PER-18: explicit scenario runner walks the configured

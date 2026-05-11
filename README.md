@@ -6,11 +6,15 @@ Part of the Testing Agent MVP stack. See related repos at the bottom.
 
 ## What it does
 
-Systematically walks an app's UI using **PUCT** (AlphaZero-style MCTS) with a **Go-Explore** frontier archive to maximize graph coverage. Three modes:
+Systematically walks an app's UI using **PUCT** (AlphaZero-style MCTS) with a **Go-Explore** frontier archive to maximize graph coverage. Three runtime paths, one per mode:
 
-- **Monte Carlo** — uniform priors, fastest, no LLM
-- **AI-only** — LLM on every step, highest fidelity, slowest
-- **Hybrid** (default) — LLM priors cached per screen, PUCT selection, MC rollouts
+| Mode | Runtime | LLM cost | Strength |
+|------|---------|----------|----------|
+| **MC** | `ExplorationEngine` with uniform priors + MC rollouts | none | fastest, fully reproducible baseline |
+| **Hybrid** | `ExplorationEngine` + `LLMPriorProvider` (priors cached per screen) | one LLM call per new screen | balance of cost and coverage |
+| **AI** (default for new runs) | `LLMExplorationLoop` (LLM picks every action) | one LLM call per step | best at modals, ambiguous forms, recovering from app errors |
+
+All three modes share the same controller (AXe / Appium), the same screen-fingerprint logic, the same form filler, the same event emission contract. Picking a mode does not silently change behaviour anywhere else.
 
 Outputs per run: `graph.json`, `diagram.mmd` (Mermaid), `report.txt`, `checkpoint.json`.
 

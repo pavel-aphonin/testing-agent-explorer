@@ -1,12 +1,16 @@
-"""Clean exploration loop (Engine V2).
+"""DEPRECATED — second-generation exploration loop (Engine V2).
 
-This replaces the monolithic ExplorationEngine with a simple state machine:
+Originally introduced as a clean alternative to ``engine.py``: a simple
+``observe → decide → execute → record`` state machine driven by an
+``ExplorationStrategy`` (MC / PUCT pluggable). The worker no longer
+routes any mode through this loop — MC, Hybrid, and AI all go through
+``engine.ExplorationEngine`` or ``llm_loop.LLMExplorationLoop`` now.
 
-    observe → decide → dismiss popup → execute → observe → record → learn → verify
-
-No special-casing for text fields, no form filling heuristics, no navigator.
-Each step is one action on one element. The strategy decides what to do;
-the loop just executes and records.
+Kept for reference and to keep the unit tests that exercised it
+green; not imported by production code paths. New work should NOT
+add features here — either extend ``engine.py`` (PUCT / engine flow)
+or ``llm_loop.py`` (LLM-driven flow). When the dependent tests are
+retargeted onto the engine, this file can be deleted.
 """
 
 from __future__ import annotations

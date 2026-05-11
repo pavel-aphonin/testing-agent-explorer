@@ -1,32 +1,37 @@
-"""Exploration modes — parameterizations of the same engine.
+"""Exploration modes — three runtime paths the worker can pick from.
 
-The engine itself doesn't branch on mode. It reads a ModeConfig and
-behaves accordingly. This means new modes can be added without touching
-the engine, and bugs in one mode can't accidentally regress the others.
+Each mode has ONE clear runtime path. The worker reads
+``config["mode"]``, looks up the ModeConfig here, and routes to the
+right runtime — there is no mode that aliases another. Adding a new
+mode means adding a row to MODE_CONFIGS and a branch in
+``worker.execute_one_run``; bugs in one mode can't regress others.
 
-Mode summary (as actually implemented in the worker):
+Mode summary:
 
-| Mode    | c_puct | LLM priors      | LLM per step | MC rollouts |
-|---------|--------|-----------------|--------------|-------------|
-| MC      | 1.4    | no (uniform)    | no           | depth 10    |
-| AI      | 0.0    | yes (re-asked)  | yes          | depth 0     |
-| HYBRID  | 0.0    | yes (re-asked)  | yes          | depth 0     |
+| Mode    | Runtime path                        | c_puct | LLM priors      | LLM per step | Rollouts |
+|---------|-------------------------------------|--------|-----------------|--------------|----------|
+| MC      | ExplorationEngine (uniform priors)  | 1.4    | no (uniform)    | no           | depth 10 |
+| HYBRID  | ExplorationEngine + LLMPriorProvider| 2.0    | yes (cached)    | no           | depth 5  |
+| AI      | LLMExplorationLoop                  | 0.0    | yes (re-asked)  | yes          | depth 0  |
 
-HYBRID currently has the same ModeConfig as AI — the worker routes
-both through `LLMExplorationLoop` where the LLM picks every action.
-The originally-designed HYBRID (LLM priors cached per screen + PUCT
-selection from those priors, no per-step LLM call) is a deferred
-implementation: doing it properly requires hooking the cached priors
-into engine.py's PUCT selection rather than routing through the AI
-loop. Until that work lands, calling HYBRID a separate mode would be
-a contract lie — so this file keeps it as a registered alias of AI
-and the public UIs no longer offer it as a distinct option.
+**AI** — the LLM is in the driver's seat: it sees fresh elements +
+screenshot + history on every step and picks the next action. Highest
+cost (one LLM call per step), best at handling open-ended modals,
+form ambiguity, recovering from app errors.
 
-In AI mode the LLM is in the driver's seat: it sees fresh elements and
-makes a fresh decision on every step, with PUCT used only as a fallback
-when the LLM's chosen action is unavailable.
+**HYBRID** — the LLM is consulted exactly once per newly-discovered
+screen to assign priors over the visible elements. PUCT (the same
+selector that drives MC) then makes all decisions for that screen,
+informed by those priors. Far fewer LLM calls than AI (cost scales
+with unique screens, not steps); cached priors mean revisits reuse
+the same evaluation. Trade-off: PUCT can only pick from the actions
+visible on the current screen, so HYBRID is weaker than AI at
+deciding "I should go back and try the other tab".
 
-In MC mode the LLM is never called.
+**MC** — no LLM at all. PUCT runs with uniform priors and Monte-Carlo
+rollouts evaluate each new screen. Cheapest, most reproducible,
+useful as a baseline and for environments where the LLM is
+unavailable.
 """
 
 from __future__ import annotations
@@ -107,22 +112,15 @@ MODE_CONFIGS: dict[ExplorationMode, ModeConfig] = {
         llm_screen_naming=True,
         vision_enabled=True,  # AI mode: pay the latency, gain visual bug detection
     ),
-    # HYBRID is currently an alias of AI — see the module docstring.
-    # The original design (cached priors + PUCT, no per-step LLM) is
-    # not yet wired into engine.py, and routing through it as if it
-    # were would silently behave like AI while reporting a different
-    # mode. Until the implementation lands, mirror AI exactly so a
-    # legacy run created with mode='hybrid' behaves identically to a
-    # fresh AI run.
     ExplorationMode.HYBRID: ModeConfig(
         mode=ExplorationMode.HYBRID,
-        c_puct=0.0,
+        c_puct=2.0,
         use_llm_priors=True,
-        llm_priors_cache=False,
-        llm_per_step=True,
-        rollout_depth=0,
+        llm_priors_cache=True,  # one LLM call per new screen, then reuse
+        llm_per_step=False,     # PUCT picks; LLM only sets priors at first visit
+        rollout_depth=5,
         llm_screen_naming=True,
-        vision_enabled=True,
+        vision_enabled=True,    # screenshot fed alongside elements on first visit
     ),
 }
 
