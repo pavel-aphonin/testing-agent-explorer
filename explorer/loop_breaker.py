@@ -83,11 +83,14 @@ def _env_int(name: str, default: int, lo: int, hi: int) -> int:
 _WINDOW = _env_int("TA_LOOP_WINDOW", 5, 3, 30)
 
 # How many times the SAME (source_hash, target_hash) pair must repeat in
-# the window before we shout "loop". Lowered from 3 to 2 (PER-23):
-# reacts after the first repeat instead of waiting for two — the
-# escalation to force-break still gives the LLM one chance to fix
-# itself before we take over. Override via TA_LOOP_REPEAT_THRESHOLD.
-_REPEAT_THRESHOLD = _env_int("TA_LOOP_REPEAT_THRESHOLD", 2, 2, 10)
+# the window before we shout "loop". Lowered from 3 to 2 in PER-23,
+# then to 1 for the form-input-popup-close-reinput ping-pong that
+# debug bank builds trigger on every keystroke — by the time the
+# windowed detector fires at 2 repeats, the LLM has already burned
+# 6 steps re-entering the same value. At 1 repeat we cut over to
+# force-break within 2 steps of detecting the pattern. Override via
+# TA_LOOP_REPEAT_THRESHOLD if it gets too twitchy.
+_REPEAT_THRESHOLD = _env_int("TA_LOOP_REPEAT_THRESHOLD", 1, 1, 10)
 
 # Self-loop guard: ANY two consecutive identical (source, target)
 # transitions where source == target trigger an immediate force-break

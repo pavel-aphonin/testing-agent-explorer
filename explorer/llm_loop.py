@@ -91,13 +91,20 @@ Rules:
 - If you see a login/registration form, fill in ALL fields with appropriate data and tap the submit button
 - For email fields, use: test@test.com
 - For password fields, use: password123
-- For name fields, use: Test User
+- For name fields (ФИО, Фамилия Имя Отчество, "Full name"), use: Test User
+- For date-of-birth fields (Дата рождения), use: 1990-01-01
 - For phone fields, use: +7 900 000-00-00
 - After logging in successfully, explore ALL buttons and navigation elements
 - If you see a system popup (Save Password, Allow Notifications), dismiss it by tapping "Not Now" / "Cancel" / "OK"
 - If you're stuck on the same screen, try different elements or go back
 - Prefer untapped buttons over already-explored ones
 - Go DEEPER into the app — don't stay on one screen
+
+CRITICAL — avoiding infinite loops on forms:
+- Before you `input` into a text field, CHECK the "Already filled on this screen" block in the user prompt. If the field is already filled with the value you intended, DO NOT input again — pick a DIFFERENT empty field, or tap the submit / "Готово" / "Далее" / "Получить" button.
+- Use the "stable id" of the screen as your anchor — the screen name can drift between turns even when nothing real changed (this is a known LLM-naming quirk). If the stable id repeats, you are on the SAME screen, even if the name looks different.
+- A modal/popup that appears after you input ANYTHING is most likely a validation overlay. Close it ONCE (Закрыть / Cancel / OK), then proceed with the NEXT empty field on the underlying form — do NOT re-fill the field you just entered.
+- Use the "element_index" exactly as shown in the Interactive elements list. The index is recomputed every step — DO NOT memorise indexes across steps. Always re-read the element label before deciding.
 
 IMPORTANT: Respond with ONLY the JSON object, no other text."""
 
@@ -165,10 +172,26 @@ class LLMExplorationLoop:
         # pick an unused element from the current screen. Cleared
         # after one forced step.
         self._force_break: bool = False
-        # Per-screen set of (action_type, element_label) we've already
-        # tried. Used for the forced-break fallback to find something
-        # new to poke.
+        # Per-screen set of (element_kind, element_label) we've already
+        # tried. Used both for the forced-break fallback AND for the
+        # "already done" hint in the user prompt so the LLM stops
+        # re-tapping the same element after every popup dismissal.
         self._tried_per_screen: dict[str, set[tuple[str, str]]] = {}
+        # Per-screen map of {field_label -> last value entered}. Lets
+        # the user prompt remind the LLM "you already filled ФИО with
+        # 'Test User'", so it doesn't re-input the same value when a
+        # modal dialog pops up and gets dismissed (debug bank build
+        # triggers a validation overlay on every input). The screen_id
+        # is the stable structural fingerprint, not the LLM's name —
+        # so 'Деньги' / 'ФИО' / 'Авторизация' that share the same
+        # structural shape resolve to the same bucket.
+        self._filled_per_screen: dict[str, dict[str, str]] = {}
+        # FormFiller from form_filler.py — classifies a field by its
+        # label/test_id and returns a sensible value (uses test_data
+        # if a matching key is present). Loaded lazily so we don't
+        # crash if test_data is None.
+        from explorer.form_filler import FormFiller
+        self._form_filler = FormFiller(test_data=test_data or {})
 
         # Suspect-action queue for batched defect detection. Each entry
         # is a snapshot of the step's context that we'll pass to the
@@ -465,14 +488,26 @@ DEFECTS to flag (the DefectDetector will pick these up):
                         break
                 if chosen_idx is not None:
                     chosen_el = elements[chosen_idx]
+                    is_text_field = chosen_el.kind == ElementKind.TEXT_FIELD
+                    # Pick a sensible input value via FormFiller —
+                    # classifies the field by label/test_id and returns
+                    # workspace test_data when a key matches (name /
+                    # phone / dob / email / password / etc.). Replaces
+                    # the previous hardcoded "email→test@test.com /
+                    # password→password123 / else None" trio that left
+                    # name/dob/phone fields with None and made force-
+                    # break input no-ops.
+                    chosen_value: str | None = None
+                    if is_text_field:
+                        try:
+                            chosen_value = self._form_filler.get_valid_value_for(chosen_el)
+                        except Exception:  # pragma: no cover — defensive
+                            logger.debug("form_filler failed in force-break", exc_info=True)
+                            chosen_value = "test"
                     decision = {
-                        "action": "input" if chosen_el.kind == ElementKind.TEXT_FIELD else "tap",
+                        "action": "input" if is_text_field else "tap",
                         "element_index": chosen_idx,
-                        "value": (
-                            "test@test.com" if "email" in ((chosen_el.test_id or "") + (chosen_el.label or "")).lower()
-                            else "password123" if "password" in ((chosen_el.test_id or "") + (chosen_el.label or "")).lower()
-                            else None
-                        ),
+                        "value": chosen_value,
                         "reasoning": "Force cycle-break: picking an element I haven't tried on this screen yet.",
                     }
                     print(
@@ -503,13 +538,21 @@ DEFECTS to flag (the DefectDetector will pick these up):
                     tkey = f"{screen.screen_id}|{el.kind}|{label}"
                     if tkey not in self._tried_fallbacks:
                         self._tried_fallbacks.add(tkey)
+                        is_text_field = el.kind == ElementKind.TEXT_FIELD
+                        fb_value: str | None = None
+                        if is_text_field:
+                            try:
+                                fb_value = self._form_filler.get_valid_value_for(el)
+                            except Exception:  # pragma: no cover — defensive
+                                logger.debug(
+                                    "form_filler failed in LLM-unavailable fallback",
+                                    exc_info=True,
+                                )
+                                fb_value = "test"
                         decision = {
-                            "action": "input" if el.kind == ElementKind.TEXT_FIELD else "tap",
+                            "action": "input" if is_text_field else "tap",
                             "element_index": i,
-                            "value": "test@test.com" if "email" in (el.test_id or "").lower() else
-                                     "password123" if "password" in (el.test_id or "").lower() or
-                                     (hasattr(el, 'element_type') and el.element_type == "SecureTextField") else
-                                     None,
+                            "value": fb_value,
                             "reasoning": "LLM unavailable, trying next element (skip back buttons)",
                         }
                         break
@@ -551,6 +594,36 @@ DEFECTS to flag (the DefectDetector will pick these up):
                 await self._input_text(element, value)
             else:
                 await self._tap(element)
+
+            # Remember what we did on this screen. Two parallel buckets:
+            #   _tried_per_screen[scr] = {(kind, label), ...} — so the
+            #     force-break path (and the LLM, via the user prompt)
+            #     can see what's already been poked.
+            #   _filled_per_screen[scr] = {label: value, ...} — so the
+            #     LLM stops re-inputting the same value into the same
+            #     field after a modal dialog pops up and gets closed.
+            try:
+                el_kind = (
+                    element.kind.value
+                    if hasattr(element.kind, "value")
+                    else str(element.kind)
+                )
+                el_label = (element.label or "").strip()
+                self._tried_per_screen.setdefault(before, set()).add(
+                    (el_kind, el_label)
+                )
+                if action_type == "input" and value is not None:
+                    field_key = (
+                        el_label
+                        or element.test_id
+                        or f"index_{elem_idx}"
+                    )
+                    self._filled_per_screen.setdefault(before, {})[
+                        field_key
+                    ] = value
+            except Exception:  # pragma: no cover — defensive
+                # Tracking is best-effort; never let it kill the run.
+                logger.debug("tried/filled tracking failed", exc_info=True)
 
             await asyncio.sleep(SETTLE_DELAY)
 
@@ -774,11 +847,44 @@ DEFECTS to flag (the DefectDetector will pick these up):
 
         history_text = "\n".join(self._history[-10:]) if self._history else "No previous actions"
 
-        user_prompt = f"""Current screen: '{screen.name or 'unnamed'}'
+        # Stable structural fingerprint of the current screen. The
+        # LLM-assigned ``screen.name`` is unreliable (the model renames
+        # the same screen between calls — 'Деньги' / 'ФИО' /
+        # 'Авторизация'); ``screen_id`` is a SHA-256 of the structural
+        # element list, so it stays the same even when a popup briefly
+        # appeared and got dismissed. Surfacing it gives the LLM an
+        # anchor independent of its own naming inconsistency.
+        screen_id_short = (screen.screen_id or "")[:8] if screen.screen_id else "?"
+
+        # What we've already done on THIS structural screen — the LLM
+        # often forgets it filled a field after a popup dismissal,
+        # then re-enters the same value. Render the filled-fields map
+        # and the tried-elements list so it sees its own past actions
+        # cleanly, not just buried in the textual history.
+        filled = self._filled_per_screen.get(self._current_screen_id, {})
+        tried = self._tried_per_screen.get(self._current_screen_id, set())
+        already_filled_text = (
+            "\n".join(f"  - '{lbl}' = '{val}'" for lbl, val in filled.items())
+            if filled
+            else "  (nothing yet)"
+        )
+        already_tried_text = (
+            "\n".join(f"  - [{kind}] '{lbl}'" for kind, lbl in sorted(tried))
+            if tried
+            else "  (nothing yet)"
+        )
+
+        user_prompt = f"""Current screen: '{screen.name or 'unnamed'}' (stable id: {screen_id_short})
 Screens discovered so far: {len(self.screens)}
 
 Interactive elements:
 {elements_text}
+
+Already filled on this screen (do NOT re-input these unless you want to change them):
+{already_filled_text}
+
+Already tried on this screen (prefer untried elements; re-tap only if you have a clear reason):
+{already_tried_text}
 
 Recent history:
 {history_text}

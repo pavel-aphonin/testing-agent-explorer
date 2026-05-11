@@ -207,7 +207,16 @@ class DefectDetector:
                     description=str(parsed.get("description", "")).strip(),
                 )
         except (httpx.HTTPError, json.JSONDecodeError, KeyError, ValueError) as exc:
-            logger.warning("Defect classification failed: %s", exc)
+            # Include exception type + a non-empty fallback so we can tell
+            # network timeouts apart from JSON parse failures. Previous
+            # form was "Defect classification failed: %s" which logged
+            # blank for any exception whose str() was empty (e.g. some
+            # httpx subclasses, KeyError with no args).
+            logger.warning(
+                "Defect classification failed: %s: %s",
+                type(exc).__name__,
+                str(exc) or "(no message)",
+            )
             return None
         except asyncio.CancelledError:
             raise
