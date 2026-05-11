@@ -36,6 +36,24 @@ logger = logging.getLogger("explorer.llm_loop")
 SETTLE_DELAY = 3.0
 AXE_BIN = "/opt/homebrew/bin/axe"
 
+# Labels that classify an element as a "navigate-back" affordance.
+# Used by the force-break and fallback paths to skip back buttons
+# when looking for a NEW thing to poke — otherwise the agent would
+# pick "Назад" as its "untried element" and walk straight out of
+# the screen it was trying to explore.
+#
+# Curated to language-universal back labels only — anything app-
+# specific belongs in workspace settings, not in code. Notable
+# previous entries removed:
+#   "Вход" — that's "Log in", not a back button (legacy bug)
+#   "Профиль" — that's a Profile tab, not a back button (legacy bug)
+NAV_BACK_LABELS: frozenset[str] = frozenset({
+    "Back", "Назад",
+    "<", "‹",
+    "Close", "Закрыть",
+    "Cancel", "Отмена",
+})
+
 # How many suspect actions to accumulate before flushing the batch to
 # the defect detector. Smaller = defects appear faster; larger = fewer
 # LLM calls. 5 is a reasonable demo default — drains on every 5th
@@ -77,34 +95,35 @@ SYSTEM_PROMPT = """You are an AI agent exploring a mobile app. Your goal is to d
 
 On each step you see:
 1. A list of interactive elements on the current screen (buttons, text fields, switches, etc.)
-2. A history of your previous actions
+2. The block "Available test data" (only when the workspace has configured values for this run)
+3. What you already filled / already tried on this screen
+4. A history of your previous actions
 
 You must respond with a JSON object:
 {
     "reasoning": "Brief explanation of what you see and why you chose this action",
     "action": "tap" or "input",
     "element_index": 0,
-    "value": "text to type (only for input action, null for tap)"
+    "value": "text to type for input — or null to let the system pick a sensible default"
 }
 
-Rules:
-- If you see a login/registration form, fill in ALL fields with appropriate data and tap the submit button
-- For email fields, use: test@test.com
-- For password fields, use: password123
-- For name fields (ФИО, Фамилия Имя Отчество, "Full name"), use: Test User
-- For date-of-birth fields (Дата рождения), use: 1990-01-01
-- For phone fields, use: +7 900 000-00-00
-- After logging in successfully, explore ALL buttons and navigation elements
-- If you see a system popup (Save Password, Allow Notifications), dismiss it by tapping "Not Now" / "Cancel" / "OK"
-- If you're stuck on the same screen, try different elements or go back
-- Prefer untapped buttons over already-explored ones
-- Go DEEPER into the app — don't stay on one screen
+How to pick `value` for an input action:
+- If "Available test data" lists a key that matches the field (email / login / password / phone / name / fio / search / etc.), use THAT exact value.
+- If nothing matches and the field is a known category (email, password, phone, name, search, number, url), return `value: null`. The worker will fill the field by classifying it and choosing a generic placeholder. DO NOT invent values yourself when the workspace hasn't provided one — your guesses won't be reproducible across runs.
+- Only invent a value when the field is clearly free-form text that the system can't classify (a comment box, a search query, etc.).
 
-CRITICAL — avoiding infinite loops on forms:
-- Before you `input` into a text field, CHECK the "Already filled on this screen" block in the user prompt. If the field is already filled with the value you intended, DO NOT input again — pick a DIFFERENT empty field, or tap the submit / "Готово" / "Далее" / "Получить" button.
-- Use the "stable id" of the screen as your anchor — the screen name can drift between turns even when nothing real changed (this is a known LLM-naming quirk). If the stable id repeats, you are on the SAME screen, even if the name looks different.
-- A modal/popup that appears after you input ANYTHING is most likely a validation overlay. Close it ONCE (Закрыть / Cancel / OK), then proceed with the NEXT empty field on the underlying form — do NOT re-fill the field you just entered.
-- Use the "element_index" exactly as shown in the Interactive elements list. The index is recomputed every step — DO NOT memorise indexes across steps. Always re-read the element label before deciding.
+General exploration rules:
+- If you see a login/registration form, fill in ALL fields and tap the submit button.
+- If you see a system popup (Save Password, Allow Notifications), dismiss it by tapping "Not Now" / "Cancel" / "OK".
+- After logging in successfully, explore ALL buttons and navigation elements.
+- Prefer untapped buttons over already-explored ones.
+- Go DEEPER into the app — don't stay on one screen.
+
+Avoiding infinite loops on forms:
+- Before you `input` into a text field, CHECK the "Already filled on this screen" block. If the field is already filled with the value you intended, DO NOT input again — pick a DIFFERENT empty field, or tap the submit / "Готово" / "Далее" / "Получить" button.
+- Use the "stable id" of the screen as your anchor — the screen name can drift between turns even when nothing real changed. If the stable id repeats, you are on the SAME screen, even if the name looks different.
+- A modal/popup that appears after you input ANYTHING is most likely a validation overlay. Close it ONCE, then proceed with the NEXT empty field — do NOT re-fill what you just entered.
+- "element_index" is recomputed every step — DO NOT memorise indexes. Always re-read the element label before deciding.
 
 IMPORTANT: Respond with ONLY the JSON object, no other text."""
 
@@ -476,11 +495,10 @@ DEFECTS to flag (the DefectDetector will pick these up):
                 tried = self._tried_per_screen.setdefault(
                     self._current_screen_id, set(),
                 )
-                _BACK = {"Вход", "Back", "Назад", "<", "‹", "Close", "Закрыть", "Профиль"}
                 chosen_idx: int | None = None
                 for i, el in enumerate(elements):
                     label = (el.label or "").strip()
-                    if label in _BACK:
+                    if label in NAV_BACK_LABELS:
                         continue
                     key = (el.kind.value if hasattr(el.kind, "value") else str(el.kind), label)
                     if key not in tried:
@@ -489,25 +507,16 @@ DEFECTS to flag (the DefectDetector will pick these up):
                 if chosen_idx is not None:
                     chosen_el = elements[chosen_idx]
                     is_text_field = chosen_el.kind == ElementKind.TEXT_FIELD
-                    # Pick a sensible input value via FormFiller —
-                    # classifies the field by label/test_id and returns
-                    # workspace test_data when a key matches (name /
-                    # phone / dob / email / password / etc.). Replaces
-                    # the previous hardcoded "email→test@test.com /
-                    # password→password123 / else None" trio that left
-                    # name/dob/phone fields with None and made force-
-                    # break input no-ops.
-                    chosen_value: str | None = None
-                    if is_text_field:
-                        try:
-                            chosen_value = self._form_filler.get_valid_value_for(chosen_el)
-                        except Exception:  # pragma: no cover — defensive
-                            logger.debug("form_filler failed in force-break", exc_info=True)
-                            chosen_value = "test"
+                    # Leave value=null so the main execution path resolves
+                    # it through FormFiller (single source). Force-break
+                    # used to hand-pick "test@test.com"/"password123"/None
+                    # which (a) duplicated the FormFiller lookup chain in
+                    # two places and (b) left every non-email/password
+                    # field with None — making force-break input a no-op.
                     decision = {
                         "action": "input" if is_text_field else "tap",
                         "element_index": chosen_idx,
-                        "value": chosen_value,
+                        "value": None,
                         "reasoning": "Force cycle-break: picking an element I haven't tried on this screen yet.",
                     }
                     print(
@@ -529,30 +538,21 @@ DEFECTS to flag (the DefectDetector will pick these up):
                 decision = await self._ask_llm(screen, elements)
             if decision is None:
                 # Fallback: tap first untried element, SKIPPING back buttons
-                _BACK_LABELS = {"Вход", "Back", "Назад", "<", "‹", "Close", "Закрыть"}
                 for i, el in enumerate(elements):
                     label = (el.label or "").strip()
                     # Skip back/navigation buttons in fallback
-                    if label in _BACK_LABELS:
+                    if label in NAV_BACK_LABELS:
                         continue
                     tkey = f"{screen.screen_id}|{el.kind}|{label}"
                     if tkey not in self._tried_fallbacks:
                         self._tried_fallbacks.add(tkey)
-                        is_text_field = el.kind == ElementKind.TEXT_FIELD
-                        fb_value: str | None = None
-                        if is_text_field:
-                            try:
-                                fb_value = self._form_filler.get_valid_value_for(el)
-                            except Exception:  # pragma: no cover — defensive
-                                logger.debug(
-                                    "form_filler failed in LLM-unavailable fallback",
-                                    exc_info=True,
-                                )
-                                fb_value = "test"
+                        # Leave value=null. The main execution path
+                        # resolves it through FormFiller so this fallback
+                        # doesn't duplicate the lookup chain.
                         decision = {
-                            "action": "input" if is_text_field else "tap",
+                            "action": "input" if el.kind == ElementKind.TEXT_FIELD else "tap",
                             "element_index": i,
-                            "value": fb_value,
+                            "value": None,
                             "reasoning": "LLM unavailable, trying next element (skip back buttons)",
                         }
                         break
@@ -580,6 +580,34 @@ DEFECTS to flag (the DefectDetector will pick these up):
 
             element = elements[elem_idx]
             before = self._current_screen_id
+
+            # If the LLM signalled an input but didn't pick a value,
+            # delegate to FormFiller — the single source of truth for
+            # default field values. FormFiller's lookup chain is:
+            #   1. workspace test_data[field_type]
+            #   2. workspace test_data alias (login/username/pwd/...)
+            #   3. BUILTIN_VARIANTS[field_type] generic placeholder
+            # The LLM is told explicitly in the system prompt to return
+            # null rather than invent a value — this keeps the run
+            # reproducible across model calls and avoids one model
+            # typing "Test User" while another types "John Doe".
+            if action_type == "input" and (value is None or not str(value).strip()):
+                try:
+                    value = self._form_filler.get_valid_value_for(element)
+                    print(
+                        f"    [form_filler] resolved {element.label!r} → {value!r}",
+                        flush=True,
+                    )
+                except Exception:
+                    # Classification failed — log and downgrade to tap
+                    # so the run keeps moving instead of silently
+                    # inputting an empty string.
+                    logger.warning(
+                        "FormFiller could not resolve a value for %r — skipping input",
+                        element.label,
+                        exc_info=True,
+                    )
+                    value = None
 
             print(
                 f"\n>>> [Step {step}/{self.max_steps}] "
