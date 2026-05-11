@@ -19,37 +19,53 @@ from dataclasses import dataclass
 logger = logging.getLogger("explorer.axe_client")
 
 
-def _resolve_axe_binary() -> str:
+def _resolve_axe_binary() -> str | None:
     """Locate the AXe CLI binary.
 
     Lookup order (first hit wins):
       1. ``TA_AXE_BIN`` environment variable — explicit override, lets
-         a user point at a custom build or an installed-elsewhere copy.
+         a user point at a custom build or installed-elsewhere copy.
       2. ``shutil.which("axe")`` — the system PATH. Works on Intel
          Macs (``/usr/local/bin/axe``), Apple Silicon Macs
          (``/opt/homebrew/bin/axe``), and Linux installs alike.
-      3. The Homebrew Apple-Silicon default — kept only as a last
-         resort so existing dev machines don't break if PATH isn't
-         set up; a missing binary at exec time still surfaces a
-         clean error.
 
-    Resolution happens at import time once, not on every subprocess
-    call — restart the worker after changing the binary location.
+    Returns ``None`` when neither is set. Callers that actually invoke
+    AXe must check and fail with a clear error — no silent hardcoded
+    platform default. To install on macOS: ``brew install
+    cameroncooke/axe/axe``; on Linux build from source and add to PATH.
     """
     explicit = os.environ.get("TA_AXE_BIN")
     if explicit:
         return explicit
-    found = shutil.which("axe")
-    if found:
-        return found
-    return "/opt/homebrew/bin/axe"
+    return shutil.which("axe")
 
 
 AXE = _resolve_axe_binary()
+if AXE is None:
+    # Don't fail at import — modules that only need types from this
+    # file (e.g. tests, linting) shouldn't blow up. Log loudly so a
+    # worker-mode startup notices, then let the first subprocess call
+    # raise a real FileNotFoundError with the missing-binary path.
+    logger.warning(
+        "AXe CLI not found. Set TA_AXE_BIN or install axe on PATH "
+        "(brew install cameroncooke/axe/axe). Subprocess calls will "
+        "fail until one of these is in place."
+    )
 
 
 async def _run(args: list[str], timeout: float = 15) -> tuple[int, str, str]:
-    """Run a subprocess with timeout. Returns (returncode, stdout, stderr)."""
+    """Run a subprocess with timeout. Returns (returncode, stdout, stderr).
+
+    Fails fast with a clear error if AXe was never resolved at import
+    time — beats letting create_subprocess_exec raise an obscure
+    NoneType error deep in asyncio.
+    """
+    if not args or args[0] is None:
+        raise RuntimeError(
+            "AXe CLI binary not configured. Set TA_AXE_BIN or install "
+            "'axe' on PATH (brew install cameroncooke/axe/axe). "
+            "Worker cannot drive iOS Simulator without it."
+        )
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
