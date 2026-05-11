@@ -138,11 +138,26 @@ async def replay_action(controller, action: ActionDetail) -> bool:
                     )
                     result = await controller.tap_at(x, y)
                     return result.error is None
-                elif action.target_label:
-                    result = await controller.tap_element(
-                        text=action.target_label
-                    )
+                # No frame — fall back to test_id (most stable) then
+                # label (last resort). The AXe controller exposes
+                # tap_by_id / tap_by_label, not tap_element. Old code
+                # called tap_element(text=...) which crashed every
+                # replay with AttributeError as soon as a recorded
+                # action arrived without target_frame.
+                elif action.target_test_id and hasattr(controller, "tap_by_id"):
+                    result = await controller.tap_by_id(action.target_test_id)
                     return result.error is None
+                elif action.target_label and hasattr(controller, "tap_by_label"):
+                    result = await controller.tap_by_label(action.target_label)
+                    return result.error is None
+                # Controller has neither (e.g. Appium) — caller will
+                # need to feed coordinates via target_frame; we can't
+                # synthesise them here.
+                logger.warning(
+                    "replay: cannot tap %r — no target_frame and "
+                    "controller has no tap_by_id/tap_by_label",
+                    action.target_label or action.target_test_id,
+                )
                 return False
 
             case "input":

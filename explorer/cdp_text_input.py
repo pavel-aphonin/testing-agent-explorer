@@ -35,7 +35,7 @@ class CDPTextInput:
     async def discover(self) -> bool:
         """Discover the WebSocket URL of the running RN app via Metro."""
         try:
-            async with httpx.AsyncClient(timeout=3) as client:
+            async with httpx.AsyncClient(timeout=3, trust_env=False) as client:
                 resp = await client.get(f"{self.metro_url}/json")
                 if resp.status_code != 200:
                     return False
@@ -218,7 +218,7 @@ class CDPTextInput:
     async def is_available(self) -> bool:
         """Quick check if Metro CDP is reachable."""
         try:
-            async with httpx.AsyncClient(timeout=2) as client:
+            async with httpx.AsyncClient(timeout=2, trust_env=False) as client:
                 resp = await client.get(f"{self.metro_url}/json")
                 return resp.status_code == 200
         except Exception:

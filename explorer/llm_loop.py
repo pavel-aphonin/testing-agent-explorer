@@ -977,7 +977,7 @@ What should I do next? Respond with JSON only."""
             user_msg_content = user_prompt
 
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
                 resp = await client.post(
                     f"{self.llm_url}/v1/chat/completions",
                     json={
@@ -1080,7 +1080,7 @@ What should I do next? Respond with JSON only."""
         if doc_ids:
             payload["document_ids"] = doc_ids
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
                 resp = await client.post(
                     f"{self.rag_base_url}/api/admin/knowledge/query",
                     headers={"Authorization": f"Bearer {self.rag_token}"},
@@ -1148,7 +1148,7 @@ What should I do next? Respond with JSON only."""
             messages[1]["content"] = prompt
 
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
                 resp = await client.post(
                     f"{self.llm_url}/v1/chat/completions",
                     json={
@@ -1493,7 +1493,7 @@ What should I do next? Respond with JSON only."""
             )
         prompt = base_prompt + "Ответь ТОЛЬКО названием, без пояснений и кавычек."
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
                 resp = await client.post(
                     f"{self.llm_url}/v1/chat/completions",
                     json={

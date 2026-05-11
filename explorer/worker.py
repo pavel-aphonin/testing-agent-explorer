@@ -293,11 +293,26 @@ class RealExecutor:
                 await sim_manager.launch(bundle_id)
                 await event_sink({"type": "log", "step_idx": 0, "message": "App launched, starting exploration…"})
             except Exception as exc:
+                # Setup failed. Clean up the simulator (best effort)
+                # and propagate so execute_one_run's exception handler
+                # emits the single error event + skips the misleading
+                # "completed" status_change. Before this fix the local
+                # error event was sent and then execute_one_run posted
+                # status_change=completed because run() returned cleanly
+                # — backend's runs state-machine then saw an error-then-
+                # completed sequence and either rejected the second
+                # event with 409 or, worse, marked the run completed
+                # despite the upstream error.
                 logger.exception("Simulator setup failed for run %s", run_id)
-                await event_sink({"type": "error", "step_idx": 0, "message": f"Simulator setup failed: {exc}"})
                 if sim_manager:
-                    await sim_manager.cleanup()
-                return
+                    try:
+                        await sim_manager.cleanup()
+                    except Exception:
+                        logger.exception(
+                            "Simulator cleanup also failed for run %s",
+                            run_id,
+                        )
+                raise RuntimeError(f"Simulator setup failed: {exc}") from exc
 
         # ── AXe client ──
         if self._client_factory is not None:
@@ -436,11 +451,11 @@ class RealExecutor:
                     # so the runner can auto-verify expected_result against
                     # scenario.rag_document_ids and emit spec_mismatch
                     # defects without waiting for the LLM detector.
-                    # PER-XX: backend URL + worker token were injected
-                    # into config by execute_one_run from the BackendClient
-                    # before the executor ran. We don't have direct access
-                    # to BackendClient here — `client` in this scope is
-                    # the AXeExplorerClient that drives the simulator.
+                    # Backend URL + worker token are injected into config
+                    # by execute_one_run from the BackendClient before the
+                    # executor runs. We don't have direct access to
+                    # BackendClient in this scope — `client` here is the
+                    # AXeExplorerClient that drives the simulator.
                     sr = ScenarioRunner(
                         controller=client,
                         scenarios=scenarios_cfg,
@@ -485,9 +500,20 @@ class RealExecutor:
                 for i, ra in enumerate(replay_actions):
                     raw_type = (ra.get("action_type") or "tap").lower()
                     atype = ActionType(raw_type) if raw_type in _ALLOWED_ATYPES else ActionType.TAP
+                    # Propagate every field path_finder.serialize_action
+                    # may have emitted. target_test_id is the most
+                    # stable handle (test_id rarely changes between
+                    # builds); target_frame lets the controller tap by
+                    # coordinate when neither id nor label resolve.
+                    # Previous code only carried target_label → the
+                    # AXe replay path raised AttributeError (no
+                    # tap_element method) every time a frame was
+                    # missing.
                     action = ActionDetail(
                         action_type=atype,
                         target_label=ra.get("target_label"),
+                        target_test_id=ra.get("target_test_id"),
+                        target_frame=ra.get("target_frame"),
                         input_text=ra.get("input_text"),
                     )
                     ok = False
@@ -762,10 +788,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--worker-token",
-        default=os.environ.get(
-            "TA_WORKER_TOKEN", "change_me_worker_token_long_random_string"
+        default=os.environ.get("TA_WORKER_TOKEN"),
+        help=(
+            "Worker token for /api/internal/* (required). "
+            "Set via env TA_WORKER_TOKEN or pass --worker-token. "
+            "There is no default — a public placeholder token was a "
+            "P1 security finding (PER-104) because internal endpoints "
+            "would have been protected by a known string in env-less runs."
         ),
-        help="Worker token for /api/internal/* (default: env TA_WORKER_TOKEN)",
     )
     parser.add_argument(
         "--poll-interval",
@@ -782,6 +812,13 @@ def main() -> None:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+
+    if not args.worker_token:
+        parser.error(
+            "Worker token is required. Set TA_WORKER_TOKEN environment "
+            "variable or pass --worker-token. Worker refuses to start "
+            "with no token rather than fall back to a public default."
+        )
 
     async def _run() -> None:
         stop_event = asyncio.Event()

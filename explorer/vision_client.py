@@ -56,7 +56,7 @@ class VisionExplorerClient:
         self._width = 0
         self._height = 0
         self._udid = ""
-        self._http = httpx.AsyncClient(timeout=300)  # 5 min for 32B vision model
+        self._http = httpx.AsyncClient(timeout=300, trust_env=False)  # 5 min for 32B vision model
         self._last_screenshot_b64: str | None = None  # Cache for get_ui_elements + take_screenshot
 
     async def connect(self, udid: str) -> None:

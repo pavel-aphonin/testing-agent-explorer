@@ -177,6 +177,18 @@ class ExplorationLoop:
         This naturally builds a depth-first tree through the app."""
         back_stack: list[str] = []  # screens we can go back to
 
+        # Anti-stuck guard: consecutive relaunches without any new
+        # element interaction mean the loop has nothing to do but
+        # cycle through "exhausted screen → relaunch → same exhausted
+        # screen". Previously the while-condition only watched
+        # ``self._step``, which is only incremented after a successful
+        # action — so a fully-exhausted root screen made the loop
+        # spin forever (audit PER-104, finding #1). Cap consecutive
+        # relaunches and exit cleanly so the run posts a terminal
+        # status instead of hanging.
+        consecutive_relaunches = 0
+        _MAX_CONSECUTIVE_RELAUNCHES = 3
+
         while self._step < self.max_steps:
             # Re-capture current screen (may have changed after back/relaunch)
             screen = await self._capture()
@@ -205,6 +217,7 @@ class ExplorationLoop:
             # Priority 1: If form not yet submitted with valid data — do it
             if text_fields and not form_tried:
                 self._step += 1
+                consecutive_relaunches = 0  # made progress on this screen
                 self.visited_transitions.add(form_key)
                 print(f"\n>>> [Step {self._step}] {screen.name!r}: form (valid data)", flush=True)
                 before = self._current_screen_id
@@ -248,6 +261,7 @@ class ExplorationLoop:
                     btn = untried_buttons[0]
 
                 self._step += 1
+                consecutive_relaunches = 0  # made progress on this screen
                 print(f"\n>>> [Step {self._step}] {screen.name!r}: tap {btn.label!r}", flush=True)
                 before = self._current_screen_id
 
@@ -288,6 +302,24 @@ class ExplorationLoop:
             print(">>> Relaunching app...", flush=True)
             await self._relaunch()
             back_stack.clear()
+            consecutive_relaunches += 1
+            if consecutive_relaunches >= _MAX_CONSECUTIVE_RELAUNCHES:
+                # Relaunched several times without making forward
+                # progress — the root screen has nothing untried.
+                # Exit so the run posts terminal status; staying in
+                # the loop would burn LLM budget on the same screen
+                # forever and never reach `status_change=completed`.
+                print(
+                    f">>> {_MAX_CONSECUTIVE_RELAUNCHES} consecutive "
+                    "relaunches without progress — discovery exhausted.",
+                    flush=True,
+                )
+                break
+
+        # Note: ``consecutive_relaunches`` is reset to 0 every time the
+        # main loop successfully takes a new action (lines around 207
+        # and 250 increment self._step). The break above only fires
+        # when the loop has done nothing else but relaunch in a row.
 
         print(f"\n>>> Discovery complete: {len(self.screens)} screens", flush=True)
 

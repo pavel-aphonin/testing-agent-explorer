@@ -167,7 +167,7 @@ class DefectDetector:
         user_prompt = "\n".join(context_parts)
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with httpx.AsyncClient(timeout=self.timeout, trust_env=False) as client:
                 resp = await client.post(
                     f"{self.llm_url}/v1/chat/completions",
                     json={

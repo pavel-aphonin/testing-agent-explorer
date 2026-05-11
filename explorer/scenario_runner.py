@@ -761,10 +761,10 @@ class ScenarioRunner:
         )
         payload = {"query": query, "top_k": 3, "document_ids": document_ids}
         try:
-            # PER-XX: use the internal RAG endpoint (worker-token-protected)
-            # rather than /api/admin/knowledge/query (admin-JWT only),
+            # Use the internal RAG endpoint (worker-token-protected)
+            # rather than /api/admin/knowledge/query (admin-JWT only) —
             # otherwise we get 401 and silently skip every spec check.
-            # trust_env=False mirrors BackendClient — bypasses macOS
+            # trust_env=False mirrors BackendClient and bypasses macOS
             # system proxy on corporate dev macs (PER-51).
             async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
                 resp = await client.post(

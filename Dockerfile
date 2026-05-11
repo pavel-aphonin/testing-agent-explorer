@@ -17,7 +17,9 @@ COPY explorer/ ./explorer/
 
 # NOTE: This container is a runnable CLI, not a long-running server.
 # The backend calls `python -m explorer.cli ...` as a subprocess.
-# iOS simulator / AXe CLI / Metro live OUTSIDE the container on the host.
-# This container is used for headless modes (vision, web, android later)
-# and for the backend to orchestrate subprocess runs.
+# iOS Simulator / Android Emulator / AXe CLI / Metro live OUTSIDE the
+# container on the host — the worker daemon (also outside) drives them
+# via xcrun simctl, avdmanager / adb, AXe and Appium. This container is
+# used for headless analyses and for the backend to orchestrate
+# subprocess runs.
 ENTRYPOINT ["python", "-m", "explorer.cli"]

@@ -88,7 +88,7 @@ Goal with PUCT + Go-Explore: **2-3× higher coverage** at the same time budget.
 
 ## Known limitations
 
-- PBT variants in text fields can loop without an attempt counter (engine-level fix in progress)
+- PBT variants in text fields are tracked per field-uid in `form_filler.PBTInputGenerator._tried` — exhausting variants returns `None` rather than looping. If a navigation step relaunches the app and resets the form to empty between variants, ensure `_navigate_to` lands on the same `screen_id` (not just the start screen) before continuing.
 - Similar screens (e.g. Profile view vs Profile edit) may share a navigation title and collide
 - **iOS 26 + idb_companion 1.1.8** — accessibility API hangs on RN. We use AXe instead.
 - **React Native + XCUITest** — `page_source` hangs. We use AXe `describe-ui`.
