@@ -649,13 +649,20 @@ class ExplorationEngine:
         new_node = await self._capture_screen()
         self.graph.add_node(new_node)
 
-        # Record edge for the trigger field with valid input
+        # Record edge for the trigger field with valid input.
+        # The persisted ``input_text`` is redacted for sensitive
+        # fields (password / token / secret) so neither the graph
+        # checkpoint on disk nor any future backend persistence
+        # carries the raw secret. Non-sensitive values (ФИО / phone
+        # / search) stay verbatim — diagnosability matters for them.
+        from explorer.form_filler import redact_value
+        valid_value = self.form_filler.get_valid_value_for(trigger_field)
         action = ActionDetail(
             action_type=ActionType.INPUT,
             target_label=trigger_field.label,
             target_test_id=trigger_field.test_id,
             target_frame=trigger_field.frame,
-            input_text=self.form_filler.get_valid_value_for(trigger_field),
+            input_text=redact_value(trigger_field, valid_value),
             input_category="valid",
         )
         self.graph.add_edge(GraphEdge(
@@ -695,12 +702,15 @@ class ExplorationEngine:
         new_node = await self._capture_screen()
         self.graph.add_node(new_node)
 
+        # Redact stored input_text for sensitive fields — same policy
+        # as _fill_form_happy_path above.
+        from explorer.form_filler import redact_value
         action = ActionDetail(
             action_type=ActionType.INPUT,
             target_label=element.label,
             target_test_id=element.test_id,
             target_frame=element.frame,
-            input_text=value,
+            input_text=redact_value(element, value),
             input_category=category,
         )
         self.graph.add_edge(GraphEdge(
@@ -750,9 +760,21 @@ class ExplorationEngine:
     async def _type_into_field(
         self, element: ElementSnapshot, text: str
     ) -> None:
-        """Set text into a TextInput field. Uses CDP for RN apps when available."""
+        """Set text into a TextInput field. Uses CDP for RN apps when available.
+
+        Stdout shows a redacted view of ``text`` for sensitive fields
+        (password / token / secret / SecureTextField) — see
+        form_filler.redact_value. The controller still receives the
+        real value because the typing call below uses ``text``
+        directly; only the log line is masked.
+        """
+        from explorer.form_filler import redact_value
+        log_text = redact_value(element, text)
         try:
-            print(f"      Typing into {element.test_id or element.label!r}: {text!r:.40}", flush=True)
+            print(
+                f"      Typing into {element.test_id or element.label!r}: {log_text!r:.40}",
+                flush=True,
+            )
 
             # If controller supports set_text_in_field (AXe + CDP), use it
             if hasattr(self.controller, 'set_text_in_field'):
