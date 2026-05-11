@@ -370,9 +370,25 @@ class RealExecutor:
                     await asyncio.sleep(2.0)
                     try:
                         mirror_log = mirror_log_path.open("w")
+                        # SimMirror defaults to binding 127.0.0.1
+                        # (PER-106 #7). The backend runs in Docker
+                        # and reaches the host's SimMirror through
+                        # ``host.docker.internal`` — that traffic
+                        # arrives on the host's external interface,
+                        # NOT loopback, so a loopback-bound mirror
+                        # would be unreachable. We override via the
+                        # ``TA_SIM_MIRROR_BIND`` env var (default
+                        # ``0.0.0.0`` for the docker-backend case);
+                        # operators running the backend natively on
+                        # the same host can set it to "127.0.0.1"
+                        # and stay loopback-only.
+                        mirror_bind = os.environ.get(
+                            "TA_SIM_MIRROR_BIND", "0.0.0.0"
+                        )
                         mirror_proc = await asyncio.create_subprocess_exec(
                             mirror_bin,
                             "--port", mirror_port,
+                            "--bind", mirror_bind,
                             "--max-width", "480",
                             "--fps", "15",
                             stdout=mirror_log,
