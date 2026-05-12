@@ -1182,9 +1182,23 @@ class ScenarioRunner:
             '"reasoning": "одно короткое предложение"}\n\n'
             'Если цель достигнута, верни: {"done": true, "reason": '
             '"чем подтверждается достижение"}\n\n'
-            "Правила выбора value: если в «Доступных тестовых данных» "
-            "есть подходящий ключ — используй его значение. Если нет — "
-            "верни null, система подберёт значение сама."
+            "КРИТИЧЕСКОЕ ПРАВИЛО для action=input:\n"
+            "1) Определи категорию поля (email / phone / телефон / "
+            "password / пароль / name / search / amount / sum / number).\n"
+            "2) Найди в блоке «Доступные тестовые данные» ключ той же "
+            "категории (фамилия и синонимы тоже считаются: tel/mobile "
+            "= phone, login/username = email, pwd/pass = password).\n"
+            "3) Если ключ есть — копируй значение из «Доступных "
+            "тестовых данных» ДОСЛОВНО, СИМВОЛ В СИМВОЛ. Ничего не "
+            "добавляй, не убирай, не переформатируй: ни '+', ни "
+            "пробелов, ни скобок, ни тире. Подаёт само приложение "
+            "маску — это его дело, не твоё.\n"
+            "4) Если подходящего ключа нет — верни value: null. "
+            "Система подставит дефолтное значение по категории.\n"
+            "5) ЗАПРЕЩЕНО выдумывать значения для phone / email / "
+            "password / FIO / любых идентифицирующих данных — твои "
+            "выдумки невоспроизводимы между запусками и не пройдут "
+            "валидацию приложения. Лучше вернуть null, чем придумать.\n"
         )
         user_prompt = (
             f"Цель: {description}\n"
@@ -1312,5 +1326,22 @@ class ScenarioRunner:
             return
         try:
             await self.event_callback(event)
-        except Exception:
-            logger.exception("[scenario] event callback failed (event=%s)", event.get("type"))
+        except asyncio.CancelledError:
+            # Task cancellation from above must propagate so the
+            # asyncio runtime can unwind cleanly.
+            raise
+        except Exception as exc:
+            # PER-110 follow-up: when the backend tells us the run is
+            # in a terminal state (409 → RunCancelled), the worker's
+            # outer loop is responsible for tearing down. If we swallow
+            # the exception here, the goal loop and the rest of the
+            # scenario keep spinning forever — that's what produced the
+            # "stuck after cancel" hang during the demo. We don't
+            # import RunCancelled to avoid a circular dep with worker.py,
+            # so detect by class name.
+            if type(exc).__name__ == "RunCancelled":
+                raise
+            logger.exception(
+                "[scenario] event callback failed (event=%s)",
+                event.get("type"),
+            )

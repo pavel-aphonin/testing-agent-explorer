@@ -552,6 +552,13 @@ class RealExecutor:
                     )
                     sr_summary = await sr.run_all()
                     logger.info("[scenario] summary: %s", sr_summary)
+                except RunCancelled:
+                    # PER-110 follow-up: when the run is cancelled
+                    # while scenarios are still running, propagate
+                    # straight to the outer handler (around loop.run()
+                    # below) so we don't fall through into free
+                    # exploration on a cancelled run.
+                    raise
                 except Exception:
                     logger.exception("Scenario runner crashed — continuing to free exploration")
 
@@ -700,6 +707,13 @@ async def execute_one_run(
         await sink(
             {"type": "error", "step_idx": 0, "message": str(exc)},
         )
+    except RunCancelled as exc:
+        # PER-110 follow-up: cancellation is not a failure. The backend
+        # already moved the run into the terminal state — sending an
+        # `error` event back would 409 anyway, and worse, it would
+        # show up in the UI as "Run failed" which is misleading. Just
+        # log and exit cleanly so the claim loop picks up the next run.
+        logger.info("Run %s cancelled mid-execution: %s", run_id, exc)
     except Exception as exc:
         logger.exception("Run %s failed", run_id)
         await sink(
