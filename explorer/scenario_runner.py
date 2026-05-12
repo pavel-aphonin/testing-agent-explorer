@@ -404,6 +404,32 @@ class ScenarioRunner:
                     # Match the runner's "keep going on soft failure"
                     # philosophy from action steps — the user can wire
                     # a decision node downstream if they want a hard stop.
+            elif ntype == "goal":
+                # PER-110: high-level NL instruction. The runner runs a
+                # mini LLM-loop until the LLM declares the goal done
+                # (or max_steps is exhausted). Behaves like a single
+                # scenario step from the timeline's point of view —
+                # one step_started, one step_completed/step_failed.
+                step = node.get("data") or {}
+                ok, reason = await self._run_goal_node(
+                    sid, action_idx, step, node_id=current,
+                )
+                if ok:
+                    completed += 1
+                else:
+                    failed += 1
+                    logger.warning(
+                        "[scenario] goal %s failed (%s) — continuing",
+                        current, reason,
+                    )
+                self._cond_ctx["last_action_result"] = {
+                    "ok": ok,
+                    "reason": reason,
+                    "action": "goal",
+                    "element_label": (step.get("description") or "")[:80],
+                }
+                action_idx += 1
+                await asyncio.sleep(_ACTION_SETTLE_SEC)
             elif ntype == "sub_scenario":
                 target_id = ((node.get("data") or {}).get("linked_scenario_id") or "").strip()
                 if not target_id:
@@ -919,6 +945,283 @@ class ScenarioRunner:
             "reason": last_reason,
         })
         return False, last_reason
+
+    # ─────────────────────────────────────── PER-110: goal node loop
+
+    # Default cap on inner LLM-loop iterations for a single goal node.
+    # ~15 actions is enough for "login + navigate + fill one form".
+    # Authors can override per-node via data.max_steps.
+    _GOAL_DEFAULT_MAX_STEPS = 15
+
+    async def _run_goal_node(
+        self,
+        scenario_id: str,
+        step_idx: int,
+        data: dict[str, Any],
+        node_id: str | None = None,
+    ) -> tuple[bool, str | None]:
+        """Drive a 'goal' node — the LLM picks actions until it
+        declares the task done or max_steps is exhausted.
+
+        We deliberately do NOT delegate to LLMExplorationLoop here:
+        that class is built for open-ended free exploration (it tracks
+        screen-coverage, runs the defect detector, escalates with the
+        cycle breaker, etc.). For a focused goal we want a tight inner
+        loop that prompts the LLM with "here's the goal, here's the
+        screen, what's next" and stops the moment it reports success.
+
+        Emits one ``scenario.step_started`` then a
+        ``scenario.step_completed`` or ``scenario.step_failed`` so the
+        timeline treats the goal as a single high-level step. Inner
+        actions emit ``scenario.goal_action`` events for the UI's
+        verbose log view.
+        """
+        description = _substitute_test_data(
+            (data.get("description") or "").strip(), self.test_data
+        )
+        expected = (data.get("expected_outcome") or "").strip()
+        try:
+            max_steps = int(data.get("max_steps") or self._GOAL_DEFAULT_MAX_STEPS)
+        except (TypeError, ValueError):
+            max_steps = self._GOAL_DEFAULT_MAX_STEPS
+        max_steps = max(1, min(max_steps, 50))
+
+        started_evt: dict[str, Any] = {
+            "type": "scenario.step_started",
+            "scenario_id": scenario_id,
+            "step_idx": step_idx,
+            "action": "goal",
+            "element_label": description[:200],
+        }
+        if node_id is not None:
+            started_evt["node_id"] = node_id
+        await self._emit(started_evt)
+
+        if not description:
+            await self._emit({
+                "type": "scenario.step_failed",
+                "scenario_id": scenario_id,
+                "step_idx": step_idx,
+                "node_id": node_id,
+                "action": "goal",
+                "reason": "goal_description_missing",
+            })
+            return False, "goal_description_missing"
+
+        if not self.llm_client:
+            # Goals require an LLM by definition — no fallback that
+            # makes sense without one. Fail loudly so the user sees
+            # the misconfiguration in the timeline rather than a
+            # silent skip.
+            await self._emit({
+                "type": "scenario.step_failed",
+                "scenario_id": scenario_id,
+                "step_idx": step_idx,
+                "node_id": node_id,
+                "action": "goal",
+                "reason": "llm_client_unavailable",
+            })
+            return False, "llm_client_unavailable"
+
+        history: list[str] = []
+        last_reason: str | None = None
+        done = False
+
+        for inner_step in range(max_steps):
+            # 1. Read the current screen.
+            try:
+                elements = await asyncio.wait_for(
+                    self.controller.get_ui_elements(), timeout=10
+                )
+            except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
+                last_reason = f"get_ui_elements failed: {exc}"
+                await asyncio.sleep(_ACTION_SETTLE_SEC)
+                continue
+
+            # 2. Ask the LLM what to do (or whether we're done).
+            decision = await self._goal_decide(
+                description=description,
+                elements=elements,
+                history=history,
+                step_idx=inner_step,
+                max_steps=max_steps,
+            )
+            if decision is None:
+                last_reason = "llm_no_decision"
+                break
+
+            if decision.get("done"):
+                done = True
+                last_reason = (decision.get("reason") or "goal reported as done")[:300]
+                break
+
+            action = (decision.get("action") or "tap").lower()
+            label = (decision.get("element_label") or "").strip()
+            raw_value = decision.get("value")
+            value = _substitute_test_data(
+                str(raw_value or ""), self.test_data
+            )
+
+            # Emit a granular event so the user's timeline can show
+            # what the LLM is actually doing inside the goal. Not
+            # persisted — broadcast-only via redis_bus.
+            await self._emit({
+                "type": "scenario.goal_action",
+                "scenario_id": scenario_id,
+                "step_idx": step_idx,
+                "node_id": node_id,
+                "inner_step": inner_step,
+                "action": action,
+                "element_label": label,
+                "reasoning": (decision.get("reasoning") or "")[:300],
+            })
+
+            # 3. Execute. Reuse the action dispatcher that regular
+            # action-nodes go through so behaviour stays consistent
+            # (input fallback, swipe parsing, etc.).
+            try:
+                ok, reason = await self._dispatch(action, label, value)
+            except Exception as exc:
+                ok, reason = False, f"crash: {exc}"
+            history.append(
+                f"{action} «{label}»"
+                + (f" → {value}" if action == "input" and value else "")
+                + (" [OK]" if ok else f" [FAIL: {reason}]")
+            )
+            last_reason = reason
+            await asyncio.sleep(_ACTION_SETTLE_SEC)
+
+        # 4. Optional expected_outcome verification once the LLM
+        # claims done. Mismatch downgrades the result.
+        if done and expected:
+            ok, why = await self._check_screen_with_retries(
+                expected, scenario_id, node_id,
+            )
+            if not ok:
+                done = False
+                last_reason = f"expected_outcome_mismatch: {why}"
+
+        evt: dict[str, Any] = {
+            "type": "scenario.step_completed" if done else "scenario.step_failed",
+            "scenario_id": scenario_id,
+            "step_idx": step_idx,
+            "action": "goal",
+            "element_label": description[:200],
+            "reason": last_reason or (None if done else "max_steps_exceeded"),
+        }
+        if node_id is not None:
+            evt["node_id"] = node_id
+        await self._emit(evt)
+        return done, evt.get("reason")
+
+    async def _goal_decide(
+        self,
+        *,
+        description: str,
+        elements: list,
+        history: list[str],
+        step_idx: int,
+        max_steps: int,
+    ) -> dict[str, Any] | None:
+        """Ask the LLM whether the goal is done and, if not, pick the
+        next action. Returns ``None`` on parse / transport failure so
+        the caller can decide whether to retry or bail.
+
+        Output JSON shape::
+
+            {
+              "done": bool,
+              "reason": str,
+              "action": "tap" | "input" | "back" | "swipe",
+              "element_label": str,
+              "value": str | null,
+              "reasoning": str
+            }
+        """
+        # Build a compact element list — too many entries blow up the
+        # prompt and the smaller models lose track.
+        lines: list[str] = []
+        for i, el in enumerate(elements[:25]):
+            if isinstance(el, dict):
+                label = el.get("label") or "(без подписи)"
+                kind = el.get("kind") or "element"
+            else:
+                label = getattr(el, "label", "") or "(без подписи)"
+                kind = getattr(el, "kind", "element")
+                if hasattr(kind, "value"):
+                    kind = kind.value
+            lines.append(f"  {i + 1}. [{kind}] {label}")
+        if len(elements) > 25:
+            lines.append(f"  …и ещё {len(elements) - 25}.")
+
+        td_lines = ""
+        if self.test_data:
+            td_lines = (
+                "\nДоступные тестовые данные (ключ: значение):\n"
+                + "\n".join(f"  - {k}: {v}" for k, v in self.test_data.items())
+            )
+
+        history_block = ""
+        if history:
+            history_block = "\nИстория действий в рамках этой цели:\n" + "\n".join(
+                f"  {i + 1}. {h}" for i, h in enumerate(history[-8:])
+            )
+
+        system_prompt = (
+            "Ты — автотестер мобильного приложения, который выполняет "
+            "цель пользователя, описанную на естественном языке. На "
+            "каждом шаге ты получаешь список интерактивных элементов "
+            "текущего экрана и историю того, что уже делал. Твоя задача "
+            "— выбрать ОДНО следующее действие, которое продвинет "
+            "выполнение цели, либо сообщить что цель уже достигнута.\n\n"
+            "Отвечай СТРОГО валидным JSON-объектом без какого-либо "
+            "сопроводительного текста:\n"
+            '{"done": false, "action": "tap"|"input"|"back"|"swipe", '
+            '"element_label": "точная подпись элемента", '
+            '"value": "значение для input или null", '
+            '"reasoning": "одно короткое предложение"}\n\n'
+            'Если цель достигнута, верни: {"done": true, "reason": '
+            '"чем подтверждается достижение"}\n\n'
+            "Правила выбора value: если в «Доступных тестовых данных» "
+            "есть подходящий ключ — используй его значение. Если нет — "
+            "верни null, система подберёт значение сама."
+        )
+        user_prompt = (
+            f"Цель: {description}\n"
+            f"Шаг: {step_idx + 1} из {max_steps}\n\n"
+            f"Текущий экран:\n" + "\n".join(lines)
+            + td_lines
+            + history_block
+        )
+
+        try:
+            resp = await self.llm_client.chat(
+                system=system_prompt, user=user_prompt, max_tokens=400
+            )
+        except Exception as exc:
+            logger.warning("[scenario] goal LLM call failed: %s", exc)
+            return None
+        if not resp:
+            return None
+
+        # Tolerate fenced ```json blocks the model sometimes wraps
+        # the answer in, plus leading whitespace / "Answer:" prefaces.
+        text = resp.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.S)
+        # Some smaller models prepend "Answer:" or echo the prompt.
+        # Grab the first balanced {...} chunk if a stray prefix made
+        # it past the strip.
+        match = re.search(r"\{.*\}", text, flags=re.S)
+        if not match:
+            logger.warning("[scenario] goal LLM returned no JSON: %r", text[:200])
+            return None
+        try:
+            import json
+            return json.loads(match.group(0))
+        except json.JSONDecodeError as exc:
+            logger.warning("[scenario] goal LLM JSON parse failed: %s", exc)
+            return None
 
     async def _dispatch(
         self, action: str, label: str, value: str
