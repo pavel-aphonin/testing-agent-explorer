@@ -240,7 +240,14 @@ class RealExecutor:
         mode_config = MODE_CONFIGS[mode]
         if mode_config.use_llm_priors:
             llm_url = os.environ.get("TA_LLM_BASE_URL", "http://localhost:8080")
-            llm_model = os.environ.get("TA_LLM_MODEL_NAME", "embeddings")
+            # PER-106 #5: prefer the per-run model name from the claim
+            # response. The backend resolves it from the user's pick or
+            # AgentSettings default; ``None`` here means "no override",
+            # and we fall back to the worker's env var as before.
+            llm_model = (
+                config.get("llm_model_name")
+                or os.environ.get("TA_LLM_MODEL_NAME", "embeddings")
+            )
             try:
                 from explorer.llm_client import LLMClient, LLMPriorProvider
 
@@ -414,7 +421,13 @@ class RealExecutor:
             # documented runtime for that mode (see modes.py). No
             # silent aliasing.
             llm_url = os.environ.get("TA_LLM_BASE_URL", "http://localhost:8080")
-            llm_model_name = os.environ.get("TA_LLM_MODEL_NAME", "embeddings")
+            # PER-106 #5: same per-run override as the prior_provider
+            # branch above; keep the two in sync so AI mode actually
+            # honours the user's selection.
+            llm_model_name = (
+                config.get("llm_model_name")
+                or os.environ.get("TA_LLM_MODEL_NAME", "embeddings")
+            )
 
             if mode is ExplorationMode.AI:
                 # AI: LLM picks every action. Routes through
