@@ -759,7 +759,16 @@ class ScenarioRunner:
             + (f" with value '{step_value}'" if step_value else "")
             + f": {expected}"
         )
-        payload = {"query": query, "top_k": 3, "document_ids": document_ids}
+        # PER-106 #4: always include the run_id so the backend can
+        # narrow to the run's workspace when ``document_ids`` is empty.
+        # Without this fallback the worker would search every tenant's
+        # corpus and match the wrong document.
+        payload = {
+            "query": query,
+            "top_k": 3,
+            "document_ids": document_ids,
+            "run_id": self.run_id,
+        }
         try:
             # Use the internal RAG endpoint (worker-token-protected)
             # rather than /api/admin/knowledge/query (admin-JWT only) —
