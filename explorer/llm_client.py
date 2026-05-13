@@ -80,6 +80,7 @@ class LLMClient:
         user: str,
         max_tokens: int = MAX_TOKENS,
         screenshot_b64: str | None = None,
+        response_format: dict | None = None,
     ) -> str | None:
         """Single-shot chat completion. Returns the assistant's text, or None on error.
 
@@ -89,6 +90,16 @@ class LLMClient:
         capable through llama-server's mmproj sidecar (PER-22), so this
         unlocks "agent looks at the screen" mode without changing the
         infrastructure.
+
+        PER-111: when ``response_format`` is passed, it goes straight
+        into the llama-server payload. llama.cpp compiles JSON schemas
+        into GBNF grammars under the hood, so a ``{"type":"json_schema",
+        "json_schema":{...}}`` value gives us constrained decoding —
+        the model physically cannot emit tokens outside the schema. If
+        the server returns 4xx mentioning ``response_format`` /
+        ``json_schema`` / ``grammar``, we retry the call ONCE without
+        the format so the goal node degrades gracefully on older builds
+        instead of failing outright.
         """
         if screenshot_b64:
             user_content: Any = [
@@ -102,23 +113,48 @@ class LLMClient:
             ]
         else:
             user_content = user
+
+        async def _post(client: httpx.AsyncClient, body: dict) -> str | None:
+            response = await client.post(
+                f"{self.base_url}/v1/chat/completions", json=body
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data["choices"][0]["message"]["content"]
+
+        base_payload: dict = {
+            "model": self.model_name,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_content},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": 0.2,
+        }
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, trust_env=False) as client:
-                response = await client.post(
-                    f"{self.base_url}/v1/chat/completions",
-                    json={
-                        "model": self.model_name,
-                        "messages": [
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": user_content},
-                        ],
-                        "max_tokens": max_tokens,
-                        "temperature": 0.2,
-                    },
-                )
-                response.raise_for_status()
-                data = response.json()
-                return data["choices"][0]["message"]["content"]
+            async with httpx.AsyncClient(
+                timeout=self.timeout, trust_env=False
+            ) as client:
+                payload = dict(base_payload)
+                if response_format is not None:
+                    payload["response_format"] = response_format
+                try:
+                    return await _post(client, payload)
+                except httpx.HTTPStatusError as exc:
+                    if response_format is None or not 400 <= exc.response.status_code < 500:
+                        raise
+                    body_text = exc.response.text.lower()
+                    if not any(
+                        tok in body_text
+                        for tok in ("response_format", "json_schema", "grammar")
+                    ):
+                        raise
+                    logger.warning(
+                        "LLM rejected response_format (%s); retrying "
+                        "without grammar — output will be plain text JSON.",
+                        exc.response.status_code,
+                    )
+                    return await _post(client, base_payload)
         except (httpx.HTTPError, KeyError, ValueError) as exc:
             logger.warning("LLM chat call failed: %s", exc)
             return None

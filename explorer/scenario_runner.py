@@ -28,14 +28,109 @@ exploration.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import re
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+import httpx
+
 from explorer.expression import ExprError, evaluate as eval_expr
+from explorer.goal_schema import (
+    build_goal_schema,
+    build_test_data_block,
+    build_value_sources_list,
+    resolve_value,
+)
 
 logger = logging.getLogger("explorer.scenario_runner")
+
+
+# PER-111: prompt template fetched from backend (/api/internal/system-
+# prompts). Cache for 60s — admin edits propagate within a minute,
+# which is fast enough for hot-reload and slow enough that thousands
+# of LLM-calls during a single run don't all hammer the backend.
+_PROMPT_CACHE_TTL_SEC = 60.0
+_prompt_cache: dict[str, tuple[float, str]] = {}
+
+
+async def _load_prompt(code: str, backend_url: str, worker_token: str) -> str | None:
+    """Fetch a prompt template by code, with 60-second TTL cache.
+
+    Returns the ``content`` string from the backend's
+    ``/api/internal/system-prompts/{code}`` endpoint, or None when the
+    backend is unreachable / the slot was never seeded. Callers
+    decide whether to fall back to a baked-in default — for goal-decide
+    we keep one in ``_GOAL_DECIDE_SYSTEM_FALLBACK`` below.
+    """
+    cached = _prompt_cache.get(code)
+    if cached is not None and time.monotonic() - cached[0] < _PROMPT_CACHE_TTL_SEC:
+        return cached[1]
+    url = f"{backend_url.rstrip('/')}/api/internal/system-prompts/{code}"
+    try:
+        async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
+            resp = await client.get(
+                url, headers={"Authorization": f"Bearer {worker_token}"}
+            )
+            if resp.status_code != 200:
+                return None
+            content = resp.json().get("content")
+            if isinstance(content, str) and content:
+                _prompt_cache[code] = (time.monotonic(), content)
+                return content
+            return None
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("Failed to load prompt %s: %s", code, exc)
+        return None
+
+
+# Fallbacks for when the backend has not been migrated yet (first boot
+# after deploy) — match the migration seed text. Keep these in sync
+# with alembic/versions/20260513_system_prompts.py.
+_GOAL_DECIDE_SYSTEM_FALLBACK = (
+    "Ты — автотестер мобильного приложения. На каждом шаге ты получаешь "
+    "цель, список элементов экрана и историю действий. Выбери ОДНО "
+    "следующее действие, которое приближает цель, либо отрапортуй о "
+    "достижении.\n\n"
+    "ОТВЕТ — строго JSON по schema. value_literal заполняется ТОЛЬКО "
+    "при value_source ∈ {goal_literal, improvised}. Если поле "
+    "соответствует ключу test_data — используй value_source = "
+    'test_data.<ключ>, value_literal = null. Запрещено выдумывать '
+    "phone / email / password / документы — лучше done=false с "
+    "reasoning='missing test_data: <category>'."
+)
+_GOAL_DECIDE_USER_FALLBACK = (
+    "Цель: {{goal}}\n"
+    "Шаг: {{step_idx}} из {{max_steps}}\n\n"
+    "Текущий экран:\n{{elements_block}}\n\n"
+    "История действий в рамках цели:\n{{history_block}}\n\n"
+    'Доступные значения для подстановки (через value_source = "test_data.<ключ>"):\n'
+    "{{test_data_block}}\n\n"
+    "Допустимые значения value_source для этого шага:\n{{value_sources_list}}"
+)
+
+
+def _render_template(template: str, values: dict[str, str]) -> str:
+    """Substitute ``{{key}}`` / ``{{ key }}`` placeholders with values.
+
+    Unknown placeholders stay verbatim — easier to spot a missing key
+    in the prompt output than to silently drop content. We do NOT
+    reuse ``_substitute_test_data`` because that one specifically
+    walks the ``test_data.*`` namespace; here we want a generic
+    "render this whole template" pass.
+    """
+    if not template or "{{" not in template:
+        return template
+
+    def _repl(match: "re.Match[str]") -> str:
+        key = match.group(1).strip()
+        v = values.get(key)
+        return v if v is not None else match.group(0)
+
+    return re.sub(r"\{\{\s*([\w.]+)\s*\}\}", _repl, template)
 
 
 # How many times to refresh elements + retry the lookup before giving
@@ -963,12 +1058,20 @@ class ScenarioRunner:
         """Drive a 'goal' node — the LLM picks actions until it
         declares the task done or max_steps is exhausted.
 
-        We deliberately do NOT delegate to LLMExplorationLoop here:
-        that class is built for open-ended free exploration (it tracks
-        screen-coverage, runs the defect detector, escalates with the
-        cycle breaker, etc.). For a focused goal we want a tight inner
-        loop that prompts the LLM with "here's the goal, here's the
-        screen, what's next" and stops the moment it reports success.
+        PER-111 contract:
+            * The system + user prompts come from ``system_prompts.*``
+              rows in the backend (loaded once per node via
+              ``_load_prompt`` with TTL cache). Admin edits propagate
+              within a minute, no redeploy.
+            * The LLM does NOT return a raw ``value`` to type. Instead
+              it picks ``value_source`` from a constrained enum
+              (``test_data.<key>`` / ``goal_literal`` / ``improvised``
+              / ``none``). The worker — not the model — substitutes
+              real values via :func:`goal_schema.resolve_value`. This
+              physically prevents fabricated phones / emails / etc.
+            * ``improvised_memory`` lives for the lifetime of this
+              goal: when the model invents a value for a label, the
+              next visit to the same label reuses the same string.
 
         Emits one ``scenario.step_started`` then a
         ``scenario.step_completed`` or ``scenario.step_failed`` so the
@@ -1023,7 +1126,29 @@ class ScenarioRunner:
             })
             return False, "llm_client_unavailable"
 
+        # Load prompt templates from the DB once per goal — they don't
+        # change between inner steps. ``self.rag_base_url`` doubles as
+        # the worker's "backend URL" because the same param is used
+        # for the knowledge-query endpoint; if either bit of glue is
+        # missing we degrade to the baked-in fallback constants above.
+        system_prompt = _GOAL_DECIDE_SYSTEM_FALLBACK
+        user_template = _GOAL_DECIDE_USER_FALLBACK
+        if self.rag_base_url and self.rag_token:
+            sys_from_db = await _load_prompt(
+                "goal_decide.system", self.rag_base_url, self.rag_token,
+            )
+            usr_from_db = await _load_prompt(
+                "goal_decide.user", self.rag_base_url, self.rag_token,
+            )
+            if sys_from_db:
+                system_prompt = sys_from_db
+            if usr_from_db:
+                user_template = usr_from_db
+
         history: list[str] = []
+        # PER-111 R4 — same element_label → same improvised value.
+        # Lives for one goal node only; reset on the next goal.
+        improvised_memory: dict[str, str] = {}
         last_reason: str | None = None
         done = False
 
@@ -1045,6 +1170,8 @@ class ScenarioRunner:
                 history=history,
                 step_idx=inner_step,
                 max_steps=max_steps,
+                system_prompt=system_prompt,
+                user_template=user_template,
             )
             if decision is None:
                 last_reason = "llm_no_decision"
@@ -1057,10 +1184,12 @@ class ScenarioRunner:
 
             action = (decision.get("action") or "tap").lower()
             label = (decision.get("element_label") or "").strip()
-            raw_value = decision.get("value")
-            value = _substitute_test_data(
-                str(raw_value or ""), self.test_data
-            )
+            # PER-111: value is resolved by the WORKER, not the model.
+            # The model picked a value_source; we turn that into the
+            # actual string to type. Returns None for tap/back/swipe
+            # and for inputs where no source applies.
+            value = resolve_value(decision, self.test_data, improvised_memory)
+            value_source = decision.get("value_source") or ""
 
             # Emit a granular event so the user's timeline can show
             # what the LLM is actually doing inside the goal. Not
@@ -1073,19 +1202,26 @@ class ScenarioRunner:
                 "inner_step": inner_step,
                 "action": action,
                 "element_label": label,
+                "value_source": value_source,
                 "reasoning": (decision.get("reasoning") or "")[:300],
             })
 
             # 3. Execute. Reuse the action dispatcher that regular
             # action-nodes go through so behaviour stays consistent
-            # (input fallback, swipe parsing, etc.).
+            # (input fallback, swipe parsing, etc.). ``value`` is the
+            # worker-resolved string (or empty if value_source = none).
             try:
-                ok, reason = await self._dispatch(action, label, value)
+                ok, reason = await self._dispatch(
+                    action, label, value or ""
+                )
             except Exception as exc:
                 ok, reason = False, f"crash: {exc}"
             history.append(
                 f"{action} «{label}»"
-                + (f" → {value}" if action == "input" and value else "")
+                + (
+                    f" → {value} (via {value_source})"
+                    if action == "input" and value else ""
+                )
                 + (" [OK]" if ok else f" [FAIL: {reason}]")
             )
             last_reason = reason
@@ -1122,21 +1258,31 @@ class ScenarioRunner:
         history: list[str],
         step_idx: int,
         max_steps: int,
+        system_prompt: str,
+        user_template: str,
     ) -> dict[str, Any] | None:
         """Ask the LLM whether the goal is done and, if not, pick the
         next action. Returns ``None`` on parse / transport failure so
         the caller can decide whether to retry or bail.
 
-        Output JSON shape::
+        PER-111 output schema (constrained by llama-server through
+        ``response_format=json_schema``)::
 
             {
               "done": bool,
-              "reason": str,
+              "reason": str | null,
               "action": "tap" | "input" | "back" | "swipe",
               "element_label": str,
-              "value": str | null,
+              "value_source": "test_data.<key>" | "goal_literal"
+                            | "improvised" | "none",
+              "value_literal": str | null,
               "reasoning": str
             }
+
+        ``system_prompt`` and ``user_template`` come from the caller,
+        which loaded them from ``system_prompts.goal_decide.*`` in the
+        DB (with baked-in fallbacks). The template is rendered here
+        with the per-step placeholder values.
         """
         # Build a compact element list — too many entries blow up the
         # prompt and the smaller models lose track.
@@ -1153,64 +1299,45 @@ class ScenarioRunner:
             lines.append(f"  {i + 1}. [{kind}] {label}")
         if len(elements) > 25:
             lines.append(f"  …и ещё {len(elements) - 25}.")
+        elements_block = "\n".join(lines) if lines else "  (экран пуст)"
 
-        td_lines = ""
-        if self.test_data:
-            td_lines = (
-                "\nДоступные тестовые данные (ключ: значение):\n"
-                + "\n".join(f"  - {k}: {v}" for k, v in self.test_data.items())
-            )
-
-        history_block = ""
-        if history:
-            history_block = "\nИстория действий в рамках этой цели:\n" + "\n".join(
+        history_block = (
+            "\n".join(
                 f"  {i + 1}. {h}" for i, h in enumerate(history[-8:])
             )
-
-        system_prompt = (
-            "Ты — автотестер мобильного приложения, который выполняет "
-            "цель пользователя, описанную на естественном языке. На "
-            "каждом шаге ты получаешь список интерактивных элементов "
-            "текущего экрана и историю того, что уже делал. Твоя задача "
-            "— выбрать ОДНО следующее действие, которое продвинет "
-            "выполнение цели, либо сообщить что цель уже достигнута.\n\n"
-            "Отвечай СТРОГО валидным JSON-объектом без какого-либо "
-            "сопроводительного текста:\n"
-            '{"done": false, "action": "tap"|"input"|"back"|"swipe", '
-            '"element_label": "точная подпись элемента", '
-            '"value": "значение для input или null", '
-            '"reasoning": "одно короткое предложение"}\n\n'
-            'Если цель достигнута, верни: {"done": true, "reason": '
-            '"чем подтверждается достижение"}\n\n'
-            "КРИТИЧЕСКОЕ ПРАВИЛО для action=input:\n"
-            "1) Определи категорию поля (email / phone / телефон / "
-            "password / пароль / name / search / amount / sum / number).\n"
-            "2) Найди в блоке «Доступные тестовые данные» ключ той же "
-            "категории (фамилия и синонимы тоже считаются: tel/mobile "
-            "= phone, login/username = email, pwd/pass = password).\n"
-            "3) Если ключ есть — копируй значение из «Доступных "
-            "тестовых данных» ДОСЛОВНО, СИМВОЛ В СИМВОЛ. Ничего не "
-            "добавляй, не убирай, не переформатируй: ни '+', ни "
-            "пробелов, ни скобок, ни тире. Подаёт само приложение "
-            "маску — это его дело, не твоё.\n"
-            "4) Если подходящего ключа нет — верни value: null. "
-            "Система подставит дефолтное значение по категории.\n"
-            "5) ЗАПРЕЩЕНО выдумывать значения для phone / email / "
-            "password / FIO / любых идентифицирующих данных — твои "
-            "выдумки невоспроизводимы между запусками и не пройдут "
-            "валидацию приложения. Лучше вернуть null, чем придумать.\n"
+            if history else "  (пока ничего)"
         )
-        user_prompt = (
-            f"Цель: {description}\n"
-            f"Шаг: {step_idx + 1} из {max_steps}\n\n"
-            f"Текущий экран:\n" + "\n".join(lines)
-            + td_lines
-            + history_block
+
+        test_data_keys = list(self.test_data.keys())
+        test_data_block = build_test_data_block(self.test_data)
+        value_sources_list = build_value_sources_list(test_data_keys)
+        schema = build_goal_schema(test_data_keys)
+
+        user_prompt = _render_template(
+            user_template,
+            {
+                "goal": description,
+                "step_idx": str(step_idx + 1),
+                "max_steps": str(max_steps),
+                "elements_block": elements_block,
+                "history_block": history_block,
+                "test_data_block": test_data_block,
+                "value_sources_list": value_sources_list,
+            },
         )
 
         try:
             resp = await self.llm_client.chat(
-                system=system_prompt, user=user_prompt, max_tokens=400
+                system=system_prompt,
+                user=user_prompt,
+                max_tokens=400,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "goal_decision",
+                        "schema": schema,
+                    },
+                },
             )
         except Exception as exc:
             logger.warning("[scenario] goal LLM call failed: %s", exc)
@@ -1218,23 +1345,28 @@ class ScenarioRunner:
         if not resp:
             return None
 
-        # Tolerate fenced ```json blocks the model sometimes wraps
-        # the answer in, plus leading whitespace / "Answer:" prefaces.
+        # Even with constrained decoding the chat-template can wrap the
+        # JSON in markdown fences or a leading "Answer:" prefix — strip
+        # those, then use raw_decode to read exactly one balanced
+        # object (immune to trailing chatter the model might add when
+        # the grammar is not enforced — graceful-fallback path).
         text = resp.strip()
         if text.startswith("```"):
             text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.S)
-        # Some smaller models prepend "Answer:" or echo the prompt.
-        # Grab the first balanced {...} chunk if a stray prefix made
-        # it past the strip.
-        match = re.search(r"\{.*\}", text, flags=re.S)
-        if not match:
-            logger.warning("[scenario] goal LLM returned no JSON: %r", text[:200])
+        start = text.find("{")
+        if start < 0:
+            logger.warning(
+                "[scenario] goal LLM returned no JSON: %r", text[:200]
+            )
             return None
         try:
-            import json
-            return json.loads(match.group(0))
+            obj, _ = json.JSONDecoder().raw_decode(text[start:])
+            return obj
         except json.JSONDecodeError as exc:
-            logger.warning("[scenario] goal LLM JSON parse failed: %s", exc)
+            logger.warning(
+                "[scenario] goal LLM JSON parse failed: %s; raw=%r",
+                exc, text[start:start + 300],
+            )
             return None
 
     async def _dispatch(
