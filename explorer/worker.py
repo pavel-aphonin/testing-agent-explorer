@@ -912,6 +912,14 @@ def main() -> None:
     # so `tail -f /tmp/ta-worker.log` stays human-readable on dev.
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging_backend = (os.environ.get("LOGGING_BACKEND") or "none").strip().lower()
+
+    # Quiet the noisiest 3rd-party loggers regardless of mode. Without
+    # this, ``-v`` blows the Elasticsearch index up with hundreds of
+    # httpcore handshake DEBUG lines per second — useless for
+    # diagnosing the agent, ruinous for disk usage. WARNING still
+    # surfaces real transport problems (timeouts, refused connections).
+    for noisy in ("httpcore", "httpx", "asyncio"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     if logging_backend not in ("", "none"):
         try:
             from pythonjsonlogger import jsonlogger
