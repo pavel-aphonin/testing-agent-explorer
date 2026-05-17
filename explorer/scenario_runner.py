@@ -1183,17 +1183,24 @@ class ScenarioRunner:
         improvised_memory: dict[str, str] = {}
         last_reason: str | None = None
         done = False
-        # PER-111 v2: anti-loop guard. The first live runs caught
-        # Gemma 4 repeating the same failing input 15 times in a row
-        # despite the FAIL marker landing in history each time —
-        # the model just rationalised "let me try again" and burned
-        # the whole max_steps budget on one stuck field. P3 in the
-        # prompt is advisory; this is the structural guarantee.
-        # If the last N (action, element_id, value_source) tuples
-        # are all identical AND all failed, we break the loop with
-        # ``stuck_loop`` instead of letting the model run it out.
+        # PER-111 v2: anti-loop guard, two patterns.
+        #
+        # `recent_attempts` (last 3): catches the "repeat the same
+        # failing call N times" pattern. First live run caught Gemma 4
+        # repeating the same failing input 15 times despite the FAIL
+        # marker in history — the model rationalised "let me try
+        # again" and burned the whole max_steps budget on one stuck
+        # field. P3 in the prompt is advisory; this is structural.
+        #
+        # `oscillation_window` (last 6): catches the A,B,A,B pattern
+        # — second live run had the model bouncing between "Войти"
+        # and "Back" until max_steps ran out. Identical-failures
+        # check doesn't fire because the tuples aren't identical;
+        # but if the last 6 steps contain only 2 unique tuples we're
+        # in a 3-cycle and won't escape.
         from collections import deque
         recent_attempts: deque[tuple[str, str | None, str, bool]] = deque(maxlen=3)
+        oscillation_window: deque[tuple[str, str | None]] = deque(maxlen=6)
 
         for inner_step in range(max_steps):
             # 1. Read the current screen.
@@ -1307,7 +1314,7 @@ class ScenarioRunner:
             )
             last_reason = reason
 
-            # Anti-loop check: if the same (action, element_id,
+            # Anti-loop check #1: if the same (action, element_id,
             # value_source) failed `recent_attempts.maxlen` times in
             # a row, the model isn't going to find a way out and the
             # remaining max_steps would just be more of the same.
@@ -1326,6 +1333,31 @@ class ScenarioRunner:
                     f"stuck_loop: {recent_attempts.maxlen}× same failing "
                     f"({action}, element_id={element_id}, "
                     f"value_source={value_source})"
+                )
+                break
+
+            # Anti-loop check #2: oscillation pattern (A,B,A,B,…).
+            # If the last 6 steps have only 2 unique (action, id)
+            # pairs the model is stuck in a 3-cycle between two
+            # actions and won't escape on its own. Mostly catches
+            # "tap Войти ↔ tap Back" loops where the model thinks
+            # each branch will help but the screen just toggles.
+            oscillation_window.append((action, element_id))
+            if (
+                len(oscillation_window) == oscillation_window.maxlen
+                and len(set(oscillation_window)) <= 2
+            ):
+                unique_pairs = ", ".join(
+                    f"({a},{e})" for a, e in set(oscillation_window)
+                )
+                logger.warning(
+                    "[goal] anti-loop: oscillation in last %d steps "
+                    "(only 2 unique actions: %s); aborting goal early",
+                    oscillation_window.maxlen, unique_pairs,
+                )
+                last_reason = (
+                    f"stuck_loop: oscillation between {unique_pairs} "
+                    f"over last {oscillation_window.maxlen} steps"
                 )
                 break
 

@@ -691,6 +691,60 @@ async def test_T16_anti_loop_breaks_after_three_identical_failures() -> None:
     assert len(controller.set_text_calls) == 3
 
 
+@pytest.mark.asyncio
+async def test_T17_anti_loop_breaks_on_oscillation_pattern() -> None:
+    """T17 (PER-111 v2): if the LLM oscillates between two actions
+    (A, B, A, B, …) the worker breaks out after 6 steps even when
+    every individual action succeeded. Catches the demo regression
+    where Gemma 4 toggled between "tap Войти" and "tap Back" until
+    max_steps ran out — each step was [OK] so the identical-failure
+    guard didn't fire."""
+
+    controller = FakeController(
+        elements=[
+            {
+                "id": "voyti_btn",
+                "label": "Войти",
+                "kind": "AXButton",
+                "test_id": "voyti_btn",
+            },
+            {
+                "id": "back_btn",
+                "label": "Back",
+                "kind": "AXButton",
+                "test_id": "back_btn",
+            },
+        ]
+    )
+    # 10 alternating taps — A,B,A,B,A,B,A,B,A,B — anti-loop should
+    # fire after the 6th decision because last-6 has only 2 unique
+    # (action, id) pairs.
+    pattern = []
+    for i in range(10):
+        eid = "voyti_btn" if i % 2 == 0 else "back_btn"
+        label = "Войти" if i % 2 == 0 else "Back"
+        pattern.append(
+            _decision(
+                action="tap",
+                element_id=eid,
+                element_label=label,
+                value_source="none",
+            )
+        )
+    llm = FakeLLMClient(responses=pattern)
+    runner = _make_runner(controller, llm, test_data={})
+    ok, reason = await runner._run_goal_node(
+        scenario_id="t17", step_idx=0,
+        data={"description": "Войди", "max_steps": 10}, node_id="g1",
+    )
+    assert ok is False
+    assert reason is not None and "oscillation" in reason
+    # Anti-loop fires once the window of 6 is full of 2 unique pairs
+    # — so exactly 6 LLM calls and 6 taps, not 10.
+    assert len(llm.calls) == 6
+    assert len(controller.tap_calls) == 6
+
+
 def test_T14b_scenario_runner_prompts_no_hardcoded_actions() -> None:
     """T14b: the same property holds for the live module source
     (catches anyone re-introducing hardcoded action names in a prompt
