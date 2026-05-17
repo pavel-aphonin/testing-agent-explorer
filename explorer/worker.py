@@ -392,12 +392,25 @@ class RealExecutor:
                         mirror_bind = os.environ.get(
                             "TA_SIM_MIRROR_BIND", "0.0.0.0"
                         )
+                        # PER-111 followup: pin SimMirror to THIS run's
+                        # simulator window. Without a selector SimMirror
+                        # picked "the first Simulator window", which on
+                        # the demo machine ended up being a stray
+                        # "Apple TV Remote" 155×515 surface — UI showed
+                        # "ждём захват симулятора" forever.
+                        # Simulator window titles begin with the device
+                        # name (``TA-<run-id-short>``) which we set in
+                        # IOSSimulatorManager.create(), so matching by
+                        # that substring unambiguously hits the right
+                        # window per run.
+                        mirror_window_title = f"TA-{run_id[:8]}"
                         mirror_proc = await asyncio.create_subprocess_exec(
                             mirror_bin,
                             "--port", mirror_port,
                             "--bind", mirror_bind,
                             "--max-width", "480",
                             "--fps", "15",
+                            "--window-title-substring", mirror_window_title,
                             stdout=mirror_log,
                             stderr=mirror_log,
                         )
