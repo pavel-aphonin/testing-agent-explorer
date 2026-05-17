@@ -13,10 +13,49 @@ import base64
 import json
 import logging
 import os
+import re
 import shutil
+import unicodedata
 from dataclasses import dataclass
 
 logger = logging.getLogger("explorer.axe_client")
+
+
+# PER-111 v2: a short, alphanumeric slug used inside synthetic
+# element ids when AXUniqueId is missing. We transliterate Cyrillic
+# (Готово → gotovo) so the generated id stays purely ASCII — keeps
+# the LLM's response_format enum compact and predictable. Trim hard
+# at 24 chars to bound the per-element enum entry size.
+_SLUG_TRIM_LEN = 24
+_SLUG_INVALID_RE = re.compile(r"[^a-z0-9]+")
+
+# unicodedata.normalize("NFKD") strips Latin diacritics but not
+# Cyrillic, so we explicitly transliterate the Russian alphabet —
+# every screen we run goal-nodes against is bilingual (Russian app
+# UI + English worker logs), and a slug like "" for the Готово
+# button is useless. Lowercase only; the slug pipeline downstream
+# already lower-cases the input.
+_CYRILLIC_TRANSLIT: dict[str, str] = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d",
+    "е": "e", "ё": "yo", "ж": "zh", "з": "z", "и": "i",
+    "й": "y", "к": "k", "л": "l", "м": "m", "н": "n",
+    "о": "o", "п": "p", "р": "r", "с": "s", "т": "t",
+    "у": "u", "ф": "f", "х": "h", "ц": "ts", "ч": "ch",
+    "ш": "sh", "щ": "sch", "ъ": "", "ы": "y", "ь": "",
+    "э": "e", "ю": "yu", "я": "ya",
+}
+
+
+def _slug(text: str) -> str:
+    """Lower-case ASCII-only slug for use inside synthetic ids."""
+    if not text:
+        return ""
+    lowered = text.lower()
+    transliterated = "".join(_CYRILLIC_TRANSLIT.get(c, c) for c in lowered)
+    normalized = unicodedata.normalize("NFKD", transliterated)
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+    s = _SLUG_INVALID_RE.sub("_", ascii_text).strip("_")
+    return s[:_SLUG_TRIM_LEN] if len(s) > _SLUG_TRIM_LEN else s
 
 
 def _resolve_axe_binary() -> str | None:
@@ -330,24 +369,34 @@ class AXeExplorerClient:
             test_id = node.get("AXUniqueId", "")
             frame = node.get("frame", {}) or {}
             kind = node.get("type", "") or "element"
+            label = node.get("AXLabel", "") or ""
             # PER-111 v2: every element needs a stable id so the LLM
             # can refer to it from the constrained enum and the
-            # worker can resolve it back to a frame. AXe gives us
-            # AXUniqueId for native iOS controls, but React Native and
-            # custom views often skip accessibilityIdentifier — for
-            # those we synthesize from (type, x, y), which stays
-            # stable across calls until the screen redraws.
+            # worker can resolve it back to a frame. Priority is:
+            #   1. AXUniqueId (developer-set accessibilityIdentifier)
+            #   2. <kind>_<slug(label)>_<y>  (semantic + position)
+            #   3. <kind>_<x>_<y>            (last resort)
+            # The Y coordinate disambiguates duplicate labels on the
+            # same screen (two "Готово" buttons in a stack) without
+            # making the id meaningless. ``slug`` trims to 24 chars
+            # and keeps only [a-z0-9_], so the id stays short enough
+            # for llama-server to enumerate efficiently.
             try:
                 fx = int(frame.get("x", 0) or 0)
                 fy = int(frame.get("y", 0) or 0)
             except (TypeError, ValueError):
                 fx, fy = 0, 0
-            synthetic_id = test_id or f"{kind}_{fx}_{fy}"
+            if test_id:
+                synthetic_id = test_id
+            elif label:
+                synthetic_id = f"{kind}_{_slug(label)}_{fy}"
+            else:
+                synthetic_id = f"{kind}_{fx}_{fy}"
             result.append({
                 "id": synthetic_id,
                 "type": kind,
                 "kind": kind,
-                "label": node.get("AXLabel", ""),
+                "label": label,
                 "value": node.get("AXValue", ""),
                 "test_id": test_id,
                 "frame": frame,

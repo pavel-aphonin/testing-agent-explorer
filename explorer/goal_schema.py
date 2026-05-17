@@ -12,14 +12,18 @@ for this run:
   ``ref_action_types.arguments_schema`` and arrives in the same
   payload.
 * ``element_id`` — enum of the stable ids the worker just observed
-  via AXe + ``null`` (some actions don't target an element).
+  via AXe. For actions that act on a specific element (tap, input,
+  long_press, assert) the schema requires a non-null id from the
+  enum — the LLM cannot return null and the worker cannot end up
+  with "find element 'None'". For navigation/timing actions (back,
+  wait, swipe, scroll) null is allowed.
 * ``value_source`` — ``test_data.<key>`` for any key the workspace
   has, plus ``goal_literal`` / ``improvised`` / ``none``.
 
 Combined with llama-server's ``response_format=json_schema`` this
 makes fabrication impossible at the grammar level: the model can
 neither invent an action name nor pass invalid args nor reference an
-element that isn't on screen.
+element that isn't on screen nor "forget" the element on a tap.
 """
 
 from __future__ import annotations
@@ -36,14 +40,48 @@ NONE = "none"
 SPECIAL_SOURCES: tuple[str, ...] = (GOAL_LITERAL, IMPROVISED, NONE)
 
 
-def _action_args_branch(action_code: str, args_schema: dict[str, Any]) -> dict:
+# Actions that conceptually MUST target a specific on-screen element.
+# For these the JSON Schema forbids ``element_id: null`` and the LLM
+# is forced to pick one of the stable ids the worker exposed. Listed
+# by reference-dictionary code — this is the worker's contract with
+# the action vocabulary, not a hardcode of any one app's behavior:
+# tap/input/long_press/assert are universal across iOS/Android UIs.
+# Adding a new code to the dictionary that targets an element means
+# adding it here too (otherwise the LLM can choose null and the
+# worker's _find_element returns "not found").
+_ELEMENT_TARGETED_ACTIONS: frozenset[str] = frozenset({
+    "tap",
+    "input",
+    "long_press",
+    "assert",
+    "double_click",
+    "right_click",
+})
+
+
+def _action_args_branch(
+    action_code: str,
+    args_schema: dict[str, Any],
+    element_ids: list[str],
+) -> dict:
     """Build one ``oneOf`` branch for a single action.
 
     Each branch pins ``action`` to a constant and supplies the
-    corresponding ``action_args`` schema. ``args_schema`` empty /
-    missing → branch demands ``action_args: {}`` (empty object).
+    corresponding ``action_args`` schema. For element-targeted
+    actions the branch also pins ``element_id`` to the non-null
+    enum so the model can't skip the target. ``args_schema`` empty
+    / missing → branch demands ``action_args: {}`` (empty object).
     Pure JSON-Schema, no GBNF-specific extensions, so llama-server
     just compiles it on its end.
+
+    ``additionalProperties`` is deliberately omitted from the branch
+    so it composes with the base object (which has its own
+    additionalProperties: false plus the full set of allowed
+    properties). A branch with ``additionalProperties: false`` would
+    reject the value_source / reasoning / etc. fields the base
+    requires — JSON Schema's allOf semantics intersect the two, so
+    the branch only needs to add constraints, not redeclare the
+    whole shape.
     """
     if not args_schema:
         args_schema = {
@@ -51,15 +89,25 @@ def _action_args_branch(action_code: str, args_schema: dict[str, Any]) -> dict:
             "additionalProperties": False,
             "properties": {},
         }
-    return {
+    branch: dict[str, Any] = {
         "type": "object",
-        "additionalProperties": False,
         "required": ["action", "action_args"],
         "properties": {
-            "action": {"type": "string", "const": action_code},
+            "action": {"const": action_code},
             "action_args": args_schema,
         },
     }
+    if action_code in _ELEMENT_TARGETED_ACTIONS and element_ids:
+        # Force the model to pick an element id from the live enum —
+        # null is removed. If element_ids is empty (blank screen),
+        # leave element_id alone: a forced non-null enum with no
+        # values would make the whole schema unsatisfiable.
+        branch["required"].append("element_id")
+        branch["properties"]["element_id"] = {
+            "type": "string",
+            "enum": list(element_ids),
+        }
+    return branch
 
 
 def build_goal_schema(
@@ -123,11 +171,16 @@ def build_goal_schema(
 
     # Discriminated args: ``oneOf`` for the (action, action_args)
     # pair. Each branch fixes action to one of the dictionary codes
-    # and constrains action_args by that action's arguments_schema.
+    # and, for element-targeted ones, also pins element_id to the
+    # non-null enum.
     base["allOf"] = [
         {
             "oneOf": [
-                _action_args_branch(a["code"], a.get("arguments_schema") or {})
+                _action_args_branch(
+                    a["code"],
+                    a.get("arguments_schema") or {},
+                    element_ids,
+                )
                 for a in actions
                 if a.get("code")
             ]

@@ -573,6 +573,69 @@ def test_T14_fallback_prompts_dont_enumerate_specific_actions() -> None:
     assert "доступных действий" in _GOAL_DECIDE_SYSTEM_FALLBACK.lower()
 
 
+def test_T15_element_targeted_actions_forbid_null_element_id() -> None:
+    """T15 (PER-111 v2): for actions that conceptually require a
+    target (tap, input, long_press, assert) the constrained-decode
+    schema must not allow element_id to be null. Without this the
+    LLM can — and on real runs does — return ``element_id: null``
+    for a tap, which sends the worker into a "find element 'None'"
+    failure loop.
+
+    Synchronous test against build_goal_schema directly so it's fast
+    and doesn't need a sim."""
+    from explorer.goal_schema import (
+        _ELEMENT_TARGETED_ACTIONS,
+        build_goal_schema,
+    )
+
+    actions = [
+        {"code": "tap", "arguments_schema": {}},
+        {"code": "input", "arguments_schema": {}},
+        {"code": "back", "arguments_schema": {}},
+        {
+            "code": "scroll",
+            "arguments_schema": {
+                "type": "object",
+                "required": ["direction"],
+                "properties": {"direction": {"type": "string"}},
+            },
+        },
+    ]
+    schema = build_goal_schema(
+        test_data_keys=["phone"],
+        actions=actions,
+        element_ids=["doneButton", "phone_field"],
+    )
+    one_of = schema["allOf"][0]["oneOf"]
+    by_action = {
+        branch["properties"]["action"]["const"]: branch for branch in one_of
+    }
+
+    # Element-targeted actions: element_id REQUIRED and type=string
+    # only (no null), enum without None.
+    for code in ("tap", "input"):
+        assert code in _ELEMENT_TARGETED_ACTIONS
+        branch = by_action[code]
+        assert "element_id" in branch["required"], (
+            f"action {code!r} branch must require element_id"
+        )
+        eid_prop = branch["properties"]["element_id"]
+        assert eid_prop["type"] == "string", (
+            f"{code} element_id must be plain string, got {eid_prop['type']!r}"
+        )
+        assert None not in eid_prop["enum"], (
+            f"{code} element_id enum must not include null"
+        )
+        assert "doneButton" in eid_prop["enum"]
+
+    # Non-targeted actions: element_id stays nullable on the base
+    # schema (branch leaves it alone).
+    for code in ("back", "scroll"):
+        assert code not in _ELEMENT_TARGETED_ACTIONS
+        branch = by_action[code]
+        assert "element_id" not in branch["required"]
+
+
 def test_T14b_scenario_runner_prompts_no_hardcoded_actions() -> None:
     """T14b: the same property holds for the live module source
     (catches anyone re-introducing hardcoded action names in a prompt
