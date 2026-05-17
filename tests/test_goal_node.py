@@ -1,23 +1,42 @@
 """Regression tests for the goal-node value_source contract (PER-111).
 
-Covers T1–T9 from the research plan. Each test wires a minimal fake
-controller + fake LLM to ``ScenarioRunner._run_goal_node`` so we can
-assert what value the worker actually typed without booting iOS.
+PER-111 v2 update:
+    * element_id is the primary on-screen identifier (element_label is
+      a human-readable label and may be null / change between visits).
+    * The action dictionary is workspace-curated and shipped by the
+      backend in RunClaimResponse.actions — tests don't pass it (so the
+      schema falls back to the permissive `action: string` enum), which
+      lets us exercise the value_source + element_id contract in
+      isolation from the action-args branching.
+    * T7 replaced by T7' — "improvised" must actually type a plausible
+      value, not skip the field. v1 said "don't fabricate", v2 says
+      "invent a sensible default".
+    * T13 — explore mode (empty description) runs until max_steps and
+      reports step_completed (designed exit), not step_failed.
+    * T14 — neither the system nor user fallback prompt enumerates
+      specific action codes ("tap", "input", "swipe", "back"). Action
+      names must flow only via the workspace dictionary in the user
+      message.
 
-The fake LLM returns a queue of pre-canned decisions; the fake
-controller records every ``set_text_in_field`` / ``tap_by_label`` /
-``go_back`` / ``swipe`` call so a test can introspect exactly what
-the worker did.
+Each test wires a minimal fake controller + fake LLM to
+``ScenarioRunner._run_goal_node`` so we can assert what value the
+worker actually typed without booting iOS.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from explorer.scenario_runner import ScenarioRunner
+from explorer.scenario_runner import (
+    _GOAL_DECIDE_SYSTEM_FALLBACK,
+    _GOAL_DECIDE_USER_FALLBACK,
+    ScenarioRunner,
+)
 
 
 # ----------------------------------------------------------------- fakes
@@ -32,16 +51,28 @@ class _TapResult:
 class FakeController:
     """Records every controller call; returns scripted UI elements.
 
-    Elements are dicts (the format ``_goal_decide`` reads). To simulate
-    "AXLabel is null" pass ``label=None`` — that's what made the
-    DevKnife overlay break on the real demo and the test_data lookup
-    must still work in that case.
+    Elements are dicts in the format ``_goal_decide`` reads via
+    ``build_elements_block``. Each element carries an ``id`` (the
+    canonical stable identifier per PER-111 v2) and a ``test_id``
+    (the AXe accessibility identifier the dispatcher uses to type
+    into the field). In real life they often coincide; here we keep
+    them equal for simplicity.
     """
 
     elements: list[dict[str, Any]] = field(
         default_factory=lambda: [
-            {"label": "Введите телефон", "kind": "AXTextField", "test_id": "phone_field"},
-            {"label": "Зайти", "kind": "AXButton", "test_id": "submit_btn"},
+            {
+                "id": "phone_field",
+                "label": "Введите телефон",
+                "kind": "AXTextField",
+                "test_id": "phone_field",
+            },
+            {
+                "id": "submit_btn",
+                "label": "Зайти",
+                "kind": "AXButton",
+                "test_id": "submit_btn",
+            },
         ]
     )
     set_text_calls: list[tuple[str, str]] = field(default_factory=list)
@@ -123,6 +154,7 @@ def _make_runner(
     controller: FakeController,
     llm: FakeLLMClient,
     test_data: dict[str, str] | None = None,
+    actions: list[dict[str, Any]] | None = None,
 ) -> ScenarioRunner:
     """Build a ScenarioRunner wired for goal-node tests.
 
@@ -141,6 +173,7 @@ def _make_runner(
         test_data=test_data or {},
         event_callback=event_sink,
         llm_client=llm,
+        actions=actions or [],
     )
     runner._test_events = events  # type: ignore[attr-defined]
     return runner
@@ -151,18 +184,21 @@ def _decision(
     *,
     done: bool = False,
     reason: str | None = None,
-    element_label: str = "",
+    element_id: str | None = None,
+    element_label: str | None = None,
     value_source: str = "none",
     value_literal: str | None = None,
     reasoning: str = "test",
+    action_args: dict[str, Any] | None = None,
 ) -> str:
-    import json
-
+    """Build one canned LLM response matching the PER-111 v2 contract."""
     return json.dumps(
         {
             "done": done,
             "reason": reason,
             "action": action,
+            "action_args": action_args or {},
+            "element_id": element_id,
             "element_label": element_label,
             "value_source": value_source,
             "value_literal": value_literal,
@@ -178,12 +214,14 @@ def _decision(
 @pytest.mark.asyncio
 async def test_T1_uses_test_data_phone_value() -> None:
     """T1: LLM picks test_data.phone → worker types the workspace's
-    actual phone, regardless of what value_literal contains."""
+    actual phone, regardless of what value_literal contains. Element
+    is referenced by element_id (PER-111 v2 contract)."""
     controller = FakeController()
     llm = FakeLLMClient(
         responses=[
             _decision(
                 action="input",
+                element_id="phone_field",
                 element_label="Введите телефон",
                 value_source="test_data.phone",
                 value_literal=None,
@@ -221,12 +259,18 @@ async def test_T2_response_format_is_sent_with_test_data_enum() -> None:
     )
     rf = llm.calls[0]["response_format"]
     assert rf["type"] == "json_schema"
-    enum = rf["json_schema"]["schema"]["properties"]["value_source"]["enum"]
+    schema = rf["json_schema"]["schema"]
+    enum = schema["properties"]["value_source"]["enum"]
     assert "test_data.phone" in enum
     assert "test_data.iban" in enum
     assert "goal_literal" in enum
     assert "improvised" in enum
     assert "none" in enum
+    # element_id enum must include every on-screen id plus null.
+    eid_enum = schema["properties"]["element_id"]["enum"]
+    assert "phone_field" in eid_enum
+    assert "submit_btn" in eid_enum
+    assert None in eid_enum
 
 
 @pytest.mark.asyncio
@@ -234,12 +278,18 @@ async def test_T3_goal_literal_typed_verbatim() -> None:
     """T3: when LLM picks goal_literal, the worker types value_literal
     as-is (used for constants embedded in the goal text like '1000')."""
     controller = FakeController(
-        elements=[{"label": "Сумма", "kind": "AXTextField", "test_id": "amount"}]
+        elements=[{
+            "id": "amount",
+            "label": "Сумма",
+            "kind": "AXTextField",
+            "test_id": "amount",
+        }]
     )
     llm = FakeLLMClient(
         responses=[
             _decision(
                 action="input",
+                element_id="amount",
                 element_label="Сумма",
                 value_source="goal_literal",
                 value_literal="1000",
@@ -258,25 +308,35 @@ async def test_T3_goal_literal_typed_verbatim() -> None:
 
 @pytest.mark.asyncio
 async def test_T4_improvised_value_remembered_across_steps() -> None:
-    """T4: when the model invents a value for an element_label, the
-    second visit to the same label produces the same string — even if
-    the model itself contradicts itself on the second turn."""
+    """T4: when the model invents a value for an element_id, the second
+    visit to the same id produces the same string — even if the model
+    itself contradicts itself on the second turn. PER-111 v2 keys
+    improvised_memory by element_id (not label) so re-renders with a
+    new label still hit the cache."""
     controller = FakeController(
-        elements=[
-            {"label": "Название", "kind": "AXTextField", "test_id": "name"},
-        ]
+        elements=[{
+            "id": "name_field",
+            "label": "Название",
+            "kind": "AXTextField",
+            "test_id": "name",
+        }]
     )
     llm = FakeLLMClient(
         responses=[
             _decision(
                 action="input",
+                element_id="name_field",
                 element_label="Название",
                 value_source="improvised",
                 value_literal="Тестовая 1",
             ),
             _decision(
                 action="input",
-                element_label="Название",
+                element_id="name_field",
+                # Same id, but UI re-rendered with a different label
+                # (e.g. localization / a11y refresh). Memory must still
+                # hit because it's keyed by id.
+                element_label="Name",
                 value_source="improvised",
                 # Model changed its mind — but worker MUST stick with
                 # the first answer to make the run reproducible.
@@ -306,6 +366,7 @@ async def test_T5_tap_does_not_type_anything() -> None:
         responses=[
             _decision(
                 action="tap",
+                element_id="submit_btn",
                 element_label="Зайти",
                 value_source="none",
                 value_literal=None,
@@ -325,8 +386,9 @@ async def test_T5_tap_does_not_type_anything() -> None:
 
 @pytest.mark.asyncio
 async def test_T6_done_true_terminates_node() -> None:
-    """T6: when LLM reports done=true on the first step, the inner
-    loop exits and the goal is reported completed."""
+    """T6: in scenario mode (description non-empty), when LLM reports
+    done=true on the first step, the inner loop exits and the goal is
+    reported completed."""
     controller = FakeController()
     llm = FakeLLMClient(
         responses=[_decision(done=True, reason="главный экран виден")]
@@ -342,37 +404,37 @@ async def test_T6_done_true_terminates_node() -> None:
 
 
 @pytest.mark.asyncio
-async def test_T7_missing_test_data_does_not_fabricate() -> None:
-    """T7: when the goal needs a phone but workspace has no phone key,
-    the model is supposed to return value_source=none and a reasoning
-    that flags missing data — worker neither types nor crashes."""
+async def test_T7_improvised_phone_returns_plausible_value() -> None:
+    """T7' (PER-111 v2): when the goal needs a phone but workspace has
+    no phone key, the model picks value_source=improvised and provides
+    a plausible value_literal. The worker types whatever the model
+    invented (no v1-style "skip the field" behavior). Value stays
+    reproducible across visits via improvised_memory."""
     controller = FakeController()
+    invented = "+79991234567"
     llm = FakeLLMClient(
         responses=[
             _decision(
-                action="back",
-                element_label="Зайти",
-                value_source="none",
-                value_literal=None,
-                reasoning="missing test_data: phone",
+                action="input",
+                element_id="phone_field",
+                element_label="Введите телефон",
+                value_source="improvised",
+                value_literal=invented,
+                reasoning="нет test_data.phone — придумываю правдоподобный номер",
             ),
-            _decision(done=False, reason=None, action="back",
-                      value_source="none", value_literal=None,
-                      reasoning="нечего делать дальше"),
-            _decision(done=False, reason=None, action="back",
-                      value_source="none", value_literal=None,
-                      reasoning="нечего делать"),
+            _decision(done=True, reason="заполнил поле телефона"),
         ]
     )
     runner = _make_runner(controller, llm, test_data={})
-    # max_steps small so the test finishes quickly.
     ok, _ = await runner._run_goal_node(
         scenario_id="t7", step_idx=0,
-        data={"description": "Авторизуйся номером", "max_steps": 3},
+        data={"description": "Введи свой телефон", "max_steps": 3},
         node_id="g1",
     )
-    assert ok is False  # never reaches done
-    assert controller.set_text_calls == []  # critical: no fabrication
+    assert ok is True
+    # Worker typed exactly what the LLM invented — no normalization,
+    # no skip, no crash.
+    assert controller.set_text_calls == [("phone_field", invented)]
 
 
 @pytest.mark.asyncio
@@ -405,12 +467,18 @@ async def test_T9_workspace_agnostic_key_iban() -> None:
     email — e.g. iban. Confirms there's no category-specific code path
     left over from PER-110."""
     controller = FakeController(
-        elements=[{"label": "IBAN", "kind": "AXTextField", "test_id": "iban"}]
+        elements=[{
+            "id": "iban_field",
+            "label": "IBAN",
+            "kind": "AXTextField",
+            "test_id": "iban",
+        }]
     )
     llm = FakeLLMClient(
         responses=[
             _decision(
                 action="input",
+                element_id="iban_field",
                 element_label="IBAN",
                 value_source="test_data.iban",
                 value_literal=None,
@@ -427,3 +495,107 @@ async def test_T9_workspace_agnostic_key_iban() -> None:
     )
     assert ok is True
     assert controller.set_text_calls == [("iban", "DE89370400440532013000")]
+
+
+@pytest.mark.asyncio
+async def test_T13_explore_mode_ignores_done_and_exhausts_max_steps() -> None:
+    """T13 (PER-111 v2): empty description = explore mode. The model is
+    forbidden from declaring done=true on its own; if it tries, the
+    worker logs a warning and keeps going. The node naturally ends
+    when max_steps is exhausted, and the timeline reports it as
+    completed (designed exit, not failure) so free-exploration nodes
+    don't show a red mark in every run."""
+    controller = FakeController()
+    # Three taps, each with done=true — worker must ignore the done
+    # flag in explore mode and keep stepping until max_steps.
+    llm = FakeLLMClient(
+        responses=[
+            _decision(
+                action="tap",
+                element_id="submit_btn",
+                element_label="Зайти",
+                done=True,
+                reason="модель пытается закончить рано",
+            ),
+            _decision(
+                action="tap",
+                element_id="submit_btn",
+                element_label="Зайти",
+                done=True,
+                reason="и ещё раз пытается",
+            ),
+            _decision(
+                action="tap",
+                element_id="submit_btn",
+                element_label="Зайти",
+                done=True,
+                reason="и снова",
+            ),
+        ]
+    )
+    runner = _make_runner(controller, llm, test_data={})
+    ok, reason = await runner._run_goal_node(
+        scenario_id="t13", step_idx=0,
+        # No description → mode=explore.
+        data={"description": "", "max_steps": 3}, node_id="g1",
+    )
+    assert ok is True
+    assert reason is not None and "explore" in reason
+    # Worker ran the full quota of LLM calls, not just one.
+    assert len(llm.calls) == 3
+    # And actually tapped the button each time (didn't break early).
+    assert controller.tap_calls == ["Зайти", "Зайти", "Зайти"]
+
+
+def test_T14_fallback_prompts_dont_enumerate_specific_actions() -> None:
+    """T14 (PER-111 v2): neither the system nor user fallback prompt
+    embedded in scenario_runner.py mentions specific action codes
+    (``tap``, ``input``, ``swipe``, ``back``, ``scroll``, ``wait``,
+    ``long_press``, ``assert``). Action names must arrive via the
+    workspace-curated dictionary in actions_block — the prompt only
+    references "the list of available actions".
+
+    Synchronous test (no asyncio) — pure string check on module
+    constants.
+    """
+    blob = (
+        _GOAL_DECIDE_SYSTEM_FALLBACK
+        + "\n"
+        + _GOAL_DECIDE_USER_FALLBACK
+    ).lower()
+    forbidden = ("tap", "swipe", "scroll", "long_press", "wait_ms", "go_back")
+    found = [name for name in forbidden if name in blob]
+    assert not found, (
+        f"v2 prompt fallbacks must not enumerate action codes; found: {found}"
+    )
+    # The fallback must also reference the dictionary-driven discovery
+    # path, so the LLM knows where to read action names from.
+    assert "доступных действий" in _GOAL_DECIDE_SYSTEM_FALLBACK.lower()
+
+
+def test_T14b_scenario_runner_prompts_no_hardcoded_actions() -> None:
+    """T14b: the same property holds for the live module source
+    (catches anyone re-introducing hardcoded action names in a prompt
+    string later — the dispatcher implementations don't count, but the
+    prompt fallbacks do). We scan only the fallback constant region;
+    the dispatcher legitimately knows action names because it maps
+    them to controller calls."""
+    runner_path = (
+        Path(__file__).parent.parent / "explorer" / "scenario_runner.py"
+    )
+    src = runner_path.read_text(encoding="utf-8")
+    # Slice between the two fallback markers — that's the prompt
+    # region. _GOAL_DECIDE_SYSTEM_FALLBACK and _GOAL_DECIDE_USER_FALLBACK
+    # are right next to each other in the file.
+    sys_idx = src.find("_GOAL_DECIDE_SYSTEM_FALLBACK")
+    end_idx = src.find("_render_template", sys_idx)
+    assert sys_idx >= 0 and end_idx > sys_idx, (
+        "could not locate fallback prompt region; "
+        "rename moved markers? — update this test"
+    )
+    region = src[sys_idx:end_idx].lower()
+    forbidden = ("\"tap\"", "\"swipe\"", "\"scroll\"", "\"long_press\"")
+    found = [w for w in forbidden if w in region]
+    assert not found, (
+        f"hardcoded action codes leaked into prompt fallback region: {found}"
+    )

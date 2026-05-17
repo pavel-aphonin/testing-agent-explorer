@@ -40,9 +40,10 @@ import httpx
 
 from explorer.expression import ExprError, evaluate as eval_expr
 from explorer.goal_schema import (
+    build_actions_block,
+    build_elements_block,
     build_goal_schema,
     build_test_data_block,
-    build_value_sources_list,
     resolve_value,
 )
 
@@ -90,26 +91,34 @@ async def _load_prompt(code: str, backend_url: str, worker_token: str) -> str | 
 # Fallbacks for when the backend has not been migrated yet (first boot
 # after deploy) — match the migration seed text. Keep these in sync
 # with alembic/versions/20260513_system_prompts.py.
+# PER-111 v2: fallbacks the worker uses only when the backend's
+# /api/internal/system-prompts endpoint is unreachable at boot. The
+# canonical prompts live in the system_prompts table (migration
+# 20260518_per111_v2); these are a degraded-mode safety net so the
+# agent doesn't crash on a fresh install before migrations finish.
+# Both fallback texts are *deliberately* minimal — they describe the
+# new contract enough for the worker to keep working, but rely on the
+# DB-stored prompt for the full ruleset.
 _GOAL_DECIDE_SYSTEM_FALLBACK = (
-    "Ты — автотестер мобильного приложения. На каждом шаге ты получаешь "
-    "цель, список элементов экрана и историю действий. Выбери ОДНО "
-    "следующее действие, которое приближает цель, либо отрапортуй о "
-    "достижении.\n\n"
-    "ОТВЕТ — строго JSON по schema. value_literal заполняется ТОЛЬКО "
-    "при value_source ∈ {goal_literal, improvised}. Если поле "
-    "соответствует ключу test_data — используй value_source = "
-    'test_data.<ключ>, value_literal = null. Запрещено выдумывать '
-    "phone / email / password / документы — лучше done=false с "
-    "reasoning='missing test_data: <category>'."
+    "Ты — автотестер мобильного приложения. Возвращай строго один "
+    "JSON-объект по схеме (response_format уже включён). Поля: "
+    "done, reason, action, action_args, element_id, element_label, "
+    "value_source, value_literal, reasoning. action бери из списка "
+    "доступных действий в user-сообщении. value_source: "
+    "test_data.<ключ> если есть подходящие данные; goal_literal "
+    "если значение указано буквально в цели; improvised если ни то "
+    "ни другое; none если действие не требует ввода. element_id — "
+    "идентификатор из списка элементов экрана."
 )
 _GOAL_DECIDE_USER_FALLBACK = (
+    "Режим: {{mode}}\n"
     "Цель: {{goal}}\n"
-    "Шаг: {{step_idx}} из {{max_steps}}\n\n"
-    "Текущий экран:\n{{elements_block}}\n\n"
-    "История действий в рамках цели:\n{{history_block}}\n\n"
-    'Доступные значения для подстановки (через value_source = "test_data.<ключ>"):\n'
-    "{{test_data_block}}\n\n"
-    "Допустимые значения value_source для этого шага:\n{{value_sources_list}}"
+    "Шаг: {{step_idx}} из {{max_steps}}\n"
+    "Критерий успеха: {{success_criteria}}\n\n"
+    "Текущий экран — элементы:\n{{elements_block}}\n\n"
+    "Доступные действия:\n{{actions_block}}\n\n"
+    "Доступные данные (test_data):\n{{test_data_block}}\n\n"
+    "История действий:\n{{history_block}}"
 )
 
 
@@ -204,6 +213,15 @@ class ScenarioRunner:
         # ``screen_description`` is silently ignored — backwards-compat
         # with scenarios authored before the feature shipped.
         llm_client: Any | None = None,
+        # PER-111 v2: workspace-enabled action dictionary, shipped by
+        # backend in RunClaimResponse.actions. Each entry has code /
+        # name / description / arguments_schema (JSON-schema for that
+        # action's args). The runner feeds this to goal-node decode so
+        # the LLM picks ``action`` from a real dictionary instead of a
+        # hardcoded enum baked into the prompt. Empty list = degraded
+        # mode (LLM gets no action constraints — workspace is broken,
+        # operator needs to seed action types).
+        actions: list[dict[str, Any]] | None = None,
     ) -> None:
         self.controller = controller
         self.scenarios = scenarios or []
@@ -214,6 +232,7 @@ class ScenarioRunner:
         self.defect_callback = defect_callback
         self.run_id = run_id
         self.llm_client = llm_client
+        self._actions: list[dict[str, Any]] = list(actions or [])
         # PER-85: cache (screen-fingerprint, description) → (matches, reason)
         # so each unique description is only verified once per visited
         # screen. Reset per scenario in _run_graph.
@@ -1089,27 +1108,19 @@ class ScenarioRunner:
             max_steps = self._GOAL_DEFAULT_MAX_STEPS
         max_steps = max(1, min(max_steps, 50))
 
+        # PER-111 v2: empty description = explore mode (free wandering).
+        # The label shown in the timeline still needs *something*, so
+        # mark it explicitly instead of an empty string.
         started_evt: dict[str, Any] = {
             "type": "scenario.step_started",
             "scenario_id": scenario_id,
             "step_idx": step_idx,
             "action": "goal",
-            "element_label": description[:200],
+            "element_label": (description or "(explore)")[:200],
         }
         if node_id is not None:
             started_evt["node_id"] = node_id
         await self._emit(started_evt)
-
-        if not description:
-            await self._emit({
-                "type": "scenario.step_failed",
-                "scenario_id": scenario_id,
-                "step_idx": step_idx,
-                "node_id": node_id,
-                "action": "goal",
-                "reason": "goal_description_missing",
-            })
-            return False, "goal_description_missing"
 
         if not self.llm_client:
             # Goals require an LLM by definition — no fallback that
@@ -1145,9 +1156,30 @@ class ScenarioRunner:
             if usr_from_db:
                 user_template = usr_from_db
 
+        # PER-111 v2: action dictionary shipped with the claim (in
+        # config["actions"]). Empty list = no workspace-side dictionary
+        # — schema falls back to a permissive ``action: string``, but
+        # the worker logs a warning so the operator notices.
+        actions_dict: list[dict] = list(self._actions or [])
+        if not actions_dict:
+            logger.warning(
+                "[goal] no actions in run config — schema will be permissive"
+            )
+        # Pre-build per-goal blocks that don't depend on the screen.
+        # actions_block is identical across inner steps; elements_block
+        # is rebuilt each step from the live AXe snapshot.
+        actions_block = build_actions_block(actions_dict)
+        test_data_block = build_test_data_block(self.test_data)
+        success_criteria = expected or "—"
+        # PER-111 v2: mode comes from whether the goal has a description.
+        # No description → explore (free wandering with no completion
+        # criterion).
+        mode = "scenario" if description else "explore"
+        goal_text = description or "—"
+
         history: list[str] = []
-        # PER-111 R4 — same element_label → same improvised value.
-        # Lives for one goal node only; reset on the next goal.
+        # PER-111 v2: improvised values are memoized by element_id so
+        # re-visits of the same field reproduce the same value.
         improvised_memory: dict[str, str] = {}
         last_reason: str | None = None
         done = False
@@ -1165,13 +1197,18 @@ class ScenarioRunner:
 
             # 2. Ask the LLM what to do (or whether we're done).
             decision = await self._goal_decide(
-                description=description,
+                goal_text=goal_text,
+                mode=mode,
+                success_criteria=success_criteria,
                 elements=elements,
                 history=history,
                 step_idx=inner_step,
                 max_steps=max_steps,
                 system_prompt=system_prompt,
                 user_template=user_template,
+                actions=actions_dict,
+                actions_block=actions_block,
+                test_data_block=test_data_block,
             )
             if decision is None:
                 last_reason = "llm_no_decision"
@@ -1182,26 +1219,38 @@ class ScenarioRunner:
             # without instrumenting the prompt itself. Cheap, one line
             # per inner step.
             logger.info(
-                "[goal] decision step=%d done=%s action=%s label=%r "
-                "value_source=%s reasoning=%r",
+                "[goal] decision step=%d done=%s action=%s args=%s "
+                "element_id=%s label=%r value_source=%s reasoning=%r",
                 inner_step,
                 decision.get("done"),
                 decision.get("action"),
+                decision.get("action_args"),
+                decision.get("element_id"),
                 decision.get("element_label"),
                 decision.get("value_source"),
                 (decision.get("reasoning") or "")[:200],
             )
             if decision.get("done"):
-                done = True
-                last_reason = (decision.get("reason") or "goal reported as done")[:300]
-                break
+                # In explore mode the system prompt forbids unsolicited
+                # done=true — but if the model insists, log + override
+                # rather than terminate prematurely on an open exploration.
+                if mode == "explore":
+                    logger.warning(
+                        "[goal] model returned done=true in explore mode; "
+                        "ignoring and continuing"
+                    )
+                else:
+                    done = True
+                    last_reason = (decision.get("reason") or "goal reported as done")[:300]
+                    break
 
-            action = (decision.get("action") or "tap").lower()
-            label = (decision.get("element_label") or "").strip()
-            # PER-111: value is resolved by the WORKER, not the model.
-            # The model picked a value_source; we turn that into the
-            # actual string to type. Returns None for tap/back/swipe
-            # and for inputs where no source applies.
+            action = (decision.get("action") or "").strip().lower()
+            label = (decision.get("element_label") or "").strip() or None
+            element_id = (decision.get("element_id") or "").strip() or None
+            action_args = decision.get("action_args") or {}
+            if not isinstance(action_args, dict):
+                action_args = {}
+            # PER-111 v2: value resolved by the WORKER from value_source.
             value = resolve_value(decision, self.test_data, improvised_memory)
             value_source = decision.get("value_source") or ""
 
@@ -1220,18 +1269,25 @@ class ScenarioRunner:
                 "reasoning": (decision.get("reasoning") or "")[:300],
             })
 
-            # 3. Execute. Reuse the action dispatcher that regular
-            # action-nodes go through so behaviour stays consistent
-            # (input fallback, swipe parsing, etc.). ``value`` is the
-            # worker-resolved string (or empty if value_source = none).
+            # 3. Execute via the existing _dispatch contract.
+            # PER-111 v2: pass element_id + action_args alongside
+            # label. The dispatcher's id-first lookup matches the LLM's
+            # stable identifier even when the visible label changes
+            # (re-render, localization); action_args carry direction /
+            # ms / duration_ms for the gesture- and timing-based
+            # actions.
             try:
                 ok, reason = await self._dispatch(
-                    action, label, value or ""
+                    action,
+                    label or element_id or "",
+                    value or "",
+                    element_id=element_id,
+                    action_args=action_args,
                 )
             except Exception as exc:
                 ok, reason = False, f"crash: {exc}"
             history.append(
-                f"{action} «{label}»"
+                f"{action} «{label or element_id or '?'}»"
                 + (
                     f" → {value} (via {value_source})"
                     if action == "input" and value else ""
@@ -1251,12 +1307,24 @@ class ScenarioRunner:
                 done = False
                 last_reason = f"expected_outcome_mismatch: {why}"
 
+        # PER-111 v2: explore-mode goals never set done=true by design
+        # (the LLM is told not to, and the worker would override it
+        # anyway). Exhausting max_steps in explore mode is the *designed*
+        # exit, not a failure — report it as completed so the timeline
+        # doesn't show a red mark on every free-exploration node.
+        if mode == "explore" and not done:
+            done = True
+            last_reason = (
+                last_reason
+                or f"explore mode finished after {max_steps} steps"
+            )
+
         evt: dict[str, Any] = {
             "type": "scenario.step_completed" if done else "scenario.step_failed",
             "scenario_id": scenario_id,
             "step_idx": step_idx,
             "action": "goal",
-            "element_label": description[:200],
+            "element_label": (description or "(explore)")[:200],
             "reason": last_reason or (None if done else "max_steps_exceeded"),
         }
         if node_id is not None:
@@ -1267,54 +1335,34 @@ class ScenarioRunner:
     async def _goal_decide(
         self,
         *,
-        description: str,
+        goal_text: str,
+        mode: str,
+        success_criteria: str,
         elements: list,
         history: list[str],
         step_idx: int,
         max_steps: int,
         system_prompt: str,
         user_template: str,
+        actions: list[dict],
+        actions_block: str,
+        test_data_block: str,
     ) -> dict[str, Any] | None:
-        """Ask the LLM whether the goal is done and, if not, pick the
-        next action. Returns ``None`` on parse / transport failure so
-        the caller can decide whether to retry or bail.
+        """One LLM round for a goal node (PER-111 v2).
 
-        PER-111 output schema (constrained by llama-server through
-        ``response_format=json_schema``)::
+        Returns the raw decoded JSON object the model produced, or
+        None on transport / parse failure (caller breaks the loop).
 
-            {
-              "done": bool,
-              "reason": str | null,
-              "action": "tap" | "input" | "back" | "swipe",
-              "element_label": str,
-              "value_source": "test_data.<key>" | "goal_literal"
-                            | "improvised" | "none",
-              "value_literal": str | null,
-              "reasoning": str
-            }
-
-        ``system_prompt`` and ``user_template`` come from the caller,
-        which loaded them from ``system_prompts.goal_decide.*`` in the
-        DB (with baked-in fallbacks). The template is rendered here
-        with the per-step placeholder values.
+        ``actions`` is the workspace-curated action dictionary
+        (claim_next ships it); ``actions_block`` and
+        ``test_data_block`` are the pre-rendered prompt fragments.
+        Schema is rebuilt per call because ``element_id`` enum
+        depends on what's on screen right now — that's the whole
+        point of the new contract.
         """
-        # Build a compact element list — too many entries blow up the
-        # prompt and the smaller models lose track.
-        lines: list[str] = []
-        for i, el in enumerate(elements[:25]):
-            if isinstance(el, dict):
-                label = el.get("label") or "(без подписи)"
-                kind = el.get("kind") or "element"
-            else:
-                label = getattr(el, "label", "") or "(без подписи)"
-                kind = getattr(el, "kind", "element")
-                if hasattr(kind, "value"):
-                    kind = kind.value
-            lines.append(f"  {i + 1}. [{kind}] {label}")
-        if len(elements) > 25:
-            lines.append(f"  …и ещё {len(elements) - 25}.")
-        elements_block = "\n".join(lines) if lines else "  (экран пуст)"
-
+        # Per-step elements block (and the live id enum the schema
+        # depends on).
+        elements_block, element_ids = build_elements_block(elements)
         history_block = (
             "\n".join(
                 f"  {i + 1}. {h}" for i, h in enumerate(history[-8:])
@@ -1323,20 +1371,24 @@ class ScenarioRunner:
         )
 
         test_data_keys = list(self.test_data.keys())
-        test_data_block = build_test_data_block(self.test_data)
-        value_sources_list = build_value_sources_list(test_data_keys)
-        schema = build_goal_schema(test_data_keys)
+        schema = build_goal_schema(
+            test_data_keys=test_data_keys,
+            actions=actions,
+            element_ids=element_ids,
+        )
 
         user_prompt = _render_template(
             user_template,
             {
-                "goal": description,
+                "mode": mode,
+                "goal": goal_text,
                 "step_idx": str(step_idx + 1),
                 "max_steps": str(max_steps),
+                "success_criteria": success_criteria,
                 "elements_block": elements_block,
-                "history_block": history_block,
+                "actions_block": actions_block,
                 "test_data_block": test_data_block,
-                "value_sources_list": value_sources_list,
+                "history_block": history_block,
             },
         )
 
@@ -1384,33 +1436,117 @@ class ScenarioRunner:
             return None
 
     async def _dispatch(
-        self, action: str, label: str, value: str
+        self,
+        action: str,
+        label: str,
+        value: str,
+        element_id: str | None = None,
+        action_args: dict[str, Any] | None = None,
     ) -> tuple[bool, str | None]:
-        """Map a scenario action onto a controller call."""
+        """Map a scenario action onto a controller call.
+
+        PER-111 v2:
+            * ``element_id`` (when provided) takes priority over
+              ``label`` for element lookup. Goal-node decisions always
+              carry an id; legacy linear scenarios only carry a label,
+              hence the optional parameter.
+            * ``action_args`` carries the structured args the LLM
+              produced for direction-based / timing-based actions
+              (``swipe.direction``, ``scroll.direction``, ``wait.ms``,
+              ``long_press.duration_ms``). For tap / input / back /
+              assert the dict is empty.
+            * Every action seeded by migration 20260518_per111_v2
+              (tap / input / swipe / wait / assert / long_press /
+              scroll / back) has a real implementation here — no
+              silent fall-through to tap, which previously made
+              ``scroll`` from the LLM look like a successful step
+              while actually doing the wrong thing.
+        """
+        args = action_args or {}
+
         if action == "back":
             ok = await self.controller.go_back()
             return ok, None if ok else "go_back returned False"
 
+        if action == "wait":
+            ms = args.get("ms")
+            # Controller may not implement wait_ms on every backend —
+            # fall back to plain asyncio sleep so the action still
+            # behaves correctly.
+            wait_ms_fn = getattr(self.controller, "wait_ms", None)
+            try:
+                ms_int = int(ms) if ms is not None else 500
+            except (TypeError, ValueError):
+                ms_int = 500
+            if callable(wait_ms_fn):
+                ok = await wait_ms_fn(ms_int)
+            else:
+                await asyncio.sleep(max(0.1, min(ms_int / 1000.0, 60.0)))
+                ok = True
+            return bool(ok), None if ok else "wait failed"
+
         if action == "swipe":
-            # Generic vertical swipe up by default — scenarios that
-            # need a specific direction should encode coordinates in
-            # value as "x1,y1,x2,y2". Keeps the scenario format simple
-            # for the common case.
+            direction = (args.get("direction") or "").strip().lower()
+            # Direction wins when supplied (v2 contract); coordinate
+            # form is the legacy fallback for old linear scenarios
+            # that encoded "x1,y1,x2,y2" in value.
+            if direction:
+                swipe_dir_fn = getattr(self.controller, "swipe_direction", None)
+                if callable(swipe_dir_fn):
+                    ok = await swipe_dir_fn(direction)
+                    return bool(ok), None if ok else f"swipe {direction} failed"
+                # Controller lacks swipe_direction — fall back to a
+                # coordinate swipe derived from screen size if we can
+                # introspect it; otherwise it's a configuration bug.
+                ok = await self._fallback_directional_swipe(direction)
+                return ok, None if ok else f"swipe {direction} unsupported"
             coords = self._parse_swipe(value)
             ok = await self.controller.swipe(*coords)
-            return ok, None if ok else "swipe returned False"
+            return bool(ok), None if ok else "swipe returned False"
+
+        if action == "scroll":
+            direction = (args.get("direction") or "").strip().lower()
+            scroll_fn = getattr(self.controller, "scroll", None)
+            if callable(scroll_fn) and direction:
+                ok = await scroll_fn(direction)
+                return bool(ok), None if ok else f"scroll {direction} failed"
+            # Fall back through swipe_direction with the same arg —
+            # iOS treats them the same at the gesture layer.
+            swipe_dir_fn = getattr(self.controller, "swipe_direction", None)
+            if callable(swipe_dir_fn) and direction:
+                ok = await swipe_dir_fn(direction)
+                return bool(ok), None if ok else f"scroll {direction} failed"
+            return False, "scroll unsupported (no scroll/swipe_direction)"
 
         if action == "assert":
             # Soft check: present in current elements? Lookup uses
             # the same retry loop as actions so async screens settle.
-            element = await self._find_element(label)
+            element = await self._find_element(label, element_id=element_id)
+            target = element_id or label
             return (element is not None,
-                    None if element is not None else f"element {label!r} not found")
+                    None if element is not None else f"element {target!r} not found")
 
-        # tap / input — both need to find the element first.
-        element = await self._find_element(label)
+        # Below: actions that target a specific element on screen.
+        element = await self._find_element(label, element_id=element_id)
         if element is None:
-            return False, f"element {label!r} not found after {_LOOKUP_RETRIES} tries"
+            target = element_id or label
+            return False, (
+                f"element {target!r} not found after {_LOOKUP_RETRIES} tries"
+            )
+
+        if action == "long_press":
+            duration_ms = args.get("duration_ms") or 800
+            long_press_fn = getattr(self.controller, "long_press", None)
+            frame = element.get("frame") or {}
+            try:
+                cx = int(frame.get("x", 0)) + int(frame.get("width", 0)) // 2
+                cy = int(frame.get("y", 0)) + int(frame.get("height", 0)) // 2
+            except (TypeError, ValueError):
+                cx, cy = None, None
+            if callable(long_press_fn):
+                ok = await long_press_fn(cx, cy, duration_ms)
+                return bool(ok), None if ok else "long_press failed"
+            return False, "long_press unsupported by controller"
 
         if action == "input":
             test_id = element.get("test_id") or element.get("identifier")
@@ -1419,21 +1555,65 @@ class ScenarioRunner:
                 return ok, None if ok else "set_text_in_field returned False"
             # No test_id — fall back to tap-then-type (same as the LLM
             # loop does when the element doesn't expose an identifier).
-            tapped = await self.controller.tap_by_label(label)
+            tap_target = (element.get("label") or label or "")
+            tapped = await self.controller.tap_by_label(tap_target)
             if not tapped or not getattr(tapped, "ok", True):
                 return False, "tap before type failed"
             typed = await self.controller.type_text(value)
             return typed, None if typed else "type_text returned False"
 
-        # Default: tap.
-        result = await self.controller.tap_by_label(label)
-        ok = bool(result and getattr(result, "ok", True))
-        return ok, None if ok else "tap_by_label returned not-ok"
+        if action == "tap":
+            # Prefer the resolved element's label (what the AXe
+            # controller keys on) over the LLM's echo — handles cases
+            # where the model passed only element_id.
+            tap_target = (element.get("label") or label or "")
+            result = await self.controller.tap_by_label(tap_target)
+            ok = bool(result and getattr(result, "ok", True))
+            return ok, None if ok else "tap_by_label returned not-ok"
 
-    async def _find_element(self, label: str) -> dict | None:
-        """Look the element up on the current screen by label, with
-        retries to absorb settle-after-navigation timing."""
-        if not label:
+        # Unknown action — treat as soft failure rather than silently
+        # tapping. The LLM would otherwise see "OK" for an action the
+        # worker can't actually perform, which corrupts its history.
+        return False, f"unsupported action {action!r}"
+
+    async def _fallback_directional_swipe(self, direction: str) -> bool:
+        """Compute a vertical/horizontal swipe from screen dimensions
+        when the controller lacks a direction-aware swipe. Falls back
+        on a fixed 300px swipe in the screen centre if we don't know
+        the size."""
+        w = getattr(self.controller, "_width", None) or 390
+        h = getattr(self.controller, "_height", None) or 844
+        cx, cy = w // 2, h // 2
+        delta = min(w, h) // 3
+        coords_by_dir = {
+            "up": (cx, cy + delta, cx, cy - delta),
+            "down": (cx, cy - delta, cx, cy + delta),
+            "left": (cx + delta, cy, cx - delta, cy),
+            "right": (cx - delta, cy, cx + delta, cy),
+        }
+        coords = coords_by_dir.get(direction.lower())
+        if not coords:
+            return False
+        try:
+            ok = await self.controller.swipe(*coords)
+        except AttributeError:
+            return False
+        return bool(ok)
+
+    async def _find_element(
+        self, label: str, element_id: str | None = None
+    ) -> dict | None:
+        """Look the element up on the current screen, with retries to
+        absorb settle-after-navigation timing.
+
+        PER-111 v2: when ``element_id`` is provided, it takes priority
+        — the LLM picks element_id from a constrained enum of stable
+        AXe identifiers, so an exact id match is the most reliable
+        lookup path. ``label`` is the human-readable fallback used by
+        legacy scenarios that only carry text labels and by free
+        exploration.
+        """
+        if not label and not element_id:
             return None
         for attempt in range(_LOOKUP_RETRIES):
             try:
@@ -1447,11 +1627,22 @@ class ScenarioRunner:
                 )
                 await asyncio.sleep(_LOOKUP_DELAY_SEC)
                 continue
-            for el in elements:
-                if (el.get("label") or "").strip().lower() == label.strip().lower():
-                    return el
-                if el.get("test_id") and el.get("test_id") == label:
-                    return el
+            # Pass 1: id-first match (stable across re-renders).
+            if element_id:
+                for el in elements:
+                    if (
+                        el.get("id") == element_id
+                        or el.get("test_id") == element_id
+                        or el.get("identifier") == element_id
+                    ):
+                        return el
+            # Pass 2: label fallback for legacy scenarios.
+            if label:
+                for el in elements:
+                    if (el.get("label") or "").strip().lower() == label.strip().lower():
+                        return el
+                    if el.get("test_id") and el.get("test_id") == label:
+                        return el
             await asyncio.sleep(_LOOKUP_DELAY_SEC)
         return None
 

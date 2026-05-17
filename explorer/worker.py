@@ -562,6 +562,14 @@ class RealExecutor:
                         # is fine — semantic checks just no-op when
                         # the LLM isn't available.
                         llm_client=llm if "llm" in locals() else None,
+                        # PER-111 v2: workspace-enabled action dictionary
+                        # shipped by /api/internal/runs/claim. The runner
+                        # uses it inside goal nodes to build the LLM's
+                        # constrained-decode schema and the actions_block
+                        # in the user prompt. Empty list = degraded mode
+                        # (operator should seed RefActionType + enable
+                        # them per workspace).
+                        actions=config.get("actions") or [],
                     )
                     sr_summary = await sr.run_all()
                     logger.info("[scenario] summary: %s", sr_summary)

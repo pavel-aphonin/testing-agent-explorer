@@ -327,17 +327,117 @@ class AXeExplorerClient:
         for node in nodes:
             if not isinstance(node, dict):
                 continue
+            test_id = node.get("AXUniqueId", "")
+            frame = node.get("frame", {}) or {}
+            kind = node.get("type", "") or "element"
+            # PER-111 v2: every element needs a stable id so the LLM
+            # can refer to it from the constrained enum and the
+            # worker can resolve it back to a frame. AXe gives us
+            # AXUniqueId for native iOS controls, but React Native and
+            # custom views often skip accessibilityIdentifier — for
+            # those we synthesize from (type, x, y), which stays
+            # stable across calls until the screen redraws.
+            try:
+                fx = int(frame.get("x", 0) or 0)
+                fy = int(frame.get("y", 0) or 0)
+            except (TypeError, ValueError):
+                fx, fy = 0, 0
+            synthetic_id = test_id or f"{kind}_{fx}_{fy}"
             result.append({
-                "type": node.get("type", ""),
+                "id": synthetic_id,
+                "type": kind,
+                "kind": kind,
                 "label": node.get("AXLabel", ""),
                 "value": node.get("AXValue", ""),
-                "test_id": node.get("AXUniqueId", ""),
-                "frame": node.get("frame", {}),
+                "test_id": test_id,
+                "frame": frame,
                 "enabled": node.get("enabled", True),
                 "visible": True,
             })
             for child in node.get("children", []):
                 self._flatten([child], result)
+
+    # ─────────────────────────────────── PER-111 v2 action dispatchers
+    # The 8 reference actions seeded by migration 20260518_per111_v2
+    # — tap / input / back / type already exist above; below are the
+    # ones the v2 dispatcher needs. Direction-based gestures use AXe's
+    # ``gesture`` preset (full-screen scroll); long_press uses the
+    # touch primitive with a delay.
+
+    async def swipe(self, x1: int, y1: int, x2: int, y2: int) -> bool:
+        """Custom coordinate swipe. Used by legacy callers in llm_loop
+        and by the scenario dispatcher when explicit coords are given.
+        For direction-based swipes prefer :meth:`swipe_direction`."""
+        code, _, _ = await _run([
+            AXE, "swipe",
+            "--start-x", str(int(x1)), "--start-y", str(int(y1)),
+            "--end-x", str(int(x2)), "--end-y", str(int(y2)),
+            "--udid", self._udid,
+        ])
+        return code == 0
+
+    async def swipe_direction(self, direction: str) -> bool:
+        """PER-111 v2 swipe.direction handler — maps to AXe gesture
+        presets. iOS gesture is a one-finger drag, so we use the
+        ``swipe-from-*-edge`` presets for edge gestures and
+        ``scroll-*`` for the in-screen ones."""
+        preset = {
+            "up": "scroll-up",
+            "down": "scroll-down",
+            "left": "scroll-left",
+            "right": "scroll-right",
+        }.get((direction or "").lower())
+        if not preset:
+            logger.warning("swipe_direction: unknown direction %r", direction)
+            return False
+        code, _, _ = await _run([
+            AXE, "gesture", preset, "--udid", self._udid,
+        ])
+        return code == 0
+
+    async def scroll(self, direction: str) -> bool:
+        """PER-111 v2 scroll.direction handler — same AXe primitive as
+        swipe_direction on iOS. Distinguishing scroll from swipe at the
+        action level is useful for the LLM's reasoning, not for the
+        gesture engine."""
+        return await self.swipe_direction(direction)
+
+    async def long_press(
+        self, x: int | None = None, y: int | None = None,
+        duration_ms: int = 800,
+    ) -> bool:
+        """PER-111 v2 long_press handler. With explicit coords —
+        touches the point for ``duration_ms``. Without coords, falls
+        back to the screen centre (e.g. for a context-menu invocation
+        on the current focus); callers that target a specific element
+        should pass its frame centre."""
+        try:
+            ms = max(100, min(int(duration_ms), 5000))
+        except (TypeError, ValueError):
+            ms = 800
+        if x is None or y is None:
+            x = self._width // 2
+            y = self._height // 2
+        delay = ms / 1000.0
+        code, _, _ = await _run([
+            AXE, "touch",
+            "-x", str(int(x)), "-y", str(int(y)),
+            "--down", "--up",
+            "--delay", f"{delay:.3f}",
+            "--udid", self._udid,
+        ])
+        return code == 0
+
+    async def wait_ms(self, ms: int) -> bool:
+        """PER-111 v2 wait.ms handler — plain sleep, no AXe call. Useful
+        when the LLM needs the UI to settle before the next step (e.g.
+        after kicking off a network request)."""
+        try:
+            seconds = max(0.1, min(int(ms) / 1000.0, 60.0))
+        except (TypeError, ValueError):
+            seconds = 0.5
+        await asyncio.sleep(seconds)
+        return True
 
     async def launch_app(self, bundle_id: str) -> bool:
         code, _, _ = await _run([
