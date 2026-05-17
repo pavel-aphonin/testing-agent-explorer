@@ -1177,6 +1177,20 @@ class ScenarioRunner:
                 last_reason = "llm_no_decision"
                 break
 
+            # Diagnostic log: every LLM decision lands in
+            # /tmp/ta-worker.log so we can debug "goal didn't progress"
+            # without instrumenting the prompt itself. Cheap, one line
+            # per inner step.
+            logger.info(
+                "[goal] decision step=%d done=%s action=%s label=%r "
+                "value_source=%s reasoning=%r",
+                inner_step,
+                decision.get("done"),
+                decision.get("action"),
+                decision.get("element_label"),
+                decision.get("value_source"),
+                (decision.get("reasoning") or "")[:200],
+            )
             if decision.get("done"):
                 done = True
                 last_reason = (decision.get("reason") or "goal reported as done")[:300]
