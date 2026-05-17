@@ -907,10 +907,55 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    # PER-118: switch to JSON output when the operator opted in to the
+    # centralised log stack via LOGGING_BACKEND. Plain text otherwise
+    # so `tail -f /tmp/ta-worker.log` stays human-readable on dev.
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging_backend = (os.environ.get("LOGGING_BACKEND") or "none").strip().lower()
+    if logging_backend not in ("", "none"):
+        try:
+            from pythonjsonlogger import jsonlogger
+            handler = logging.StreamHandler()
+            handler.setFormatter(
+                jsonlogger.JsonFormatter(
+                    "%(asctime)s %(levelname)s %(name)s %(message)s",
+                    rename_fields={
+                        "asctime": "@timestamp",
+                        "levelname": "log.level",
+                        "name": "logger",
+                    },
+                    json_ensure_ascii=False,
+                )
+            )
+            # Tag every record with service=worker so Filebeat's index
+            # routing (markov-<service>-<date>) lands them with the
+            # backend rows correctly.
+            class _ServiceFilter(logging.Filter):
+                def filter(self, record):  # noqa: D401
+                    record.service = "worker"
+                    return True
+            handler.addFilter(_ServiceFilter())
+            root = logging.getLogger()
+            for h in list(root.handlers):
+                root.removeHandler(h)
+            root.addHandler(handler)
+            root.setLevel(log_level)
+        except ImportError:
+            # python-json-logger not installed in this venv — fall back
+            # to plain text. Don't crash the worker over logging config.
+            logging.basicConfig(
+                level=log_level,
+                format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            )
+            logging.getLogger(__name__).warning(
+                "python-json-logger not installed; LOGGING_BACKEND=%s ignored",
+                logging_backend,
+            )
+    else:
+        logging.basicConfig(
+            level=log_level,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        )
 
     if not args.worker_token:
         parser.error(
