@@ -1183,6 +1183,17 @@ class ScenarioRunner:
         improvised_memory: dict[str, str] = {}
         last_reason: str | None = None
         done = False
+        # PER-111 v2: anti-loop guard. The first live runs caught
+        # Gemma 4 repeating the same failing input 15 times in a row
+        # despite the FAIL marker landing in history each time —
+        # the model just rationalised "let me try again" and burned
+        # the whole max_steps budget on one stuck field. P3 in the
+        # prompt is advisory; this is the structural guarantee.
+        # If the last N (action, element_id, value_source) tuples
+        # are all identical AND all failed, we break the loop with
+        # ``stuck_loop`` instead of letting the model run it out.
+        from collections import deque
+        recent_attempts: deque[tuple[str, str | None, str, bool]] = deque(maxlen=3)
 
         for inner_step in range(max_steps):
             # 1. Read the current screen.
@@ -1295,6 +1306,29 @@ class ScenarioRunner:
                 + (" [OK]" if ok else f" [FAIL: {reason}]")
             )
             last_reason = reason
+
+            # Anti-loop check: if the same (action, element_id,
+            # value_source) failed `recent_attempts.maxlen` times in
+            # a row, the model isn't going to find a way out and the
+            # remaining max_steps would just be more of the same.
+            recent_attempts.append((action, element_id, value_source, ok))
+            if (
+                len(recent_attempts) == recent_attempts.maxlen
+                and all(not entry[3] for entry in recent_attempts)
+                and len({entry[:3] for entry in recent_attempts}) == 1
+            ):
+                logger.warning(
+                    "[goal] anti-loop: %d identical failures of (%s, %s, %s); "
+                    "aborting goal early",
+                    recent_attempts.maxlen, action, element_id, value_source,
+                )
+                last_reason = (
+                    f"stuck_loop: {recent_attempts.maxlen}× same failing "
+                    f"({action}, element_id={element_id}, "
+                    f"value_source={value_source})"
+                )
+                break
+
             await asyncio.sleep(_ACTION_SETTLE_SEC)
 
         # 4. Optional expected_outcome verification once the LLM
@@ -1550,13 +1584,37 @@ class ScenarioRunner:
 
         if action == "input":
             test_id = element.get("test_id") or element.get("identifier")
-            if test_id:
-                ok = await self.controller.set_text_in_field(test_id, value)
-                return ok, None if ok else "set_text_in_field returned False"
-            # No test_id — fall back to tap-then-type (same as the LLM
-            # loop does when the element doesn't expose an identifier).
-            tap_target = (element.get("label") or label or "")
-            tapped = await self.controller.tap_by_label(tap_target)
+            elem_label = element.get("label") or label or ""
+            # The real AXe controller's signature is
+            # set_text_in_field(test_id, label, text) — three args.
+            # The test FakeController uses two (test_id, text). Resolve
+            # at call time by introspecting the param count so both
+            # work without forking the dispatcher.
+            from inspect import signature
+            try:
+                params = signature(self.controller.set_text_in_field).parameters
+                arity = len([
+                    p for p in params.values()
+                    if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                ])
+            except (TypeError, ValueError):
+                arity = 2  # err on the side of the simpler signature
+            if test_id or elem_label:
+                if arity >= 3:
+                    ok = await self.controller.set_text_in_field(
+                        test_id or "", elem_label, value
+                    )
+                else:
+                    ok = await self.controller.set_text_in_field(
+                        test_id or elem_label, value
+                    )
+                return bool(ok), (
+                    None if ok else "set_text_in_field returned False"
+                )
+            # No usable identifier — fall back to tap-then-type. Uses
+            # the resolved element's label as the tap target so the
+            # AXe controller can find it the same way.
+            tapped = await self.controller.tap_by_label(elem_label)
             if not tapped or not getattr(tapped, "ok", True):
                 return False, "tap before type failed"
             typed = await self.controller.type_text(value)

@@ -643,6 +643,54 @@ def test_T15_element_targeted_actions_forbid_null_element_id() -> None:
         assert "element_id" not in branch["required"]
 
 
+@pytest.mark.asyncio
+async def test_T16_anti_loop_breaks_after_three_identical_failures() -> None:
+    """T16 (PER-111 v2): if the same (action, element_id, value_source)
+    fails three times in a row, the worker breaks the goal loop with
+    ``stuck_loop`` rather than burning the rest of max_steps. Catches
+    the demo regression where Gemma 4 repeated the same input 15
+    times because the FAIL marker in history was "advisory" to it."""
+
+    # FakeController whose set_text_in_field ALWAYS returns False —
+    # simulates the broken-input situation on the real sim where AXe
+    # set_text failed for every attempt.
+    class _FailingController(FakeController):
+        async def set_text_in_field(
+            self, test_id: str, value: str
+        ) -> bool:
+            self.set_text_calls.append((test_id, value))
+            return False
+
+    controller = _FailingController()
+    # Script 10 identical failing inputs — anti-loop should bite at
+    # step 3 and stop reading more decisions.
+    llm = FakeLLMClient(
+        responses=[
+            _decision(
+                action="input",
+                element_id="phone_field",
+                element_label="Введите телефон",
+                value_source="test_data.phone",
+                value_literal=None,
+            ) for _ in range(10)
+        ]
+    )
+    runner = _make_runner(
+        controller, llm, test_data={"phone": "+79051543055"}
+    )
+    ok, reason = await runner._run_goal_node(
+        scenario_id="t16", step_idx=0,
+        data={"description": "Авторизуйся", "max_steps": 10},
+        node_id="g1",
+    )
+    assert ok is False
+    assert reason is not None and "stuck_loop" in reason
+    # Anti-loop triggers after 3 failures, so exactly 3 LLM calls and
+    # 3 set_text attempts — not 10.
+    assert len(llm.calls) == 3
+    assert len(controller.set_text_calls) == 3
+
+
 def test_T14b_scenario_runner_prompts_no_hardcoded_actions() -> None:
     """T14b: the same property holds for the live module source
     (catches anyone re-introducing hardcoded action names in a prompt
