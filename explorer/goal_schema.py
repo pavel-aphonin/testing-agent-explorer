@@ -132,7 +132,51 @@ def build_goal_schema(
     value_source_enum = (
         [f"test_data.{k}" for k in test_data_keys] + list(SPECIAL_SOURCES)
     )
-    element_enum = [*element_ids, None]
+
+    # PER-111 v2: element_id is REQUIRED on every decision, with a
+    # non-null string type and an enum of the live on-screen ids.
+    # The first live run made it obvious why: llama-server's JSON
+    # Schema → GBNF compiler doesn't enforce per-branch constraints
+    # inside allOf+oneOf (so a tap branch saying "element_id must
+    # be a string" is silently ignored), and Gemma 4 happily returns
+    # element_id=null on tap/input. Pinning the field at the base
+    # schema works because that constraint IS compiled into the
+    # grammar. For navigation actions (back / swipe / scroll / wait)
+    # element_id is technically irrelevant — the worker ignores it
+    # in _dispatch — but having the LLM pick *any* visible id is
+    # cheap and keeps the grammar single-track.
+    #
+    # If element_ids is empty (blank screen, or the worker called
+    # before AXe stabilised) we leave the field nullable: a
+    # non-null enum with no values would make the whole schema
+    # unsatisfiable and llama-server would 400.
+    if element_ids:
+        element_id_schema: dict[str, Any] = {
+            "type": "string",
+            "enum": list(element_ids),
+        }
+        required_fields = [
+            "done",
+            "action",
+            "action_args",
+            "element_id",
+            "value_source",
+            "value_literal",
+            "reasoning",
+        ]
+    else:
+        element_id_schema = {
+            "type": ["string", "null"],
+            "enum": [None],
+        }
+        required_fields = [
+            "done",
+            "action",
+            "action_args",
+            "value_source",
+            "value_literal",
+            "reasoning",
+        ]
 
     # Base object — everything except action / action_args, which we
     # nail down via ``allOf`` + ``oneOf`` so the args constrain by
@@ -140,14 +184,7 @@ def build_goal_schema(
     base: dict[str, Any] = {
         "type": "object",
         "additionalProperties": False,
-        "required": [
-            "done",
-            "action",
-            "action_args",
-            "value_source",
-            "value_literal",
-            "reasoning",
-        ],
+        "required": required_fields,
         "properties": {
             "done": {"type": "boolean"},
             "reason": {"type": ["string", "null"], "maxLength": 300},
@@ -156,10 +193,7 @@ def build_goal_schema(
                 if action_codes else {"type": "string"}
             ),
             "action_args": {"type": "object"},
-            "element_id": {
-                "type": ["string", "null"],
-                "enum": element_enum,
-            },
+            "element_id": element_id_schema,
             "element_label": {"type": ["string", "null"], "maxLength": 300},
             "value_source": {"type": "string", "enum": value_source_enum},
             "value_literal": {"type": ["string", "null"], "maxLength": 300},

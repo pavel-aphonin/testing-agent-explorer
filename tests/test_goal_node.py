@@ -266,11 +266,18 @@ async def test_T2_response_format_is_sent_with_test_data_enum() -> None:
     assert "goal_literal" in enum
     assert "improvised" in enum
     assert "none" in enum
-    # element_id enum must include every on-screen id plus null.
-    eid_enum = schema["properties"]["element_id"]["enum"]
-    assert "phone_field" in eid_enum
-    assert "submit_btn" in eid_enum
-    assert None in eid_enum
+    # PER-111 v2: element_id is REQUIRED string, non-null, enum =
+    # exactly the on-screen ids. null is removed at the base-schema
+    # level because llama-server's GBNF compiler doesn't enforce
+    # per-branch oneOf constraints reliably (smoke run showed Gemma 4
+    # returning element_id=null on tap despite the branch saying it
+    # must be a string).
+    eid_prop = schema["properties"]["element_id"]
+    assert eid_prop["type"] == "string"
+    assert "phone_field" in eid_prop["enum"]
+    assert "submit_btn" in eid_prop["enum"]
+    assert None not in eid_prop["enum"]
+    assert "element_id" in schema["required"]
 
 
 @pytest.mark.asyncio
