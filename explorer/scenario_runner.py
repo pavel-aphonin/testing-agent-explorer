@@ -859,11 +859,18 @@ class ScenarioRunner:
                 # callback raises (e.g. backend down).
                 try:
                     if self.defect_callback and self.run_id:
+                        # PER-120: defects now reference priority +
+                        # severity rows by ``code``. Spec mismatches
+                        # default to high / critical — the LLM
+                        # confirmed the screen disagrees with the
+                        # written specification, which is by definition
+                        # a regression.
                         await self.defect_callback({
                             "run_id": self.run_id,
                             "step_idx": step_idx,
                             "screen_name": (step.get("screen_name") or "")[:500] or None,
-                            "priority": "P1",
+                            "priority_code": "high",
+                            "severity_code": "critical",
                             "kind": "spec_mismatch",
                             "title": f"Несоответствие спеке на шаге {step_idx + 1}",
                             "description": (
@@ -1520,7 +1527,10 @@ class ScenarioRunner:
             await asyncio.sleep(0)
 
         # 4. Optional expected_outcome verification once the LLM
-        # claims done. Mismatch downgrades the result.
+        # claims done. Mismatch downgrades the result AND opens a
+        # defect (PER-129) — when the agent insists "done" but the
+        # screen doesn't match the spec, that's a regression worth
+        # surfacing, not just a silent failure.
         if done and expected:
             ok, why = await self._check_screen_with_retries(
                 expected, scenario_id, node_id,
@@ -1528,6 +1538,36 @@ class ScenarioRunner:
             if not ok:
                 done = False
                 last_reason = f"expected_outcome_mismatch: {why}"
+                try:
+                    if self.defect_callback and self.run_id:
+                        # Priority/severity stay at "high"/"major" by
+                        # default — operator triages from there. Note
+                        # we use *code* values per PER-120 contract,
+                        # not the old P1/P2 strings.
+                        await self.defect_callback({
+                            "run_id": self.run_id,
+                            "step_idx": step_idx,
+                            "screen_name": (description or "")[:500] or None,
+                            "priority_code": "high",
+                            "severity_code": "major",
+                            "kind": "spec_mismatch",
+                            "title": (
+                                f"Цель «{description[:60]}…» не достигнута"
+                                if len(description) > 60
+                                else f"Цель «{description}» не достигнута"
+                            ),
+                            "description": (
+                                f"Ожидание: {expected}\n"
+                                f"LLM-вердикт: {why}"
+                            ),
+                            "llm_analysis_json": {
+                                "node_id": node_id,
+                                "mode": mode,
+                                "history_tail": history[-8:],
+                            },
+                        })
+                except Exception:
+                    logger.exception("[goal] defect callback failed")
 
         # PER-111 v2: explore-mode goals never set done=true by design
         # (the LLM is told not to, and the worker would override it
