@@ -804,6 +804,81 @@ async def test_T19_goal_decide_falls_back_to_text_when_screenshot_fails() -> Non
     assert len(llm.calls) == 1
 
 
+def test_T20_screen_fingerprint_ignores_value_changes() -> None:
+    """T20 (PER-127): the screen fingerprint must be stable across
+    text-field value changes — the user typing into a phone field
+    shouldn't look like a different screen. Only structural changes
+    (different element types, labels, positions) should bump it."""
+    from explorer.axe_client import screen_fingerprint
+
+    base = [
+        {"kind": "AXTextField", "label": "Phone", "value": "", "frame": {"x": 10, "y": 100, "width": 200, "height": 40}},
+        {"kind": "AXButton", "label": "Login", "value": "", "frame": {"x": 10, "y": 200, "width": 100, "height": 40}},
+    ]
+    edited = [
+        {**base[0], "value": "+79991234567"},
+        base[1],
+    ]
+    assert screen_fingerprint(base) == screen_fingerprint(edited)
+
+    moved = [
+        {**base[0], "frame": {"x": 10, "y": 200, "width": 200, "height": 40}},
+        base[1],
+    ]
+    assert screen_fingerprint(base) != screen_fingerprint(moved)
+
+
+def test_T21_loading_indicator_keywords_case_insensitive() -> None:
+    """T21 (PER-127): loading-indicator detection scans label/value
+    case-insensitively against the workspace keyword list."""
+    from explorer.axe_client import has_loading_indicator
+
+    elements = [
+        {"kind": "AXStaticText", "label": "Вход. Секундочку, пожалуйста.", "value": ""},
+        {"kind": "AXButton", "label": "Cancel", "value": ""},
+    ]
+    assert has_loading_indicator(elements, ["секундоч"]) is True
+    assert has_loading_indicator(elements, ["loading"]) is False
+    # Empty keyword list → always false (feature disabled per workspace).
+    assert has_loading_indicator(elements, []) is False
+    # Value-side match works too.
+    assert has_loading_indicator(
+        [{"kind": "X", "label": "", "value": "Please wait..."}],
+        ["please wait"],
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_T22_wait_for_screen_stable_stops_on_convergence() -> None:
+    """T22 (PER-127): _wait_for_screen_stable returns as soon as two
+    consecutive AXe snapshots match AND no loading keyword is visible.
+    Doesn't burn the full timeout when the screen is already calm."""
+
+    class _StaticController(FakeController):
+        # Same elements every call → fingerprint converges after the
+        # 2nd snapshot.
+        async def get_ui_elements(self):
+            return list(self.elements)
+
+    controller = _StaticController()
+    llm = FakeLLMClient(responses=[])
+    runner = _make_runner(controller, llm, test_data={})
+    # Tighten the cadence so the test doesn't drag.
+    runner._settle_timeout_ms = 2000
+    runner._settle_poll_ms = 50
+
+    import time as _time
+    t0 = _time.monotonic()
+    elements, stable = await runner._wait_for_screen_stable()
+    elapsed_ms = (_time.monotonic() - t0) * 1000
+
+    assert stable is True
+    assert elements  # not empty
+    # Should converge in roughly 1 poll interval (50ms), well below
+    # the 2000ms timeout. Give it 800ms headroom for CI jitter.
+    assert elapsed_ms < 800, f"_wait_for_screen_stable was too slow: {elapsed_ms}ms"
+
+
 def test_T14b_scenario_runner_prompts_no_hardcoded_actions() -> None:
     """T14b: the same property holds for the live module source
     (catches anyone re-introducing hardcoded action names in a prompt

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -56,6 +57,75 @@ def _slug(text: str) -> str:
     ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
     s = _SLUG_INVALID_RE.sub("_", ascii_text).strip("_")
     return s[:_SLUG_TRIM_LEN] if len(s) > _SLUG_TRIM_LEN else s
+
+
+def screen_fingerprint(elements: list[dict]) -> str:
+    """Stable SHA256 hash of an accessibility-tree snapshot.
+
+    PER-127: used by ``_wait_for_screen_stable`` to detect when two
+    consecutive snapshots describe the same screen. The hash covers
+    the bits that change between screens (kind/label + position) and
+    deliberately ignores volatile ones (focus state, AXValue —
+    text-field contents change as the user types but the screen is
+    still "the same screen").
+
+    Elements are projected to ``(kind, label, x, y, w, h)`` tuples,
+    sorted to make the result independent of AXe's traversal order,
+    joined into one string, and hashed.
+    """
+    parts: list[str] = []
+    for el in elements or []:
+        if not isinstance(el, dict):
+            continue
+        kind = (el.get("kind") or el.get("type") or "") or ""
+        label = (el.get("label") or "") or ""
+        frame = el.get("frame") or {}
+        try:
+            x = int(frame.get("x", 0) or 0)
+            y = int(frame.get("y", 0) or 0)
+            w = int(frame.get("width", 0) or 0)
+            h = int(frame.get("height", 0) or 0)
+        except (TypeError, ValueError):
+            x, y, w, h = 0, 0, 0, 0
+        parts.append(f"{kind}|{label}|{x}|{y}|{w}|{h}")
+    # Sort so two snapshots with the same elements in different AXe
+    # traversal order still match. SHA256 is overkill for what is
+    # effectively a screen equality test, but it's the same primitive
+    # we use elsewhere (PER-85 screen-match) and the cost is trivial
+    # compared to the AXe describe-ui call we just made.
+    parts.sort()
+    blob = "\n".join(parts).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def has_loading_indicator(
+    elements: list[dict], keywords: list[str] | None,
+) -> bool:
+    """True when any element's label or value contains one of the
+    workspace-configured loading keywords (case-insensitive).
+
+    Empty ``keywords`` list disables the check entirely — the screen
+    is considered loaded as long as the fingerprint has converged.
+    """
+    if not keywords:
+        return False
+    needles = [k.lower() for k in keywords if k]
+    if not needles:
+        return False
+    for el in elements or []:
+        if not isinstance(el, dict):
+            continue
+        haystacks = (
+            (el.get("label") or "").lower(),
+            (el.get("value") or "").lower(),
+        )
+        for h in haystacks:
+            if not h:
+                continue
+            for n in needles:
+                if n in h:
+                    return True
+    return False
 
 
 def _resolve_axe_binary() -> str | None:

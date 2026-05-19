@@ -38,6 +38,7 @@ from typing import Any
 
 import httpx
 
+from explorer.axe_client import has_loading_indicator, screen_fingerprint
 from explorer.expression import ExprError, evaluate as eval_expr
 from explorer.goal_schema import (
     build_actions_block,
@@ -222,6 +223,17 @@ class ScenarioRunner:
         # mode (LLM gets no action constraints — workspace is broken,
         # operator needs to seed action types).
         actions: list[dict[str, Any]] | None = None,
+        # PER-127: screen-stability tuning shipped by the backend per
+        # workspace. ``settle_timeout_ms`` caps how long we wait for
+        # the AXe tree to stop changing between actions;
+        # ``settle_poll_ms`` is the polling cadence;
+        # ``loading_indicator_keywords`` is the list of substrings
+        # the worker scans element labels/values for to detect "still
+        # loading" screens (e.g. "Секундочку, пожалуйста"). All
+        # optional; defaults are conservative.
+        settle_timeout_ms: int = 5000,
+        settle_poll_ms: int = 500,
+        loading_indicator_keywords: list[str] | None = None,
     ) -> None:
         self.controller = controller
         self.scenarios = scenarios or []
@@ -233,6 +245,11 @@ class ScenarioRunner:
         self.run_id = run_id
         self.llm_client = llm_client
         self._actions: list[dict[str, Any]] = list(actions or [])
+        # PER-127 settle config. Sane defaults if the backend ships
+        # nothing (legacy workspace pre-migration, or test fixtures).
+        self._settle_timeout_ms: int = max(0, int(settle_timeout_ms or 5000))
+        self._settle_poll_ms: int = max(50, int(settle_poll_ms or 500))
+        self._loading_keywords: list[str] = list(loading_indicator_keywords or [])
         # PER-85: cache (screen-fingerprint, description) → (matches, reason)
         # so each unique description is only verified once per visited
         # screen. Reset per scenario in _run_graph.
@@ -1035,6 +1052,72 @@ class ScenarioRunner:
         self._screen_match_cache[(fingerprint, description)] = result
         return result
 
+    async def _wait_for_screen_stable(
+        self,
+    ) -> tuple[list[dict], bool]:
+        """Poll AXe until two consecutive snapshots have the same
+        fingerprint AND no loading-indicator keywords are visible.
+
+        Returns ``(elements, stable)``:
+          * ``elements`` — the last snapshot we read, even on timeout
+            (so callers can proceed best-effort).
+          * ``stable`` — True when convergence was actually reached
+            within ``settle_timeout_ms``; False on timeout. The caller
+            can pass this to the LLM as a hint ("экран ещё грузится").
+
+        PER-127: instead of a flat ``asyncio.sleep`` between actions,
+        the runner uses this to wait for the app to settle — typing
+        animations, lazy navigation, network round-trips. If the
+        workspace's ``loading_indicator_keywords`` are configured, an
+        explicit spinner/«Секундочку, пожалуйста» on the screen
+        defeats convergence even when fingerprints match (a frozen
+        spinner is the *same* AXe tree across two polls).
+        """
+        timeout_ms = self._settle_timeout_ms
+        poll_ms = self._settle_poll_ms
+        if timeout_ms <= 0:
+            # Feature disabled per workspace — just grab one frame and
+            # return. Useful for super-fast sandboxes where any wait
+            # is wasted.
+            try:
+                elements = await asyncio.wait_for(
+                    self.controller.get_ui_elements(), timeout=10
+                )
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                elements = []
+            return elements, True
+
+        last_fingerprint: str | None = None
+        elements: list[dict] = []
+        deadline = asyncio.get_event_loop().time() + (timeout_ms / 1000.0)
+        # We need at least two polls separated by poll_ms to declare
+        # stability; loop budget is timeout_ms / poll_ms iterations.
+        iterations = max(2, int(timeout_ms / poll_ms))
+        for _ in range(iterations):
+            try:
+                elements = await asyncio.wait_for(
+                    self.controller.get_ui_elements(), timeout=10
+                )
+            except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
+                logger.warning("[settle] get_ui_elements failed: %s", exc)
+                if asyncio.get_event_loop().time() >= deadline:
+                    return elements, False
+                await asyncio.sleep(poll_ms / 1000.0)
+                continue
+            fp = screen_fingerprint(elements)
+            loading = has_loading_indicator(elements, self._loading_keywords)
+            if last_fingerprint == fp and not loading:
+                return elements, True
+            last_fingerprint = fp
+            if asyncio.get_event_loop().time() >= deadline:
+                # Timed out — return whatever we have so the caller
+                # can still act, but flag instability so it can
+                # downgrade its confidence (e.g. nudge the LLM toward
+                # ``wait``).
+                return elements, False
+            await asyncio.sleep(poll_ms / 1000.0)
+        return elements, False
+
     async def _check_screen_with_retries(
         self, description: str, sid: str, node_id: str | None
     ) -> tuple[bool, str]:
@@ -1211,14 +1294,33 @@ class ScenarioRunner:
             #     a PIN-entry screen from a login screen when both
             #     have a button labelled "Войти". A 440×956 q4 vision
             #     encoder costs ~256 tokens — cheap at goal-node cadence.
-            try:
-                elements = await asyncio.wait_for(
-                    self.controller.get_ui_elements(), timeout=10
-                )
-            except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
-                last_reason = f"get_ui_elements failed: {exc}"
-                await asyncio.sleep(_ACTION_SETTLE_SEC)
+            #
+            # PER-127: replace the flat ``asyncio.sleep(_ACTION_SETTLE_SEC)``
+            # with a screen-stability poll. The poll returns as soon as
+            # two consecutive AXe snapshots match AND no loading
+            # keywords are visible, or when settle_timeout_ms is hit
+            # (whichever first). When the screen times out without
+            # stabilising, we still proceed — but log a warning and
+            # tell the LLM via history so it can choose `wait`.
+            elements, stable = await self._wait_for_screen_stable()
+            if not elements:
+                last_reason = "get_ui_elements failed (empty after settle)"
                 continue
+            if not stable:
+                logger.warning(
+                    "[goal] screen did not stabilise within %d ms at step %d; "
+                    "proceeding anyway",
+                    self._settle_timeout_ms, inner_step,
+                )
+                # Hint the LLM that the screen is mid-transition so
+                # it can pick `wait` rather than try to interact with
+                # a half-rendered view. The history block is part of
+                # every goal-decide prompt, so the model sees this
+                # on the next turn.
+                history.append(
+                    "(система) экран ещё грузится — стоит дать ему время или "
+                    "выбрать действие `wait`",
+                )
 
             screenshot_b64: str | None = None
             take_screenshot_fn = getattr(self.controller, "take_screenshot", None)
@@ -1388,7 +1490,12 @@ class ScenarioRunner:
                 )
                 break
 
-            await asyncio.sleep(_ACTION_SETTLE_SEC)
+            # PER-127: settle is owned by _wait_for_screen_stable now —
+            # it polls AXe at the top of the next inner iteration. A
+            # flat sleep here would just delay the moment we start
+            # polling without giving us better data, so it's removed.
+            # We still yield to the event loop so cancel propagates.
+            await asyncio.sleep(0)
 
         # 4. Optional expected_outcome verification once the LLM
         # claims done. Mismatch downgrades the result.

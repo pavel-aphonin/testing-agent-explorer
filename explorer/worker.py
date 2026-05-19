@@ -570,6 +570,15 @@ class RealExecutor:
                         # (operator should seed RefActionType + enable
                         # them per workspace).
                         actions=config.get("actions") or [],
+                        # PER-127: per-workspace screen-stability tuning
+                        # shipped by claim_next; fall back to None when
+                        # the backend pre-dates the migration, so the
+                        # ScenarioRunner uses its own conservative defaults.
+                        settle_timeout_ms=config.get("settle_timeout_ms") or 5000,
+                        settle_poll_ms=config.get("settle_poll_ms") or 500,
+                        loading_indicator_keywords=(
+                            config.get("loading_indicator_keywords") or []
+                        ),
                     )
                     sr_summary = await sr.run_all()
                     logger.info("[scenario] summary: %s", sr_summary)
