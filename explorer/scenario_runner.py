@@ -1284,6 +1284,10 @@ class ScenarioRunner:
         from collections import deque
         recent_attempts: deque[tuple[str, str | None, str, bool]] = deque(maxlen=3)
         oscillation_window: deque[tuple[str, str | None]] = deque(maxlen=6)
+        # PER-128: fingerprint of the screen we last saw, used to mark
+        # in history whether each action actually changed anything.
+        # ``None`` until the first iteration completes.
+        last_pre_fingerprint: str | None = None
 
         for inner_step in range(max_steps):
             # 1. Read the current screen. Both representations matter:
@@ -1321,6 +1325,24 @@ class ScenarioRunner:
                     "(система) экран ещё грузится — стоит дать ему время или "
                     "выбрать действие `wait`",
                 )
+
+            # PER-128: compare the current fingerprint against the
+            # one we saw before the previous action. If they match,
+            # the last tap/input did NOT change the screen — the LLM
+            # would otherwise be tempted to repeat it. We rewrite
+            # the most recent history entry to flag this so it shows
+            # up in the next goal-decide prompt.
+            current_fingerprint = screen_fingerprint(elements)
+            if (
+                last_pre_fingerprint is not None
+                and current_fingerprint == last_pre_fingerprint
+                and history
+                and "[OK" in history[-1]
+            ):
+                history[-1] = history[-1].replace(
+                    "[OK]", "[OK, но экран не изменился]"
+                )
+            last_pre_fingerprint = current_fingerprint
 
             screenshot_b64: str | None = None
             take_screenshot_fn = getattr(self.controller, "take_screenshot", None)
