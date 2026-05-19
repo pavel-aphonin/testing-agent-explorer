@@ -579,6 +579,14 @@ class RealExecutor:
                         loading_indicator_keywords=(
                             config.get("loading_indicator_keywords") or []
                         ),
+                        # PER-131-lite: thinking-mode passport pulled
+                        # off the run's LLMModel row. ``False`` here
+                        # collapses the goal-decide call to its old
+                        # single-pass shape — same behaviour the
+                        # worker had before the passport landed.
+                        supports_thinking=bool(config.get("supports_thinking")),
+                        thinking_activation=config.get("thinking_activation"),
+                        thinking_extract_regex=config.get("thinking_extract_regex"),
                     )
                     sr_summary = await sr.run_all()
                     logger.info("[scenario] summary: %s", sr_summary)

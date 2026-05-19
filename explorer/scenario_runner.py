@@ -234,6 +234,20 @@ class ScenarioRunner:
         settle_timeout_ms: int = 5000,
         settle_poll_ms: int = 500,
         loading_indicator_keywords: list[str] | None = None,
+        # PER-131-lite: thinking-mode passport. Comes from the
+        # backend's claim_next, sourced from the LLMModel row. When
+        # ``supports_thinking`` is true the goal-decide call splits
+        # into two passes (free-form reasoning, then constrained
+        # JSON) so any model the operator plugs in — Gemma 4 today,
+        # something else tomorrow — gets reasoning without code
+        # changes. ``thinking_activation`` is the model-specific
+        # token (Gemma: ``<|think|>``);
+        # ``thinking_extract_regex`` peels the final answer out of
+        # the reasoning-wrapped response (Gemma:
+        # ``<channel\|>\n?(.*)``).
+        supports_thinking: bool = False,
+        thinking_activation: str | None = None,
+        thinking_extract_regex: str | None = None,
     ) -> None:
         self.controller = controller
         self.scenarios = scenarios or []
@@ -250,6 +264,10 @@ class ScenarioRunner:
         self._settle_timeout_ms: int = max(0, int(settle_timeout_ms or 5000))
         self._settle_poll_ms: int = max(50, int(settle_poll_ms or 500))
         self._loading_keywords: list[str] = list(loading_indicator_keywords or [])
+        # PER-131-lite thinking config.
+        self._supports_thinking: bool = bool(supports_thinking)
+        self._thinking_activation: str = thinking_activation or ""
+        self._thinking_extract_regex: str = thinking_extract_regex or ""
         # PER-85: cache (screen-fingerprint, description) → (matches, reason)
         # so each unique description is only verified once per visited
         # screen. Reset per scenario in _run_graph.
@@ -1594,6 +1612,74 @@ class ScenarioRunner:
         await self._emit(evt)
         return done, evt.get("reason")
 
+    async def _goal_think_pass(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        screenshot_b64: str | None,
+    ) -> str:
+        """First pass of the PER-131-lite two-step decode for
+        thinking-capable models.
+
+        Prepends ``self._thinking_activation`` to the system prompt
+        to switch the model into reasoning mode, sends the prompt
+        WITHOUT ``response_format`` (so the model can emit free
+        text before its final answer), then extracts the final
+        answer using ``self._thinking_extract_regex``. The returned
+        string is fed back into the second (constrained-JSON) pass
+        so the model can lean on its own reasoning when filling the
+        schema.
+
+        Returns "" if the model errors out, returns no useful
+        thinking, or the extract regex is missing / fails to match.
+        The caller treats an empty return as "fall back to
+        single-pass".
+        """
+        import re as _re
+        sysprompt_with_think = (
+            f"{self._thinking_activation}\n{system_prompt}"
+            if self._thinking_activation else system_prompt
+        )
+        try:
+            raw = await self.llm_client.chat(
+                system=sysprompt_with_think,
+                user=user_prompt,
+                # Headroom for chain-of-thought. 1500 tokens is the
+                # sweet spot for Gemma 4 — long enough for a couple
+                # of paragraphs of reasoning, short enough that one
+                # bad request doesn't burn 30s of inference.
+                max_tokens=1500,
+                screenshot_b64=screenshot_b64,
+            )
+        except Exception as exc:
+            logger.warning("[scenario] thinking pass failed: %s", exc)
+            return ""
+        if not raw:
+            return ""
+        if not self._thinking_extract_regex:
+            # Nothing to extract — treat the whole response as the
+            # model's thinking and pass it through.
+            return raw.strip()
+        try:
+            m = _re.search(self._thinking_extract_regex, raw, _re.DOTALL)
+        except _re.error as exc:
+            logger.warning(
+                "[scenario] thinking_extract_regex invalid (%s); "
+                "passing through raw response",
+                exc,
+            )
+            return raw.strip()
+        if not m:
+            # Pattern didn't match — model probably didn't emit the
+            # expected wrapper. Better to forward the whole text than
+            # to discard everything.
+            return raw.strip()
+        # Group 1 holds the final answer; some patterns might capture
+        # the thinking part instead, but that's a passport bug we
+        # surface upstream rather than mask here.
+        return (m.group(1) or "").strip()
+
     async def _goal_decide(
         self,
         *,
@@ -1662,10 +1748,41 @@ class ScenarioRunner:
             },
         )
 
+        # PER-131-lite: if the active model carries a thinking
+        # passport, we split the call into two passes — first a
+        # free-form reasoning pass with the activation token in the
+        # system prompt and NO response_format (the model would
+        # otherwise be forced to emit JSON from token #1, leaving no
+        # room for the reasoning block); then a constrained JSON
+        # pass with the reasoning fed back as context. Without the
+        # passport (legacy / non-thinking model) we collapse to the
+        # single constrained call the worker has done from day one.
         try:
+            if self._supports_thinking and self._thinking_activation:
+                thinking_text = await self._goal_think_pass(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    screenshot_b64=screenshot_b64,
+                )
+                # On a thinking-pass failure (timeout / parse error)
+                # fall through to single-pass with the original
+                # prompt so the run keeps making progress instead of
+                # stalling on a brittle preamble.
+                effective_user = (
+                    user_prompt
+                    if not thinking_text
+                    else (
+                        f"{user_prompt}\n\n"
+                        f"Твои предварительные размышления:\n{thinking_text}\n\n"
+                        f"Теперь сформируй окончательный JSON-ответ по схеме."
+                    )
+                )
+            else:
+                effective_user = user_prompt
+
             resp = await self.llm_client.chat(
                 system=system_prompt,
-                user=user_prompt,
+                user=effective_user,
                 max_tokens=400,
                 response_format={
                     "type": "json_schema",
