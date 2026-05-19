@@ -1203,7 +1203,14 @@ class ScenarioRunner:
         oscillation_window: deque[tuple[str, str | None]] = deque(maxlen=6)
 
         for inner_step in range(max_steps):
-            # 1. Read the current screen.
+            # 1. Read the current screen. Both representations matter:
+            #   - AXe accessibility dump → element_id enum + the text
+            #     description the LLM uses to ground its decision
+            #   - screenshot PNG → vision input. PER-119 confirmed
+            #     that without the rendered screen Gemma 4 can't tell
+            #     a PIN-entry screen from a login screen when both
+            #     have a button labelled "Войти". A 440×956 q4 vision
+            #     encoder costs ~256 tokens — cheap at goal-node cadence.
             try:
                 elements = await asyncio.wait_for(
                     self.controller.get_ui_elements(), timeout=10
@@ -1212,6 +1219,25 @@ class ScenarioRunner:
                 last_reason = f"get_ui_elements failed: {exc}"
                 await asyncio.sleep(_ACTION_SETTLE_SEC)
                 continue
+
+            screenshot_b64: str | None = None
+            take_screenshot_fn = getattr(self.controller, "take_screenshot", None)
+            if callable(take_screenshot_fn):
+                try:
+                    screenshot_b64 = await asyncio.wait_for(
+                        take_screenshot_fn(), timeout=10
+                    )
+                except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
+                    # Vision input is best-effort: a flaky screenshot
+                    # shouldn't poison a goal step. Log it and fall
+                    # through to text-only — the LLM still has the
+                    # accessibility dump to work from.
+                    logger.warning(
+                        "[goal] take_screenshot failed (step %d): %s; "
+                        "decision will be text-only",
+                        inner_step, exc,
+                    )
+                    screenshot_b64 = None
 
             # 2. Ask the LLM what to do (or whether we're done).
             decision = await self._goal_decide(
@@ -1227,6 +1253,7 @@ class ScenarioRunner:
                 actions=actions_dict,
                 actions_block=actions_block,
                 test_data_block=test_data_block,
+                screenshot_b64=screenshot_b64,
             )
             if decision is None:
                 last_reason = "llm_no_decision"
@@ -1413,6 +1440,7 @@ class ScenarioRunner:
         actions: list[dict],
         actions_block: str,
         test_data_block: str,
+        screenshot_b64: str | None = None,
     ) -> dict[str, Any] | None:
         """One LLM round for a goal node (PER-111 v2).
 
@@ -1425,6 +1453,13 @@ class ScenarioRunner:
         Schema is rebuilt per call because ``element_id`` enum
         depends on what's on screen right now — that's the whole
         point of the new contract.
+
+        PER-119: ``screenshot_b64`` is the rendered screen as base64
+        PNG. When provided, the user message is sent as a multimodal
+        content array (text + image) so the LLM can ground its
+        decision on the visible UI. When None we fall back to
+        text-only — the AXe accessibility dump still has everything
+        the model needs for screens with proper labels.
         """
         # Per-step elements block (and the live id enum the schema
         # depends on).
@@ -1470,6 +1505,7 @@ class ScenarioRunner:
                         "schema": schema,
                     },
                 },
+                screenshot_b64=screenshot_b64,
             )
         except Exception as exc:
             logger.warning("[scenario] goal LLM call failed: %s", exc)

@@ -745,6 +745,65 @@ async def test_T17_anti_loop_breaks_on_oscillation_pattern() -> None:
     assert len(controller.tap_calls) == 6
 
 
+@pytest.mark.asyncio
+async def test_T18_goal_decide_passes_screenshot_to_llm() -> None:
+    """T18 (PER-119): when the controller exposes ``take_screenshot``
+    and returns a PNG, the worker forwards the base64 string into
+    ``llm_client.chat`` so Gemma 4 can see the rendered screen. The
+    AXe accessibility dump alone is not enough on UIs where the same
+    label appears on different screens (e.g. PIN-entry vs login)."""
+
+    class _VisionController(FakeController):
+        screenshot_calls: int = 0
+
+        async def take_screenshot(self) -> str:
+            type(self).screenshot_calls += 1
+            return "BASE64PNGFAKE"
+
+    controller = _VisionController()
+    llm = FakeLLMClient(
+        responses=[_decision(done=True, reason="ok")]
+    )
+    runner = _make_runner(controller, llm, test_data={})
+    await runner._run_goal_node(
+        scenario_id="t18", step_idx=0,
+        data={"description": "Войди", "max_steps": 2}, node_id="g1",
+    )
+    # llm_client.chat got the screenshot.
+    assert llm.calls, "LLM was never called"
+    chat_call = llm.calls[0]
+    # FakeLLMClient stores the kwargs it was invoked with;
+    # response_format is captured today, screenshot_b64 must be too.
+    assert "response_format" in chat_call
+    # The controller's take_screenshot was actually exercised.
+    assert _VisionController.screenshot_calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_T19_goal_decide_falls_back_to_text_when_screenshot_fails() -> None:
+    """T19 (PER-119): if the controller's take_screenshot raises, the
+    worker logs a warning and still produces a decision via the
+    text-only path. Flaky vision input mustn't break a goal step."""
+
+    class _BrokenVisionController(FakeController):
+        async def take_screenshot(self) -> str:
+            raise RuntimeError("simctl screenshot crashed")
+
+    controller = _BrokenVisionController()
+    llm = FakeLLMClient(
+        responses=[_decision(done=True, reason="ok")]
+    )
+    runner = _make_runner(controller, llm, test_data={})
+    ok, _reason = await runner._run_goal_node(
+        scenario_id="t19", step_idx=0,
+        data={"description": "Войди", "max_steps": 2}, node_id="g1",
+    )
+    # Goal still completes — screenshot failure didn't abort it.
+    assert ok is True
+    # LLM was still called (text-only path).
+    assert len(llm.calls) == 1
+
+
 def test_T14b_scenario_runner_prompts_no_hardcoded_actions() -> None:
     """T14b: the same property holds for the live module source
     (catches anyone re-introducing hardcoded action names in a prompt
