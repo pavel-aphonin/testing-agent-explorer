@@ -1801,10 +1801,17 @@ class ScenarioRunner:
             # on parse-recovery (raw_decode tolerates trailing
             # chatter and markdown fences) plus the existing
             # anti-loop guard for shape-violating outputs.
+            # PER-138 follow-up: reasoning models (Nemotron Reasoning,
+            # Qwen3-Thinking) can sneak <think>…</think> into the JSON
+            # pass too — 400 tokens cuts the JSON in half (real bug:
+            # `"value_l` truncation on Nemotron smoke). 1500 gives
+            # enough headroom both for residual reasoning and for the
+            # 9-field JSON shape, including long value_literal /
+            # reasoning fields.
             chat_kwargs = {
                 "system": system_prompt,
                 "user": effective_user,
-                "max_tokens": 400,
+                "max_tokens": 1500,
                 "screenshot_b64": screenshot_b64,
             }
             if self._supports_json_schema:
