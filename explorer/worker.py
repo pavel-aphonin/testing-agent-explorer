@@ -587,6 +587,16 @@ class RealExecutor:
                         supports_thinking=bool(config.get("supports_thinking")),
                         thinking_activation=config.get("thinking_activation"),
                         thinking_extract_regex=config.get("thinking_extract_regex"),
+                        # PER-138 transport capabilities. Defaults
+                        # preserve the legacy llama_cpp + vision +
+                        # json_schema behaviour when the backend
+                        # ships no override (e.g. legacy runs).
+                        supports_json_schema=bool(
+                            config.get("supports_json_schema", True)
+                        ),
+                        supports_multimodal_image=bool(
+                            config.get("supports_multimodal_image", True)
+                        ),
                     )
                     sr_summary = await sr.run_all()
                     logger.info("[scenario] summary: %s", sr_summary)

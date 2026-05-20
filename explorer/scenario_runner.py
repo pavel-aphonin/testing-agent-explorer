@@ -248,6 +248,13 @@ class ScenarioRunner:
         supports_thinking: bool = False,
         thinking_activation: str | None = None,
         thinking_extract_regex: str | None = None,
+        # PER-138: full capabilities. ``supports_json_schema`` controls
+        # whether goal-decide sends ``response_format`` at all;
+        # ``supports_multimodal_image`` decides whether to attach the
+        # screenshot to chat calls. Defaults match the legacy
+        # llama-server + Gemma 4 setup.
+        supports_json_schema: bool = True,
+        supports_multimodal_image: bool = True,
     ) -> None:
         self.controller = controller
         self.scenarios = scenarios or []
@@ -268,6 +275,9 @@ class ScenarioRunner:
         self._supports_thinking: bool = bool(supports_thinking)
         self._thinking_activation: str = thinking_activation or ""
         self._thinking_extract_regex: str = thinking_extract_regex or ""
+        # PER-138 transport capabilities.
+        self._supports_json_schema: bool = bool(supports_json_schema)
+        self._supports_multimodal_image: bool = bool(supports_multimodal_image)
         # PER-85: cache (screen-fingerprint, description) → (matches, reason)
         # so each unique description is only verified once per visited
         # screen. Reset per scenario in _run_graph.
@@ -1371,7 +1381,11 @@ class ScenarioRunner:
 
             screenshot_b64: str | None = None
             take_screenshot_fn = getattr(self.controller, "take_screenshot", None)
-            if callable(take_screenshot_fn):
+            # PER-138: skip the screenshot entirely when the model's
+            # capability passport says it can't accept an image
+            # content block. Saves a controller call + saves wasted
+            # tokens on text-only models like Nemotron.
+            if self._supports_multimodal_image and callable(take_screenshot_fn):
                 try:
                     screenshot_b64 = await asyncio.wait_for(
                         take_screenshot_fn(), timeout=10
@@ -1780,19 +1794,28 @@ class ScenarioRunner:
             else:
                 effective_user = user_prompt
 
-            resp = await self.llm_client.chat(
-                system=system_prompt,
-                user=effective_user,
-                max_tokens=400,
-                response_format={
+            # PER-138: only ask for json_schema constrained decoding
+            # when the backend can compile a grammar from it. For
+            # endpoints that can't (some OpenAI-compat, Anthropic
+            # API, custom adapters), drop response_format and rely
+            # on parse-recovery (raw_decode tolerates trailing
+            # chatter and markdown fences) plus the existing
+            # anti-loop guard for shape-violating outputs.
+            chat_kwargs = {
+                "system": system_prompt,
+                "user": effective_user,
+                "max_tokens": 400,
+                "screenshot_b64": screenshot_b64,
+            }
+            if self._supports_json_schema:
+                chat_kwargs["response_format"] = {
                     "type": "json_schema",
                     "json_schema": {
                         "name": "goal_decision",
                         "schema": schema,
                     },
-                },
-                screenshot_b64=screenshot_b64,
-            )
+                }
+            resp = await self.llm_client.chat(**chat_kwargs)
         except Exception as exc:
             logger.warning("[scenario] goal LLM call failed: %s", exc)
             return None
