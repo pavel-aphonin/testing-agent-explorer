@@ -1856,6 +1856,34 @@ class ScenarioRunner:
             ok = await self.controller.go_back()
             return ok, None if ok else "go_back returned False"
 
+        # PER-137: coordinate tap and free-form text entry. Both let
+        # the LLM act on UIs whose elements aren't in the accessibility
+        # tree (PIN keypads, canvas-painted buttons, RN screens without
+        # accessibilityIdentifier). Neither requires element_id — the
+        # action argues directly with the screen, not via the AXe enum.
+        if action == "tap_at":
+            try:
+                x = int(args.get("x"))
+                y = int(args.get("y"))
+            except (TypeError, ValueError):
+                return False, "tap_at requires integer x, y"
+            tap_at_fn = getattr(self.controller, "tap_at", None)
+            if not callable(tap_at_fn):
+                return False, "controller has no tap_at"
+            result = await tap_at_fn(x, y)
+            ok = bool(result and getattr(result, "ok", True))
+            return ok, None if ok else f"tap_at({x},{y}) failed"
+
+        if action == "enter_text":
+            text = args.get("text")
+            if not isinstance(text, str) or not text:
+                return False, "enter_text requires non-empty text"
+            type_fn = getattr(self.controller, "type_text", None)
+            if not callable(type_fn):
+                return False, "controller has no type_text"
+            typed = await type_fn(text)
+            return bool(typed), None if typed else "type_text returned False"
+
         if action == "wait":
             ms = args.get("ms")
             # Controller may not implement wait_ms on every backend —
