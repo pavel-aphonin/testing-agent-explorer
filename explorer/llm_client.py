@@ -19,6 +19,8 @@ Design choices:
 
 from __future__ import annotations
 
+import os
+
 import json
 import logging
 import re
@@ -68,8 +70,17 @@ class LLMClient:
         self,
         base_url: str,
         model_name: str = "embeddings",
-        timeout: float = 30.0,
+        timeout: float | None = None,
     ) -> None:
+        # Default bumped from 30s to 180s: MoE models (Nemotron 3 Nano
+        # Omni 30B-A3B, Qwen3-Omni 30B-A3B) take 30-60s on cold start
+        # while llama-server warms up expert layers. With thinking on
+        # and a 1500-token reply budget the worst case is ~120s. 180s
+        # gives us headroom; ``TA_LLM_TIMEOUT`` env var overrides for
+        # tighter setups (CI, dense models). Explicit kwarg still wins
+        # when callers know exactly what they want.
+        if timeout is None:
+            timeout = float(os.environ.get("TA_LLM_TIMEOUT", "180"))
         self.base_url = base_url.rstrip("/")
         self.model_name = model_name
         self.timeout = timeout

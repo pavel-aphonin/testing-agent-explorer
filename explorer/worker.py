@@ -597,6 +597,13 @@ class RealExecutor:
                         supports_multimodal_image=bool(
                             config.get("supports_multimodal_image", True)
                         ),
+                        # PER-145 L1: coordinate space the model emits
+                        # for tap_at. Worker scales (x, y) into AXe
+                        # screen points using the device dimensions
+                        # captured at controller connect-time.
+                        tap_at_coord_space=str(
+                            config.get("tap_at_coord_space", "points")
+                        ),
                     )
                     sr_summary = await sr.run_all()
                     logger.info("[scenario] summary: %s", sr_summary)

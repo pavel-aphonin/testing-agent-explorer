@@ -255,6 +255,12 @@ class ScenarioRunner:
         # llama-server + Gemma 4 setup.
         supports_json_schema: bool = True,
         supports_multimodal_image: bool = True,
+        # PER-145 L1: coordinate space the model emits for ``tap_at``.
+        # ``points`` — raw screen points (Gemma family default).
+        # ``normalized_1000`` — 0–1000 (Qwen2.5/3-VL convention).
+        # ``pixels`` — raw pixels (Nemotron-style; scale down by
+        # device retina factor).
+        tap_at_coord_space: str = "points",
     ) -> None:
         self.controller = controller
         self.scenarios = scenarios or []
@@ -278,6 +284,10 @@ class ScenarioRunner:
         # PER-138 transport capabilities.
         self._supports_json_schema: bool = bool(supports_json_schema)
         self._supports_multimodal_image: bool = bool(supports_multimodal_image)
+        # PER-145 L1 coord-space normalization for tap_at.
+        allowed_spaces = {"points", "normalized_1000", "pixels"}
+        space = (tap_at_coord_space or "points").lower()
+        self._tap_at_coord_space: str = space if space in allowed_spaces else "points"
         # PER-85: cache (screen-fingerprint, description) → (matches, reason)
         # so each unique description is only verified once per visited
         # screen. Reset per scenario in _run_graph.
@@ -1287,6 +1297,16 @@ class ScenarioRunner:
         # actions_block is identical across inner steps; elements_block
         # is rebuilt each step from the live AXe snapshot.
         actions_block = build_actions_block(actions_dict)
+        # PER-145 L1: append a per-model coord-space hint for tap_at so
+        # the model knows what space to emit (x, y) in. Worker scales
+        # back to AXe screen points before the actual tap — see
+        # ``_dispatch`` tap_at branch. Without this hint a normalized-
+        # 1000 model (Qwen2.5/3-VL) and a points model (Gemma) would
+        # both look correct in the prompt but produce wildly different
+        # tap targets.
+        tap_at_hint = self._tap_at_hint_for_prompt()
+        if tap_at_hint:
+            actions_block = f"{actions_block}\n\n{tap_at_hint}"
         test_data_block = build_test_data_block(self.test_data)
         success_criteria = expected or "—"
         # PER-111 v2: mode comes from whether the goal has a description.
@@ -1497,8 +1517,12 @@ class ScenarioRunner:
             history.append(
                 f"{action} «{label or element_id or '?'}»"
                 + (
+                    # PER-143: enter_text also benefits from the
+                    # resolved-value annotation. Keeps the LLM's history
+                    # honest about WHICH source produced the typed
+                    # string when value_source was used.
                     f" → {value} (via {value_source})"
-                    if action == "input" and value else ""
+                    if action in ("input", "enter_text") and value else ""
                 )
                 + (" [OK]" if ok else f" [FAIL: {reason}]")
             )
@@ -1625,6 +1649,60 @@ class ScenarioRunner:
             evt["node_id"] = node_id
         await self._emit(evt)
         return done, evt.get("reason")
+
+    def _tap_at_hint_for_prompt(self) -> str:
+        """PER-145 L1: per-model coord-space guidance for ``tap_at``.
+
+        Different VLMs were trained on different coordinate spaces, and
+        the worker scales their output into AXe screen points (which is
+        what the device actually understands). We tell the model what
+        space to emit so it doesn't fight its own training:
+
+          * ``points``           — Gemma family. Output in raw screen
+            points already (≤ device width × height).
+          * ``normalized_1000``  — Qwen2.5/3-VL. The ``{"point_2d":
+            [x, y]}`` convention with both axes in 0–1000.
+          * ``pixels``           — Nemotron-style. Raw retina pixels;
+            worker divides by device scale.
+
+        Returns an empty string for default ``points`` (no extra
+        instruction needed — the model just looks at the screen).
+        """
+        space = self._tap_at_coord_space
+        screen_w = int(getattr(self.controller, "_width", 0) or 0)
+        screen_h = int(getattr(self.controller, "_height", 0) or 0)
+        if space == "normalized_1000":
+            return (
+                "ВАЖНО про tap_at: координаты (x, y) задавай в "
+                "НОРМАЛИЗОВАННОМ пространстве 0–1000 по обеим осям "
+                "(стандартный grounding-формат Qwen-VL). Worker сам "
+                "пересчитает в реальные точки экрана. Пример: центр "
+                "экрана = (500, 500); правый нижний угол = (1000, 1000)."
+            )
+        if space == "pixels":
+            scale = float(getattr(self.controller, "_scale", 1.0) or 1.0)
+            if screen_w > 0 and screen_h > 0:
+                px_w = int(round(screen_w * scale))
+                px_h = int(round(screen_h * scale))
+                return (
+                    f"ВАЖНО про tap_at: координаты (x, y) задавай в "
+                    f"raw пикселях экрана: x ∈ [0, {px_w}], "
+                    f"y ∈ [0, {px_h}]. Worker масштабирует в "
+                    f"point-пространство контроллера."
+                )
+            return (
+                "ВАЖНО про tap_at: координаты (x, y) задавай в raw "
+                "пикселях экрана. Worker масштабирует обратно."
+            )
+        # points — пишем явный диапазон, чтобы модель не отправляла
+        # пиксели «на всякий случай».
+        if screen_w > 0 and screen_h > 0:
+            return (
+                f"ВАЖНО про tap_at: координаты (x, y) задавай в "
+                f"point-пространстве этого устройства: x ∈ "
+                f"[0, {screen_w}], y ∈ [0, {screen_h}]. НЕ пиксели."
+            )
+        return ""
 
     async def _goal_think_pass(
         self,
@@ -1808,10 +1886,20 @@ class ScenarioRunner:
             # enough headroom both for residual reasoning and for the
             # 9-field JSON shape, including long value_literal /
             # reasoning fields.
+            # PER-144 fix: thinking-capable models (Nemotron Reasoning,
+            # Qwen3-Thinking) often emit `<think>…</think>` even on the
+            # JSON pass that already saw the reasoning from pass #1, and
+            # 1500 tokens isn't enough — the model burns through them
+            # inside the second think-block and hits finish_reason=length
+            # before any visible JSON. Doubled budget gives reasoning
+            # models the headroom; non-thinking models almost never use
+            # more than ~200 tokens for the JSON shape anyway, so the
+            # ceiling-bump costs nothing in the dense-instruct case.
+            json_max_tokens = 4000 if self._supports_thinking else 1500
             chat_kwargs = {
                 "system": system_prompt,
                 "user": effective_user,
-                "max_tokens": 1500,
+                "max_tokens": json_max_tokens,
                 "screenshot_b64": screenshot_b64,
             }
             if self._supports_json_schema:
@@ -1827,6 +1915,19 @@ class ScenarioRunner:
             logger.warning("[scenario] goal LLM call failed: %s", exc)
             return None
         if not resp:
+            # PER-143 follow-up: thinking-capable models (Nemotron
+            # Reasoning, Qwen3-Thinking) sometimes consume the entire
+            # max_tokens budget inside <think>…</think> on the JSON
+            # pass and emit no visible answer before EOS. Without this
+            # log the goal silently fails with ``llm_no_decision``,
+            # making the issue invisible. The empty string is the
+            # signal — see PER-144 for the structural fix.
+            logger.warning(
+                "[scenario] goal LLM returned empty response "
+                "(likely all max_tokens consumed by thinking); "
+                "thinking_passport=%s, json_schema=%s",
+                self._supports_thinking, self._supports_json_schema,
+            )
             return None
 
         # Even with constrained decoding the chat-template can wrap the
@@ -1893,21 +1994,57 @@ class ScenarioRunner:
         # action argues directly with the screen, not via the AXe enum.
         if action == "tap_at":
             try:
-                x = int(args.get("x"))
-                y = int(args.get("y"))
+                raw_x = int(args.get("x"))
+                raw_y = int(args.get("y"))
             except (TypeError, ValueError):
                 return False, "tap_at requires integer x, y"
+            # PER-145 L1: scale incoming coordinates into screen points
+            # depending on the model's coord-space passport.
+            #   ``points``           → pass through (Gemma family)
+            #   ``normalized_1000``  → 0–1000 normalized (Qwen2.5/3-VL)
+            #   ``pixels``           → raw retina pixels (Nemotron)
+            # Screen dimensions live on the AXe controller, captured
+            # at connect-time. Fall back to (raw_x, raw_y) if dims are
+            # missing — better to try than to crash.
+            screen_w = int(getattr(self.controller, "_width", 0) or 0)
+            screen_h = int(getattr(self.controller, "_height", 0) or 0)
+            scale = float(getattr(self.controller, "_scale", 1.0) or 1.0)
+            space = self._tap_at_coord_space
+            if space == "normalized_1000" and screen_w > 0 and screen_h > 0:
+                x = int(round(raw_x / 1000.0 * screen_w))
+                y = int(round(raw_y / 1000.0 * screen_h))
+            elif space == "pixels" and scale > 0:
+                x = int(round(raw_x / scale))
+                y = int(round(raw_y / scale))
+            else:
+                x, y = raw_x, raw_y
             tap_at_fn = getattr(self.controller, "tap_at", None)
             if not callable(tap_at_fn):
                 return False, "controller has no tap_at"
             result = await tap_at_fn(x, y)
             ok = bool(result and getattr(result, "ok", True))
-            return ok, None if ok else f"tap_at({x},{y}) failed"
+            return ok, None if ok else (
+                f"tap_at(raw={raw_x},{raw_y} space={space} → "
+                f"pts={x},{y}) failed"
+            )
 
         if action == "enter_text":
-            text = args.get("text")
+            # PER-143: prefer the value already resolved by the caller
+            # via :func:`goal_schema.resolve_value` (which honours
+            # value_source ∈ {test_data, improvised, literal}). Fall
+            # back to a literal ``args.text`` only if the LLM emitted
+            # the text inline without setting value_source. This keeps
+            # enter_text consistent with ``input``: the model can pick
+            # either contract and the runtime still gets the right
+            # string — including secret-aware lookups like
+            # test_data.phone → "+79051543055" (with leading prefix)
+            # rather than the raw digits the LLM tends to inline.
+            text = value if value else args.get("text")
             if not isinstance(text, str) or not text:
-                return False, "enter_text requires non-empty text"
+                return False, (
+                    "enter_text requires non-empty text "
+                    "(set value_source or args.text)"
+                )
             type_fn = getattr(self.controller, "type_text", None)
             if not callable(type_fn):
                 return False, "controller has no type_text"

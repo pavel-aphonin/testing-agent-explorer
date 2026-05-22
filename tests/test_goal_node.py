@@ -80,6 +80,12 @@ class FakeController:
     back_calls: int = 0
     swipe_calls: list[tuple] = field(default_factory=list)
     typed_text: list[str] = field(default_factory=list)
+    # PER-145 L1: screen dims AXe controller exposes after connect.
+    # Defaults match iPhone 17 Pro Max @ 3.0× retina.
+    _width: int = 440
+    _height: int = 956
+    _scale: float = 3.0
+    tap_at_calls: list[tuple[int, int]] = field(default_factory=list)
 
     async def get_ui_elements(self) -> list[dict]:
         return list(self.elements)
@@ -90,6 +96,10 @@ class FakeController:
 
     async def tap_by_label(self, label: str) -> _TapResult:
         self.tap_calls.append(label)
+        return _TapResult(ok=True)
+
+    async def tap_at(self, x: int, y: int) -> _TapResult:
+        self.tap_at_calls.append((x, y))
         return _TapResult(ok=True)
 
     async def go_back(self) -> bool:
@@ -155,6 +165,7 @@ def _make_runner(
     llm: FakeLLMClient,
     test_data: dict[str, str] | None = None,
     actions: list[dict[str, Any]] | None = None,
+    tap_at_coord_space: str = "points",
 ) -> ScenarioRunner:
     """Build a ScenarioRunner wired for goal-node tests.
 
@@ -174,6 +185,7 @@ def _make_runner(
         event_callback=event_sink,
         llm_client=llm,
         actions=actions or [],
+        tap_at_coord_space=tap_at_coord_space,
     )
     runner._test_events = events  # type: ignore[attr-defined]
     return runner
@@ -960,3 +972,190 @@ def test_T14b_scenario_runner_prompts_no_hardcoded_actions() -> None:
     assert not found, (
         f"hardcoded action codes leaked into prompt fallback region: {found}"
     )
+
+
+@pytest.mark.asyncio
+async def test_T24_enter_text_uses_value_source_over_args_text() -> None:
+    """T24 (PER-143): when the LLM picks ``action=enter_text`` and
+    sets ``value_source=test_data.phone``, the worker types the
+    workspace-resolved phone (``+79051543055`` with the leading prefix)
+    rather than whatever digits the LLM may have inlined into
+    ``action_args.text``. This keeps enter_text consistent with the
+    older ``input`` action — both honour value_source first.
+
+    Why the test matters: Nemotron 3 Nano Omni in the live smoke run
+    emitted ``enter_text`` with ``action_args.text='9051543055'``
+    (raw digits, no prefix) AND ``value_source='test_data.phone'``.
+    The dispatcher used to read ``args.text`` only, so the app saw a
+    malformed phone and login looped. After the fix the resolved
+    value wins.
+    """
+    controller = FakeController()
+    llm = FakeLLMClient(
+        responses=[
+            _decision(
+                action="enter_text",
+                element_id="phone_field",
+                element_label="Введите телефон",
+                value_source="test_data.phone",
+                value_literal=None,
+                # The LLM would simultaneously emit a raw text; the
+                # contract says we ignore it in favour of value_source.
+                action_args={"text": "9051543055"},
+            ),
+            _decision(done=True, reason="logged in"),
+        ]
+    )
+    runner = _make_runner(
+        controller, llm, test_data={"phone": "+79051543055"}
+    )
+    ok, _reason = await runner._run_goal_node(
+        scenario_id="t24",
+        step_idx=0,
+        data={"description": "Авторизуйся номером {{phone}}", "max_steps": 5},
+        node_id="g1",
+    )
+    assert ok is True
+    # The resolved value MUST win — raw digits ignored.
+    assert controller.typed_text == ["+79051543055"], (
+        f"typed_text={controller.typed_text!r} — expected ['+79051543055']; "
+        "regression: enter_text fell back to args.text again"
+    )
+
+
+@pytest.mark.asyncio
+async def test_T25_enter_text_falls_back_to_args_text_when_no_value_source() -> None:
+    """T25 (PER-143): when the LLM picks ``action=enter_text`` with
+    ``value_source=none``, the worker types the literal from
+    ``action_args.text``. This is the path for free-form text the model
+    invents on the spot (search queries, notes) where there's no
+    workspace-resolved value to defer to."""
+    controller = FakeController()
+    llm = FakeLLMClient(
+        responses=[
+            _decision(
+                action="enter_text",
+                element_id="phone_field",
+                element_label="Search",
+                value_source="none",
+                value_literal=None,
+                action_args={"text": "Hello, мир"},
+            ),
+            _decision(done=True, reason="typed"),
+        ]
+    )
+    runner = _make_runner(controller, llm, test_data={})
+    ok, _reason = await runner._run_goal_node(
+        scenario_id="t25",
+        step_idx=0,
+        data={"description": "Введи приветствие", "max_steps": 5},
+        node_id="g1",
+    )
+    assert ok is True
+    assert controller.typed_text == ["Hello, мир"], (
+        f"typed_text={controller.typed_text!r} — expected ['Hello, мир']"
+    )
+
+
+@pytest.mark.asyncio
+async def test_T27_tap_at_points_passthrough() -> None:
+    """T27 (PER-145 L1): tap_at_coord_space='points' (default, Gemma
+    family) — worker passes (x, y) straight through to AXe.
+
+    iPhone 17 Pro Max device dims: 440 × 956 points. Model emits 220,
+    480 (roughly screen centre in points). AXe gets the same values.
+    """
+    controller = FakeController()
+    llm = FakeLLMClient(responses=[_decision(done=True)])
+    runner = _make_runner(controller, llm)  # tap_at_coord_space defaults to "points"
+    await runner._dispatch(
+        "tap_at", "", "",
+        element_id=None,
+        action_args={"x": 220, "y": 480},
+    )
+    assert controller.tap_at_calls == [(220, 480)], (
+        f"points passthrough broken: {controller.tap_at_calls!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_T28_tap_at_normalized_1000_scaling() -> None:
+    """T28 (PER-145 L1): Qwen2.5/3-VL emits coordinates in 0–1000
+    normalized space (the ``{"point_2d": [x, y]}`` convention). Worker
+    must scale to actual screen points before calling AXe.
+
+    Test case: model says (500, 500) — that's screen centre on the
+    Qwen normalized grid. For 440 × 956 device, AXe should receive
+    (220, 478). Regression check against pixel/point confusion that
+    sank the Qwen 2.5-VL smoke run.
+    """
+    controller = FakeController()  # 440 × 956 default
+    llm = FakeLLMClient(responses=[_decision(done=True)])
+    runner = _make_runner(controller, llm, tap_at_coord_space="normalized_1000")
+    await runner._dispatch(
+        "tap_at", "", "",
+        element_id=None,
+        action_args={"x": 500, "y": 500},
+    )
+    # 500/1000 × 440 = 220; 500/1000 × 956 = 478
+    assert controller.tap_at_calls == [(220, 478)], (
+        f"normalized scaling broken: {controller.tap_at_calls!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_T29_tap_at_pixels_to_points_scaling() -> None:
+    """T29 (PER-145 L1): Nemotron-style — model emits raw retina
+    pixels (1320 × 2868 on iPhone 17 Pro Max @ 3.0×). Worker divides
+    by device scale to land in AXe's point space.
+
+    Test case: model says (500, 1100) — out of screen in points but
+    plausible in pixels. After /3.0 scale → (167, 367) in points,
+    which is in-bounds.
+    """
+    controller = FakeController()  # 440 × 956 @ 3.0×
+    llm = FakeLLMClient(responses=[_decision(done=True)])
+    runner = _make_runner(controller, llm, tap_at_coord_space="pixels")
+    await runner._dispatch(
+        "tap_at", "", "",
+        element_id=None,
+        action_args={"x": 500, "y": 1100},
+    )
+    # 500/3.0 = 166.7 → 167; 1100/3.0 = 366.7 → 367
+    assert controller.tap_at_calls == [(167, 367)], (
+        f"pixel scaling broken: {controller.tap_at_calls!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_T26_enter_text_fails_when_no_text_anywhere() -> None:
+    """T26 (PER-143): enter_text with neither value_source-resolved
+    value nor inline args.text returns a soft failure rather than
+    silently typing an empty string. The model sees the failure in
+    history and can correct course on the next step."""
+    controller = FakeController()
+    llm = FakeLLMClient(
+        responses=[
+            _decision(
+                action="enter_text",
+                element_id="phone_field",
+                element_label="Phone",
+                value_source="none",
+                value_literal=None,
+                action_args={},  # no text
+            ),
+            _decision(done=True, reason="giving up"),
+        ]
+    )
+    runner = _make_runner(controller, llm, test_data={})
+    ok, _reason = await runner._run_goal_node(
+        scenario_id="t26",
+        step_idx=0,
+        data={"description": "что-то ввести", "max_steps": 5},
+        node_id="g1",
+    )
+    # Goal still completed because we ran another decision with done=True.
+    assert ok is True
+    # But controller wasn't asked to type anything — the soft failure
+    # short-circuited type_text.
+    assert controller.typed_text == []
