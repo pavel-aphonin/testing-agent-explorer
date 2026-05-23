@@ -38,7 +38,11 @@ from typing import Any
 
 import httpx
 
-from explorer.axe_client import has_loading_indicator, screen_fingerprint
+from explorer.axe_client import (
+    has_loading_indicator,
+    screen_fingerprint,
+    screen_fingerprint_structural,
+)
 from explorer.expression import ExprError, evaluate as eval_expr
 from explorer.goal_schema import (
     build_actions_block,
@@ -1343,6 +1347,35 @@ class ScenarioRunner:
         # in history whether each action actually changed anything.
         # ``None`` until the first iteration completes.
         last_pre_fingerprint: str | None = None
+        # PER-161: algorithmic quick wins (Fastbot2 / AutoDroid / LLMDroid).
+        #
+        # ``visited_actions[structural_fp]`` — set of (action, element_id)
+        # already executed (and succeeded) on this logical screen. We
+        # surface it in the user-prompt history block so the model
+        # doesn't keep retrying the same dead-end on the same screen.
+        # Keyed by *structural* fingerprint (label-free) so a balance
+        # card with a different ₽ number is still recognised as the
+        # same screen.
+        #
+        # ``plateau_window`` — last N structural fingerprints. If the
+        # window contains 0 fingerprints we haven't seen before, the
+        # goal is making no progress in screen-coverage terms and we
+        # cut it short with ``coverage_plateau`` rather than burning
+        # the rest of max_steps.
+        #
+        # ``seen_fingerprints`` — running set of every structural
+        # fingerprint visited during this goal. Counted against the
+        # plateau window.
+        #
+        # ``backtrack_stack`` — chronological list of structural
+        # fingerprints visited in this goal. When the current screen
+        # is fully explored (visited_actions covers every interactive
+        # element id on it), we synthesize a ``back`` so the agent
+        # leaves rather than spamming the LLM for "one more action".
+        visited_actions: dict[str, set[tuple[str, str | None]]] = {}
+        seen_fingerprints: set[str] = set()
+        plateau_window: deque[str] = deque(maxlen=10)
+        backtrack_stack: list[str] = []
 
         for inner_step in range(max_steps):
             # 1. Read the current screen. Both representations matter:
@@ -1399,6 +1432,42 @@ class ScenarioRunner:
                 )
             last_pre_fingerprint = current_fingerprint
 
+            # PER-161: structural fingerprint (label-free) for
+            # visited_actions / plateau / backtrack. Labels can carry
+            # rolling counters (balance, timestamps, message count)
+            # that bump screen_fingerprint without us really being on
+            # a new screen — structural ignores those.
+            structural_fp = screen_fingerprint_structural(elements)
+            is_new_screen = structural_fp not in seen_fingerprints
+            seen_fingerprints.add(structural_fp)
+            # plateau_window records True for "a screen we'd never
+            # seen before in this goal", False for revisits. When the
+            # window is full and contains no True → no new screens
+            # for ``window.maxlen`` steps → coverage plateau.
+            plateau_window.append(structural_fp if is_new_screen else None)
+            if not backtrack_stack or backtrack_stack[-1] != structural_fp:
+                backtrack_stack.append(structural_fp)
+
+            # Plateau guard. Cheap, runs every step. The 10-step
+            # window mirrors the LLMDroid paper's escalation
+            # threshold; small enough that we don't waste many turns,
+            # large enough that one slow LLM decision (where the
+            # screen happens not to change) doesn't trip it.
+            if (
+                len(plateau_window) == plateau_window.maxlen
+                and all(entry is None for entry in plateau_window)
+            ):
+                logger.warning(
+                    "[goal] coverage plateau: 0 new screens in last %d "
+                    "steps; aborting goal early",
+                    plateau_window.maxlen,
+                )
+                last_reason = (
+                    f"coverage_plateau: 0 new screens in last "
+                    f"{plateau_window.maxlen} steps"
+                )
+                break
+
             screenshot_b64: str | None = None
             take_screenshot_fn = getattr(self.controller, "take_screenshot", None)
             # PER-138: skip the screenshot entirely when the model's
@@ -1422,6 +1491,14 @@ class ScenarioRunner:
                     )
                     screenshot_b64 = None
 
+            # PER-161: assemble a "уже пробовали на этом экране" hint
+            # from visited_actions for the current screen. Empty when
+            # no successful action has run on this screen yet (first
+            # visit or all attempts failed).
+            visited_summary = self._format_visited_actions(
+                visited_actions.get(structural_fp, set())
+            )
+
             # 2. Ask the LLM what to do (or whether we're done).
             decision = await self._goal_decide(
                 goal_text=goal_text,
@@ -1437,6 +1514,7 @@ class ScenarioRunner:
                 actions_block=actions_block,
                 test_data_block=test_data_block,
                 screenshot_b64=screenshot_b64,
+                visited_summary=visited_summary,
             )
             if decision is None:
                 last_reason = "llm_no_decision"
@@ -1527,6 +1605,16 @@ class ScenarioRunner:
                 + (" [OK]" if ok else f" [FAIL: {reason}]")
             )
             last_reason = reason
+
+            # PER-161: remember what we've successfully tried on this
+            # screen so the next turn's prompt can warn the model
+            # away from it. Only record successful actions — a failed
+            # try might genuinely deserve a retry on a different
+            # element (e.g. after the keyboard finally opens).
+            if ok:
+                visited_actions.setdefault(structural_fp, set()).add(
+                    (action, element_id)
+                )
 
             # Anti-loop check #1: if the same (action, element_id,
             # value_source) failed `recent_attempts.maxlen` times in
@@ -1772,6 +1860,28 @@ class ScenarioRunner:
         # surface upstream rather than mask here.
         return (m.group(1) or "").strip()
 
+    @staticmethod
+    def _format_visited_actions(
+        visited: set[tuple[str, str | None]],
+    ) -> str:
+        """PER-161: render visited_actions for the current screen as
+        a one-line «уже пробовали» note. Empty string when nothing
+        has been tried yet — caller skips the section then.
+
+        Sorted output keeps the prompt diff-stable run-to-run (cache
+        hits in llama.cpp), avoiding spurious re-encodes when the set
+        order shuffles.
+        """
+        if not visited:
+            return ""
+        parts: list[str] = []
+        for action, element_id in sorted(visited):
+            if element_id:
+                parts.append(f"{action} «{element_id}»")
+            else:
+                parts.append(action)
+        return ", ".join(parts)
+
     async def _goal_decide(
         self,
         *,
@@ -1788,6 +1898,7 @@ class ScenarioRunner:
         actions_block: str,
         test_data_block: str,
         screenshot_b64: str | None = None,
+        visited_summary: str = "",
     ) -> dict[str, Any] | None:
         """One LLM round for a goal node (PER-111 v2).
 
@@ -1817,6 +1928,15 @@ class ScenarioRunner:
             )
             if history else "  (пока ничего)"
         )
+        # PER-161: prepend visited_actions when present. The LLM
+        # already reads history; tucking the note in at the top of
+        # the same block keeps the prompt template stable (no new
+        # placeholder) and the model picks it up without retraining.
+        if visited_summary:
+            history_block = (
+                f"  (на этом экране уже пробовали: {visited_summary})\n"
+                + history_block
+            )
 
         test_data_keys = list(self.test_data.keys())
         schema = build_goal_schema(

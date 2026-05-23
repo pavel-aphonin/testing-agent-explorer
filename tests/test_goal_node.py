@@ -1335,3 +1335,143 @@ async def test_T32_input_fails_clearly_when_keyboard_never_appears() -> None:
     # And the dispatcher did NOT silently fall through to the bypass.
     assert controller.set_text_calls == []
     assert controller.typed_text == []
+
+
+def test_T33_structural_fingerprint_ignores_labels() -> None:
+    """T33 (PER-161): the structural fingerprint is label-free.
+    Two screens whose layout is identical but whose labels differ
+    (rolling balance, message count, "1 unread" vs "2 unread") must
+    hash to the same structural id — otherwise visited_actions and
+    the coverage plateau detector see every counter-tick as a brand-
+    new screen and lose their memory."""
+    from explorer.axe_client import (
+        screen_fingerprint,
+        screen_fingerprint_structural,
+    )
+
+    base = [
+        {
+            "kind": "AXStaticText",
+            "label": "Баланс: 100 000 ₽",
+            "frame": {"x": 10, "y": 100, "width": 200, "height": 40},
+        },
+        {
+            "kind": "AXButton",
+            "label": "Перевод",
+            "frame": {"x": 10, "y": 200, "width": 100, "height": 40},
+        },
+    ]
+    same_layout_different_text = [
+        {
+            "kind": "AXStaticText",
+            "label": "Баланс: 200 000 ₽",  # ← different label
+            "frame": {"x": 10, "y": 100, "width": 200, "height": 40},
+        },
+        {
+            "kind": "AXButton",
+            "label": "Перевод",
+            "frame": {"x": 10, "y": 200, "width": 100, "height": 40},
+        },
+    ]
+    # PER-127 fingerprint distinguishes the two (it includes label):
+    assert (
+        screen_fingerprint(base)
+        != screen_fingerprint(same_layout_different_text)
+    )
+    # PER-161 structural fingerprint collapses them:
+    assert (
+        screen_fingerprint_structural(base)
+        == screen_fingerprint_structural(same_layout_different_text)
+    )
+    # And it still distinguishes screens with actually different layouts.
+    moved = [
+        {**base[0], "frame": {"x": 10, "y": 300, "width": 200, "height": 40}},
+        base[1],
+    ]
+    assert (
+        screen_fingerprint_structural(base)
+        != screen_fingerprint_structural(moved)
+    )
+
+
+@pytest.mark.asyncio
+async def test_T34_visited_actions_appears_in_history_block() -> None:
+    """T34 (PER-161): after a successful action on a screen, the
+    NEXT goal-decide call sees an "уже пробовали на этом экране" hint
+    in the user prompt's history block. That's how visited_actions
+    propagates into the LLM context to break "tap the same button
+    forever" loops without needing a structural prompt rewrite."""
+    controller = FakeController()
+    llm = FakeLLMClient(
+        responses=[
+            _decision(
+                action="tap",
+                element_id="submit_btn",
+                element_label="Зайти",
+                value_source="none",
+            ),
+            _decision(done=True, reason="ok"),
+        ]
+    )
+    runner = _make_runner(controller, llm, test_data={})
+    ok, _ = await runner._run_goal_node(
+        scenario_id="t34", step_idx=0,
+        data={"description": "Зайти", "max_steps": 3}, node_id="g1",
+    )
+    assert ok is True
+    # llm.calls[1] is the second goal_decide (after the successful
+    # tap). Its user prompt must mention the visited hint.
+    assert len(llm.calls) >= 2
+    second_user = llm.calls[1]["user"]
+    assert "уже пробовали" in second_user, (
+        f"expected visited hint in 2nd prompt, got: {second_user[:400]}..."
+    )
+    assert "tap" in second_user and "submit_btn" in second_user
+
+
+@pytest.mark.asyncio
+async def test_T35_plateau_detector_breaks_goal_after_no_new_screens() -> None:
+    """T35 (PER-161): when the agent revisits known screens for
+    ``plateau_window`` consecutive steps without discovering any new
+    structural fingerprint, the goal aborts with reason
+    ``coverage_plateau`` instead of burning all max_steps. Mirrors
+    LLMDroid's escalation trigger.
+
+    The default window is 10. We script decisions whose action/id
+    tuples vary enough to dodge the 6-step oscillation guard
+    (otherwise that fires first), but whose effects leave the
+    FakeController's element list unchanged — so structural_fp
+    never moves and every plateau-window entry is a revisit."""
+    controller = FakeController()
+    # Cycle through 4 distinct (action, element_id) pairs so the
+    # 6-step oscillation guard sees >2 unique tuples and stays
+    # quiet. None of these change FakeController's elements, so
+    # structural_fp stays constant.
+    cycle = [
+        _decision(action="tap", element_id="submit_btn",
+                  element_label="Зайти", value_source="none"),
+        _decision(action="tap", element_id="phone_field",
+                  element_label="Введите телефон", value_source="none"),
+        _decision(action="swipe", action_args={"direction": "down"},
+                  element_id=None, element_label=None,
+                  value_source="none"),
+        _decision(action="scroll", action_args={"direction": "down"},
+                  element_id=None, element_label=None,
+                  value_source="none"),
+    ]
+    responses = (cycle * 4)[:12]
+    llm = FakeLLMClient(responses=responses)
+    runner = _make_runner(controller, llm, test_data={})
+    runner._settle_timeout_ms = 0  # skip settle for speed
+    ok, reason = await runner._run_goal_node(
+        scenario_id="t35", step_idx=0,
+        data={"description": "крутись на месте", "max_steps": 12},
+        node_id="g1",
+    )
+    # Goal aborted with the right reason.
+    assert ok is False
+    assert reason is not None and "coverage_plateau" in reason, reason
+    # Triggered around step 10 (window size) — well before 12.
+    assert len(llm.calls) <= 11, (
+        f"plateau guard did not fire in time: {len(llm.calls)} calls"
+    )

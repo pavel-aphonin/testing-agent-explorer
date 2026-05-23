@@ -98,6 +98,48 @@ def screen_fingerprint(elements: list[dict]) -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
+def screen_fingerprint_structural(elements: list[dict]) -> str:
+    """PER-161: label-free structural fingerprint of a screen.
+
+    Like :func:`screen_fingerprint` but drops every text label from
+    the projection — keeps only kind + frame. Two screens that
+    differ ONLY in labels (e.g. balance card showing
+    «100 000 ₽» vs «200 000 ₽», a list of transactions with rolling
+    timestamps, an inbox with new message counts) hash to the same
+    structural id.
+
+    Why a second function instead of always-strip in the original:
+
+    * ``screen_fingerprint`` is the right "did the screen change"
+      signal for the in-step `wait` / `OK-but-no-change` markers —
+      we WANT it to notice that a counter ticked.
+    * ``screen_fingerprint_structural`` is the right "is this the
+      same logical screen" signal for visited_actions / plateau
+      tracking — we don't want every counter-tick to look like a
+      new screen and reset the agent's memory of what it's tried.
+
+    Both stay stable across AXe traversal order (sorted) and across
+    AXValue changes (already ignored).
+    """
+    parts: list[str] = []
+    for el in elements or []:
+        if not isinstance(el, dict):
+            continue
+        kind = (el.get("kind") or el.get("type") or "") or ""
+        frame = el.get("frame") or {}
+        try:
+            x = int(frame.get("x", 0) or 0)
+            y = int(frame.get("y", 0) or 0)
+            w = int(frame.get("width", 0) or 0)
+            h = int(frame.get("height", 0) or 0)
+        except (TypeError, ValueError):
+            x, y, w, h = 0, 0, 0, 0
+        parts.append(f"{kind}|{x}|{y}|{w}|{h}")
+    parts.sort()
+    blob = "\n".join(parts).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
 def has_loading_indicator(
     elements: list[dict], keywords: list[str] | None,
 ) -> bool:
