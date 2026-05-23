@@ -267,6 +267,14 @@ class RealExecutor:
         device_type = config.get("device_type")
         os_version = config.get("os_version")
         app_file_path = config.get("app_file_path")
+        # PER-162: if the run was created with a baseline UDID, we
+        # clone that pre-configured sim instead of creating fresh
+        # and reinstalling the app. The baseline is operator-managed:
+        # they boot it once, log into the app, dismiss onboarding,
+        # grant permissions — every clone starts in that authorised
+        # state. Mutually exclusive with the create+install path
+        # below (clone wins when both are set).
+        baseline_udid = config.get("baseline_udid")
 
         uploads_base = os.environ.get(
             "TA_APP_UPLOADS_DIR",
@@ -276,7 +284,46 @@ class RealExecutor:
             ),
         )
 
-        if device_type and os_version:
+        if baseline_udid:
+            from explorer.simulator import IOSSimulatorManager
+
+            try:
+                await event_sink({
+                    "type": "log", "step_idx": 0,
+                    "message": f"Cloning baseline simulator {baseline_udid[:8]}…",
+                })
+                # The constructor wants device/runtime identifiers, but
+                # clone_from doesn't actually use them — it copies the
+                # source's. Pass empty strings to satisfy the signature.
+                sim_manager = IOSSimulatorManager("", "")
+                device_id = await sim_manager.clone_from(baseline_udid, run_id)
+                await event_sink({
+                    "type": "log", "step_idx": 0,
+                    "message": f"Booting clone {device_id}…",
+                })
+                await sim_manager.boot()
+                # Skip install (app is already in the clone) and skip
+                # launch (the baseline was logged in — the app may
+                # already be in the foreground, and re-launching can
+                # tear the session). Worker still emits the same
+                # downstream events so the UI timeline looks normal.
+                await event_sink({
+                    "type": "log", "step_idx": 0,
+                    "message": "Clone ready in authorised state",
+                })
+            except Exception as exc:
+                logger.exception(
+                    "Baseline clone failed for run %s (baseline=%s)",
+                    run_id, baseline_udid,
+                )
+                if sim_manager:
+                    try:
+                        await sim_manager.cleanup()
+                    except Exception:
+                        logger.exception("Clone cleanup also failed")
+                raise RuntimeError(f"Baseline clone failed: {exc}") from exc
+
+        elif device_type and os_version:
             from explorer.simulator import (
                 AndroidEmulatorManager,
                 IOSSimulatorManager,

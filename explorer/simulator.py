@@ -80,6 +80,47 @@ class IOSSimulatorManager:
         logger.info("Created iOS simulator %s (udid=%s)", self._name, self.udid)
         return self.udid
 
+    async def clone_from(self, baseline_udid: str, run_id: str) -> str:
+        """PER-162: clone a pre-configured baseline simulator.
+
+        ``xcrun simctl clone`` produces a brand-new simulator with a
+        fresh UDID but copies the source's keychain, NSUserDefaults
+        and Application Support tree — including the installed app
+        and any session it had open. The operator pre-configures the
+        baseline manually (boots a sim, installs the app, taps
+        through onboarding, logs in, grants permissions), then every
+        clone starts in the authorised zone. No fresh login flow per
+        run, no anti-fraud bans on banking apps that lock devices
+        after N failed login attempts, and post-login scenarios
+        (transfers, history, profile) actually reach the screens
+        they're supposed to test.
+
+        Requires the source UDID to be **shut down** (simctl
+        requirement). Worker pre-shuts it via the simulator-bridge
+        before issuing claim_next; we double-check here so a
+        forgotten ``simctl boot baseline`` doesn't surface as a
+        cryptic Cocoa error.
+        """
+        self._name = f"TA-{run_id[:8]}"
+        # Belt-and-suspenders: shutdown is idempotent on
+        # already-stopped sims, so this is safe even when the source
+        # is cold.
+        try:
+            await _exec(
+                "xcrun", "simctl", "shutdown", baseline_udid, timeout=10.0,
+            )
+        except Exception:
+            pass
+        self.udid = await _exec(
+            "xcrun", "simctl", "clone", baseline_udid, self._name,
+            timeout=120.0,  # cloning a 3-5 GB sim takes a while
+        )
+        logger.info(
+            "Cloned baseline %s → %s (udid=%s)",
+            baseline_udid, self._name, self.udid,
+        )
+        return self.udid
+
     async def boot(self) -> None:
         assert self.udid
         await _exec("xcrun", "simctl", "boot", self.udid, timeout=30.0)
