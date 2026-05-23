@@ -309,7 +309,15 @@ class AXeExplorerClient:
         return TapResult()
 
     async def type_text(self, text: str) -> bool:
-        """Type text via CDP (RN dev) or AXe HID (fallback)."""
+        """Type text via CDP (RN dev) or AXe HID (fallback).
+
+        Used by the older ``input`` dispatch path and by free-form
+        ``enter_text`` action. The CDP shortcut writes the value
+        directly into the React tree — fast but **bypasses native
+        keyboard events** (no onChange). For tests that need to
+        validate the real user keyboard path use
+        :meth:`type_text_via_hid` instead (see PER-160).
+        """
         # Try CDP first if we know what field is focused
         if self._cdp_available and self._cdp:
             if self._last_focused_test_id:
@@ -336,10 +344,100 @@ class AXeExplorerClient:
             return False
         return True
 
+    async def type_text_via_hid(self, text: str) -> bool:
+        """PER-160: keyboard-typing path that never touches CDP.
+
+        Always goes through AXe HID ``type`` — same hardware keyboard
+        events a real user keystroke produces. Triggers React
+        ``onChange``/``onInput`` and any native ``UITextField``
+        delegate callbacks. Use this whenever the test needs to
+        validate the **user-visible** keyboard path: ``input`` action
+        defaults here so the agent finds keyboard-specific bugs
+        (overlay covering field, broken handler, missing IME) that
+        CDP-injection silently hides.
+        """
+        if not text:
+            return True
+        code, _, err = await _run(
+            [AXE, "type", text, "--udid", self._udid], timeout=30
+        )
+        if code != 0:
+            logger.warning("type_text_via_hid failed: %s", err[:120])
+            return False
+        return True
+
+    async def wait_for_keyboard(self, timeout_ms: int = 2000) -> bool:
+        """PER-160: poll the AX-tree until an on-screen keyboard appears.
+
+        Returns True as soon as any element with ``type`` containing
+        ``Keyboard`` shows up. False on timeout. Used right after
+        tapping an input field to make sure the OS keyboard is up
+        before we start sending HID keystrokes — otherwise the first
+        few characters land on whatever was focused before.
+        """
+        import time as _time
+        deadline = _time.monotonic() + (timeout_ms / 1000.0)
+        poll_ms = 100
+        while _time.monotonic() < deadline:
+            elems = await self.get_ui_elements()
+            for el in elems:
+                kind = (el.get("type") or el.get("kind") or "")
+                if "Keyboard" in kind:
+                    return True
+            await asyncio.sleep(poll_ms / 1000.0)
+        return False
+
+    async def tap_field_and_type_via_keyboard(
+        self,
+        test_id: str | None,
+        label: str | None,
+        text: str,
+        wait_keyboard_ms: int = 2000,
+    ) -> tuple[bool, str | None]:
+        """PER-160: high-level «как живой пользователь» input.
+
+        1. Tap the input field (by test_id, else by label) so iOS
+           focuses it and brings up the keyboard.
+        2. Wait until ``XCUIElementTypeKeyboard`` is in the AX-tree.
+        3. Type the text via AXe HID — native key events.
+
+        Returns ``(ok, reason)``. Failures get a specific reason
+        (``"tap failed"`` / ``"keyboard did not appear"`` /
+        ``"type_text_via_hid returned False"``) so the dispatcher can
+        propagate it into the LLM's history without guessing.
+        """
+        if test_id:
+            tap = await self.tap_by_id(test_id)
+        elif label:
+            tap = await self.tap_by_label(label)
+        else:
+            return False, "no test_id or label to tap"
+        if not getattr(tap, "ok", True):
+            return False, f"tap failed: {getattr(tap, 'error', None) or 'unknown'}"
+        # Cache focus hint so anything that falls back to type_text
+        # (e.g. legacy code) still knows where it lives.
+        if test_id:
+            self._last_focused_test_id = test_id
+        if label:
+            self._last_focused_label = label
+        ready = await self.wait_for_keyboard(wait_keyboard_ms)
+        if not ready:
+            return False, "keyboard did not appear after tap"
+        ok = await self.type_text_via_hid(text)
+        return ok, None if ok else "type_text_via_hid returned False"
+
     async def set_text_in_field(
         self, test_id: str | None, label: str | None, text: str
     ) -> bool:
-        """High-level: set text in a specific field. Uses CDP if available."""
+        """High-level: set text in a specific field. Uses CDP if available.
+
+        PER-160: This is the **bypass** path — fast, but writes value
+        directly through React/CDP without surfacing the keyboard.
+        Used only when the caller explicitly opts in via
+        ``action_args.bypass_keyboard=True``. Default ``input``
+        dispatch now routes through
+        :meth:`tap_field_and_type_via_keyboard` instead.
+        """
         if self._cdp_available and self._cdp:
             if test_id:
                 ok = await self._cdp.set_text_by_test_id(test_id, text)

@@ -2134,6 +2134,33 @@ class ScenarioRunner:
         if action == "input":
             test_id = element.get("test_id") or element.get("identifier")
             elem_label = element.get("label") or label or ""
+            # PER-160: the user-facing path. Tap the field so iOS brings
+            # up the keyboard, wait until it is on-screen, then send
+            # HID keystrokes — same code path a real fingertip takes.
+            # This is the only way to find keyboard-related bugs
+            # (overlay covering field, broken onChange handler, missing
+            # custom keyboard, anti-fraud rejecting non-native input)
+            # and the only way React/iOS state updates correctly on
+            # apps that listen to UIControlEventEditingChanged rather
+            # than reading the field value at submit-time.
+            #
+            # Strict opt-out: ``action_args.bypass_keyboard=true`` keeps
+            # the old set_text_in_field path for the rare cases where
+            # the keyboard genuinely cannot be brought up (custom IME,
+            # canvas-rendered field, headless flow).
+            bypass = bool(args.get("bypass_keyboard"))
+            kbd_fn = getattr(
+                self.controller, "tap_field_and_type_via_keyboard", None
+            )
+            if not bypass and callable(kbd_fn) and (test_id or elem_label):
+                ok, reason = await kbd_fn(test_id, elem_label, value)
+                return bool(ok), None if ok else (
+                    reason or "keyboard input returned False"
+                )
+            # Bypass / legacy path — write the value through CDP or
+            # AXe set-text. Faster, but does NOT trigger native input
+            # events. See PER-160 for why this is opt-in now.
+            #
             # The real AXe controller's signature is
             # set_text_in_field(test_id, label, text) — three args.
             # The test FakeController uses two (test_id, text). Resolve

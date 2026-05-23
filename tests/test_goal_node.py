@@ -86,6 +86,15 @@ class FakeController:
     _height: int = 956
     _scale: float = 3.0
     tap_at_calls: list[tuple[int, int]] = field(default_factory=list)
+    # PER-160: keyboard-typing path the dispatcher uses by default
+    # for the ``input`` action. Records (test_id, label, text) so we
+    # can assert the agent went through the user-facing flow rather
+    # than the CDP bypass. ``keyboard_unavailable`` flips the helper
+    # into a failure mode (tap succeeded, keyboard never showed).
+    keyboard_calls: list[tuple[str | None, str | None, str]] = field(
+        default_factory=list
+    )
+    keyboard_unavailable: bool = False
 
     async def get_ui_elements(self) -> list[dict]:
         return list(self.elements)
@@ -113,6 +122,24 @@ class FakeController:
     async def type_text(self, value: str) -> bool:
         self.typed_text.append(value)
         return True
+
+    async def tap_field_and_type_via_keyboard(
+        self,
+        test_id: str | None,
+        label: str | None,
+        text: str,
+        wait_keyboard_ms: int = 2000,
+    ) -> tuple[bool, str | None]:
+        """PER-160 keyboard-typing path. Records the call; honours
+        ``keyboard_unavailable`` to simulate ``keyboard did not appear``
+        scenarios."""
+        self.keyboard_calls.append((test_id, label, text))
+        if self.keyboard_unavailable:
+            return False, "keyboard did not appear after tap"
+        # Mirror real behaviour: the typed string also ends up in
+        # ``typed_text`` so smoke-style assertions keep working.
+        self.typed_text.append(text)
+        return True, None
 
 
 @dataclass
@@ -251,7 +278,13 @@ async def test_T1_uses_test_data_phone_value() -> None:
         node_id="g1",
     )
     assert ok is True
-    assert controller.set_text_calls == [("phone_field", "+79051543055")]
+    # PER-160: input now defaults to keyboard-typing path. Tuple is
+    # (test_id, label, text); both old and new paths must end with
+    # the typed value in ``typed_text``.
+    assert controller.keyboard_calls == [
+        ("phone_field", "Введите телефон", "+79051543055")
+    ]
+    assert "+79051543055" in controller.typed_text
 
 
 @pytest.mark.asyncio
@@ -322,7 +355,8 @@ async def test_T3_goal_literal_typed_verbatim() -> None:
         data={"description": "Введи 1000", "max_steps": 5}, node_id="g1",
     )
     assert ok is True
-    assert controller.set_text_calls == [("amount", "1000")]
+    # PER-160: keyboard path is now default. (test_id, label, text)
+    assert controller.keyboard_calls == [("amount", "Сумма", "1000")]
 
 
 @pytest.mark.asyncio
@@ -370,10 +404,12 @@ async def test_T4_improvised_value_remembered_across_steps() -> None:
         data={"description": "Придумай имя", "max_steps": 5}, node_id="g1",
     )
     assert ok is True
-    assert controller.set_text_calls == [
-        ("name", "Тестовая 1"),
-        ("name", "Тестовая 1"),
-    ]
+    # PER-160: keyboard path is default. Two identical inputs (model
+    # remembers the improvised value across steps) → two keyboard calls.
+    assert len(controller.keyboard_calls) == 2
+    for call in controller.keyboard_calls:
+        assert call[0] == "name"
+        assert call[2] == "Тестовая 1"
 
 
 @pytest.mark.asyncio
@@ -452,8 +488,10 @@ async def test_T7_improvised_phone_returns_plausible_value() -> None:
     )
     assert ok is True
     # Worker typed exactly what the LLM invented — no normalization,
-    # no skip, no crash.
-    assert controller.set_text_calls == [("phone_field", invented)]
+    # no skip, no crash. PER-160: now via keyboard path by default.
+    assert controller.keyboard_calls == [
+        ("phone_field", "Введите телефон", invented)
+    ]
 
 
 @pytest.mark.asyncio
@@ -513,7 +551,10 @@ async def test_T9_workspace_agnostic_key_iban() -> None:
         data={"description": "Введи IBAN", "max_steps": 5}, node_id="g1",
     )
     assert ok is True
-    assert controller.set_text_calls == [("iban", "DE89370400440532013000")]
+    # PER-160: keyboard path default.
+    assert controller.keyboard_calls == [
+        ("iban", "IBAN", "DE89370400440532013000")
+    ]
 
 
 @pytest.mark.asyncio
@@ -663,15 +704,28 @@ async def test_T16_anti_loop_breaks_after_three_identical_failures() -> None:
     the demo regression where Gemma 4 repeated the same input 15
     times because the FAIL marker in history was "advisory" to it."""
 
-    # FakeController whose set_text_in_field ALWAYS returns False —
-    # simulates the broken-input situation on the real sim where AXe
-    # set_text failed for every attempt.
+    # FakeController where every input attempt fails. PER-160: the
+    # primary path is tap_field_and_type_via_keyboard, but we keep
+    # set_text_in_field broken too in case some test path falls
+    # through (or someone removes the keyboard override). Both must
+    # report failure so the anti-loop guard sees three consecutive
+    # `ok=False` ticks and trips at step 3.
     class _FailingController(FakeController):
         async def set_text_in_field(
             self, test_id: str, value: str
         ) -> bool:
             self.set_text_calls.append((test_id, value))
             return False
+
+        async def tap_field_and_type_via_keyboard(
+            self,
+            test_id: str | None,
+            label: str | None,
+            text: str,
+            wait_keyboard_ms: int = 2000,
+        ) -> tuple[bool, str | None]:
+            self.keyboard_calls.append((test_id, label, text))
+            return False, "set_text_in_field returned False"
 
     controller = _FailingController()
     # Script 10 identical failing inputs — anti-loop should bite at
@@ -698,9 +752,10 @@ async def test_T16_anti_loop_breaks_after_three_identical_failures() -> None:
     assert ok is False
     assert reason is not None and "stuck_loop" in reason
     # Anti-loop triggers after 3 failures, so exactly 3 LLM calls and
-    # 3 set_text attempts — not 10.
+    # 3 input attempts — not 10. PER-160: counts the keyboard path
+    # (primary) since that's what the dispatcher uses now.
     assert len(llm.calls) == 3
-    assert len(controller.set_text_calls) == 3
+    assert len(controller.keyboard_calls) == 3
 
 
 @pytest.mark.asyncio
@@ -1158,4 +1213,125 @@ async def test_T26_enter_text_fails_when_no_text_anywhere() -> None:
     assert ok is True
     # But controller wasn't asked to type anything — the soft failure
     # short-circuited type_text.
+    assert controller.typed_text == []
+
+
+@pytest.mark.asyncio
+async def test_T30_input_routes_through_keyboard_by_default() -> None:
+    """T30 (PER-160): the default ``input`` dispatch goes through the
+    user-facing keyboard path. The dispatcher must call
+    ``tap_field_and_type_via_keyboard`` (tap field → wait for keyboard
+    → HID-type), NOT the CDP-style ``set_text_in_field`` bypass.
+
+    Why this matters: bypassing the keyboard hides anti-fraud
+    rejections, keyboard-overlay bugs, broken IME handlers, and
+    React onChange callbacks. The agent only finds those bugs when
+    it types like a real user."""
+    controller = FakeController()
+    llm = FakeLLMClient(
+        responses=[
+            _decision(
+                action="input",
+                element_id="phone_field",
+                element_label="Введите телефон",
+                value_source="test_data.phone",
+            ),
+            _decision(done=True, reason="entered"),
+        ]
+    )
+    runner = _make_runner(
+        controller, llm, test_data={"phone": "+79051543055"}
+    )
+    ok, _reason = await runner._run_goal_node(
+        scenario_id="t30",
+        step_idx=0,
+        data={"description": "Введи телефон {{phone}}", "max_steps": 5},
+        node_id="g1",
+    )
+    assert ok is True
+    # Keyboard path used — record holds (test_id, label, text).
+    assert controller.keyboard_calls == [
+        ("phone_field", "Введите телефон", "+79051543055")
+    ], controller.keyboard_calls
+    # CDP/legacy bypass must NOT have been touched.
+    assert controller.set_text_calls == [], (
+        "regression: dispatcher fell back to set_text_in_field bypass"
+    )
+
+
+@pytest.mark.asyncio
+async def test_T31_input_bypass_keyboard_opt_in_uses_legacy_path() -> None:
+    """T31 (PER-160): when the LLM explicitly sets
+    ``action_args.bypass_keyboard=true`` the dispatcher takes the
+    legacy ``set_text_in_field`` path (CDP/AX inject). Same value
+    arrives in the field, but the keyboard never opens. This is the
+    escape hatch for custom IMEs and canvas-rendered fields where
+    the keyboard physically cannot appear."""
+    controller = FakeController()
+    llm = FakeLLMClient(
+        responses=[
+            _decision(
+                action="input",
+                element_id="phone_field",
+                element_label="Введите телефон",
+                value_source="test_data.phone",
+                action_args={"bypass_keyboard": True},
+            ),
+            _decision(done=True, reason="entered"),
+        ]
+    )
+    runner = _make_runner(
+        controller, llm, test_data={"phone": "+79051543055"}
+    )
+    ok, _reason = await runner._run_goal_node(
+        scenario_id="t31",
+        step_idx=0,
+        data={"description": "Введи телефон {{phone}}", "max_steps": 5},
+        node_id="g1",
+    )
+    assert ok is True
+    # Legacy path used — set_text_in_field got the value.
+    assert controller.set_text_calls == [("phone_field", "+79051543055")]
+    # Keyboard path NOT touched.
+    assert controller.keyboard_calls == []
+
+
+@pytest.mark.asyncio
+async def test_T32_input_fails_clearly_when_keyboard_never_appears() -> None:
+    """T32 (PER-160): if tap succeeds but the on-screen keyboard
+    never shows up within timeout, the dispatcher returns a
+    soft failure with the specific reason
+    ``"keyboard did not appear after tap"``. The LLM sees this in
+    history and can pick a different element / try bypass_keyboard
+    on the next step — better than silently writing zero characters."""
+    controller = FakeController(keyboard_unavailable=True)
+    llm = FakeLLMClient(
+        responses=[
+            _decision(
+                action="input",
+                element_id="phone_field",
+                element_label="Введите телефон",
+                value_source="test_data.phone",
+            ),
+            _decision(done=True, reason="moving on"),
+        ]
+    )
+    runner = _make_runner(
+        controller, llm, test_data={"phone": "+79051543055"}
+    )
+    ok, _reason = await runner._run_goal_node(
+        scenario_id="t32",
+        step_idx=0,
+        data={"description": "Введи телефон {{phone}}", "max_steps": 5},
+        node_id="g1",
+    )
+    # Goal completes (second decision is done=true), but the input
+    # action returned failure for the first step.
+    assert ok is True
+    # Keyboard was attempted exactly once with our value.
+    assert controller.keyboard_calls == [
+        ("phone_field", "Введите телефон", "+79051543055")
+    ]
+    # And the dispatcher did NOT silently fall through to the bypass.
+    assert controller.set_text_calls == []
     assert controller.typed_text == []
