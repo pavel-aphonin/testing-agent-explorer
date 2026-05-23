@@ -2165,10 +2165,22 @@ class ScenarioRunner:
                     "enter_text requires non-empty text "
                     "(set value_source or args.text)"
                 )
-            type_fn = getattr(self.controller, "type_text", None)
-            if not callable(type_fn):
-                return False, "controller has no type_text"
-            typed = await type_fn(text)
+            # PER-160: enter_text was the original "free-form text
+            # into the currently focused field" action, but
+            # ``controller.type_text`` still routes through CDP first
+            # if available — which silently bypasses native input
+            # events the same way set_text_in_field did. Prefer the
+            # HID-only path when the controller exposes one (real AXe
+            # controller does; FakeController in tests does not, hence
+            # the getattr fallback).
+            hid_fn = getattr(self.controller, "type_text_via_hid", None)
+            if callable(hid_fn):
+                typed = await hid_fn(text)
+            else:
+                type_fn = getattr(self.controller, "type_text", None)
+                if not callable(type_fn):
+                    return False, "controller has no type_text or type_text_via_hid"
+                typed = await type_fn(text)
             return bool(typed), None if typed else "type_text returned False"
 
         if action == "wait":

@@ -434,7 +434,7 @@ class AXeExplorerClient:
         test_id: str | None,
         label: str | None,
         text: str,
-        wait_keyboard_ms: int = 2000,
+        wait_keyboard_ms: int = 5000,
     ) -> tuple[bool, str | None]:
         """PER-160: high-level «как живой пользователь» input.
 
@@ -448,6 +448,10 @@ class AXeExplorerClient:
         ``"type_text_via_hid returned False"``) so the dispatcher can
         propagate it into the LLM's history without guessing.
         """
+        logger.info(
+            "[keyboard] tap_field_and_type_via_keyboard test_id=%r label=%r text_len=%d",
+            test_id, label, len(text),
+        )
         if test_id:
             tap = await self.tap_by_id(test_id)
         elif label:
@@ -455,6 +459,10 @@ class AXeExplorerClient:
         else:
             return False, "no test_id or label to tap"
         if not getattr(tap, "ok", True):
+            logger.warning(
+                "[keyboard] tap failed: %s",
+                getattr(tap, "error", None) or "unknown",
+            )
             return False, f"tap failed: {getattr(tap, 'error', None) or 'unknown'}"
         # Cache focus hint so anything that falls back to type_text
         # (e.g. legacy code) still knows where it lives.
@@ -462,10 +470,32 @@ class AXeExplorerClient:
             self._last_focused_test_id = test_id
         if label:
             self._last_focused_label = label
+        # PER-160 follow-up: keyboard detection in iOS 26 AXe output
+        # is inconsistent — when the keyboard is up it sometimes
+        # doesn't show as a separate ``Keyboard``-typed element in
+        # describe-ui, and waiting for it would needlessly fail every
+        # tap that actually worked. So we wait UP TO ``wait_keyboard_ms``
+        # for an explicit signal, but if we don't see one we still
+        # type after a short fixed delay (animation buffer). Worst
+        # case the HID keystrokes land on whatever's focused, which
+        # was just the field we tapped — that's the right field
+        # anyway. Failure mode here is no worse than the old
+        # CDP-bypass path it replaces.
         ready = await self.wait_for_keyboard(wait_keyboard_ms)
         if not ready:
-            return False, "keyboard did not appear after tap"
+            logger.info(
+                "[keyboard] no explicit Keyboard element in AX-tree after "
+                "%d ms — typing anyway with 500ms animation buffer",
+                wait_keyboard_ms,
+            )
+            await asyncio.sleep(0.5)
+        else:
+            logger.info("[keyboard] detected via AX-tree")
         ok = await self.type_text_via_hid(text)
+        if not ok:
+            logger.warning("[keyboard] type_text_via_hid returned False")
+        else:
+            logger.info("[keyboard] type_text_via_hid OK (%d chars)", len(text))
         return ok, None if ok else "type_text_via_hid returned False"
 
     async def set_text_in_field(
