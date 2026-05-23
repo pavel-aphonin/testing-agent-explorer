@@ -1592,8 +1592,32 @@ class ScenarioRunner:
                 )
             except Exception as exc:
                 ok, reason = False, f"crash: {exc}"
+            # PER-163: for coordinate-only actions (``tap_at``) the
+            # element_id the LLM picks is the app root container —
+            # carries no semantics. The real identity of the action
+            # is the (x, y) it tapped. We bucket coordinates to a
+            # 50pt grid so two visually-different taps don't get
+            # collapsed by anti-loop, but micro-jitter (model
+            # generating 670/675/680 for the same logical target)
+            # still groups into one bucket. ``tap_id`` is what we
+            # feed into visited_actions / oscillation_window /
+            # recent_attempts in place of bare element_id.
+            tap_id: str | None = element_id
+            tap_coord_hint = ""
+            if action == "tap_at":
+                _ax = action_args.get("x") if isinstance(action_args, dict) else None
+                _ay = action_args.get("y") if isinstance(action_args, dict) else None
+                try:
+                    _bx = int(_ax) // 50 * 50
+                    _by = int(_ay) // 50 * 50
+                    tap_id = f"@({_bx},{_by})"
+                    tap_coord_hint = f" ({int(_ax)},{int(_ay)})"
+                except (TypeError, ValueError):
+                    pass
+
             history.append(
-                f"{action} «{label or element_id or '?'}»"
+                f"{action} «{label or tap_id or element_id or '?'}»"
+                + tap_coord_hint
                 + (
                     # PER-143: enter_text also benefits from the
                     # resolved-value annotation. Keeps the LLM's history
@@ -1611,16 +1635,19 @@ class ScenarioRunner:
             # away from it. Only record successful actions — a failed
             # try might genuinely deserve a retry on a different
             # element (e.g. after the keyboard finally opens).
+            #
+            # PER-163: use ``tap_id`` (the bucketed coord) for tap_at
+            # so distinct taps don't all hash to (tap_at, app_root).
             if ok:
                 visited_actions.setdefault(structural_fp, set()).add(
-                    (action, element_id)
+                    (action, tap_id)
                 )
 
             # Anti-loop check #1: if the same (action, element_id,
             # value_source) failed `recent_attempts.maxlen` times in
             # a row, the model isn't going to find a way out and the
             # remaining max_steps would just be more of the same.
-            recent_attempts.append((action, element_id, value_source, ok))
+            recent_attempts.append((action, tap_id, value_source, ok))
             if (
                 len(recent_attempts) == recent_attempts.maxlen
                 and all(not entry[3] for entry in recent_attempts)
@@ -1644,7 +1671,10 @@ class ScenarioRunner:
             # actions and won't escape on its own. Mostly catches
             # "tap Войти ↔ tap Back" loops where the model thinks
             # each branch will help but the screen just toggles.
-            oscillation_window.append((action, element_id))
+            # PER-163: bucket the coord into the tuple so two
+            # tap_ats at meaningfully different points don't look
+            # identical here either.
+            oscillation_window.append((action, tap_id))
             if (
                 len(oscillation_window) == oscillation_window.maxlen
                 and len(set(oscillation_window)) <= 2
