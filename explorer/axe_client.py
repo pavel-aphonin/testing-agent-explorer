@@ -571,8 +571,23 @@ class AXeExplorerClient:
 
         Worker reads the per-model passport ``screenshot_max_dim``
         and forwards it; controller stays single-knob.
+
+        PER-163 retry #2: when the caller does not pass ``max_dim``
+        explicitly, the env var ``TA_SCREENSHOT_MAX_DIM`` provides a
+        machine-wide override. That covers the legacy
+        random / explore / llm-loop callers (engine.py, loop.py,
+        llm_loop.py) that don't know about model passports —
+        operator sets the env var when running them in
+        vision-precision mode. Explicit ``max_dim`` argument always
+        wins over the env var, which always wins over the legacy
+        logical-points resize.
         """
+        import os as _os
         import tempfile
+        if max_dim is None:
+            env_dim = _os.environ.get("TA_SCREENSHOT_MAX_DIM", "").strip()
+            if env_dim.isdigit() and int(env_dim) > 0:
+                max_dim = int(env_dim)
         with tempfile.NamedTemporaryFile(
             prefix="axe_shot_", suffix=".png", delete=False
         ) as tf:

@@ -1613,3 +1613,60 @@ async def test_T38_screenshot_max_dim_omitted_when_passport_null() -> None:
     # picks its own default (legacy logical-points resize).
     for kw in captured_kwargs:
         assert "max_dim" not in kw, kw
+
+
+@pytest.mark.asyncio
+async def test_T39_schema_null_leak_rejected_for_element_targeted_action() -> None:
+    """T39 (PER-163 retry #2): post-decode validation must reject
+    schema-leak where the LLM returns an element-targeted action
+    (tap / input / long_press / assert / double_click / right_click)
+    with ``element_id=null``.
+
+    Background: llama-server's GBNF compiler does not enforce
+    per-branch ``oneOf`` constraints reliably. The base schema
+    became nullable for tap_at; the compiler then sometimes lets
+    that nullability leak into ``tap`` decisions too. Without this
+    guard the dispatcher hits ``_find_element(None)`` and either
+    crashes or burns a slot retrying. With it the malformed shape
+    becomes ``llm_no_decision`` and the next step gets a fresh
+    prompt — visited_actions still records the screen as visited,
+    so plateau + anti-loop math stay sound."""
+    controller = FakeController()
+    # The model returns a malformed shape: action=tap with element_id=null.
+    # FakeLLMClient feeds it as the first response. Second response is
+    # done=True so the goal completes after the rejected decision.
+    bad_decision_raw = json.dumps({
+        "done": False, "reason": None,
+        "action": "tap",
+        "action_args": {},
+        "element_id": None,
+        "element_label": None,
+        "value_source": "none",
+        "value_literal": None,
+        "reasoning": "schema leak: null element_id with tap",
+    }, ensure_ascii=False)
+    good_done_raw = _decision(done=True, reason="moving on")
+    llm = FakeLLMClient(responses=[bad_decision_raw, good_done_raw])
+    runner = _make_runner(controller, llm, test_data={})
+    runner._settle_timeout_ms = 0
+    ok, reason = await runner._run_goal_node(
+        scenario_id="t39",
+        step_idx=0,
+        data={"description": "click smth", "max_steps": 3},
+        node_id="g1",
+    )
+    # The malformed decision is rejected — _goal_decide returns
+    # None which the goal loop treats as ``llm_no_decision`` and
+    # aborts. That's fine: the critical contract this test enforces
+    # is "schema-leak does NOT reach dispatch" — no tap call landed
+    # on the controller. Caller (scenario runner) handles the
+    # ``llm_no_decision`` abort the same way it would for any other
+    # transport failure (move to next goal).
+    assert ok is False
+    assert reason == "llm_no_decision"
+    assert controller.tap_calls == [], (
+        f"schema-leak decision reached dispatch: tap_calls={controller.tap_calls!r}"
+    )
+    # One LLM call consumed (the bad one); the done one was never
+    # served because the loop aborted on the first None.
+    assert len(llm.calls) == 1

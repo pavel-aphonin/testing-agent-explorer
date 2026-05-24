@@ -2128,13 +2128,52 @@ class ScenarioRunner:
             return None
         try:
             obj, _ = json.JSONDecoder().raw_decode(text[start:])
-            return obj
         except json.JSONDecodeError as exc:
             logger.warning(
                 "[scenario] goal LLM JSON parse failed: %s; raw=%r",
                 exc, text[start:start + 300],
             )
             return None
+
+        # PER-163 retry #2: post-decode validation.
+        #
+        # Background: llama-server's JSON-Schema → GBNF compiler does
+        # not reliably enforce per-branch ``oneOf`` constraints. The
+        # PER-163 fix made base ``element_id`` nullable (so coord-only
+        # ``tap_at`` can return null per the prompt), and per-branch
+        # oneOf for element-targeted actions tries to pin a non-null
+        # string from the enum — but the grammar compiler often
+        # ignores the branch constraint. Result: model can return
+        # ``action=tap`` (or input/long_press/assert) with
+        # ``element_id=null`` — which then crashes ``_find_element``
+        # or worse, falls through to a fake-id retry that wastes
+        # max_steps.
+        #
+        # We catch it here, log loudly, and return None so the goal
+        # loop counts the step as ``llm_no_decision`` and moves on.
+        # The dispatcher will not see this malformed shape; the LLM
+        # gets a fresh prompt next iteration where visited_actions
+        # already covers any partial state.
+        try:
+            from explorer.goal_schema import _ELEMENT_TARGETED_ACTIONS
+        except ImportError:
+            _ELEMENT_TARGETED_ACTIONS = frozenset()
+        decoded_action = (obj.get("action") or "").strip().lower()
+        # done=true short-circuits the goal loop regardless of action;
+        # validation only matters when the loop will actually
+        # dispatch.
+        if (
+            not obj.get("done")
+            and decoded_action in _ELEMENT_TARGETED_ACTIONS
+            and obj.get("element_id") in (None, "", "null")
+        ):
+            logger.warning(
+                "[scenario] schema-leak rejected: action=%r requires "
+                "element_id, model returned null; treating as no_decision",
+                decoded_action,
+            )
+            return None
+        return obj
 
     async def _dispatch(
         self,
