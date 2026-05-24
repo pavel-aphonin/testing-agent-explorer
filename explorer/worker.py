@@ -648,6 +648,8 @@ class RealExecutor:
                         # for tap_at. Worker scales (x, y) into AXe
                         # screen points using the device dimensions
                         # captured at controller connect-time.
+                        # PER-163 retry: per-model screenshot ceiling.
+                        screenshot_max_dim=config.get("screenshot_max_dim"),
                         tap_at_coord_space=str(
                             config.get("tap_at_coord_space", "points")
                         ),

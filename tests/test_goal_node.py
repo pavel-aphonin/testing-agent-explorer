@@ -1475,3 +1475,141 @@ async def test_T35_plateau_detector_breaks_goal_after_no_new_screens() -> None:
     assert len(llm.calls) <= 11, (
         f"plateau guard did not fire in time: {len(llm.calls)} calls"
     )
+
+
+# ----------------------------- PER-163 retry contracts
+
+
+def test_T36_schema_allows_null_element_id_when_tap_at_is_available() -> None:
+    """T36 (PER-163): when the action dictionary contains a
+    coordinate-only action (``tap_at``), the base schema MUST allow
+    ``element_id=null`` — otherwise the LLM can't honour the prompt
+    instruction "for tap_at leave element_id null" and ends up
+    attaching the app root container to every coord tap, poisoning
+    history / anti-loop / visited tracking.
+
+    Without coord-only actions in the set the legacy contract holds:
+    ``element_id`` is a non-null string from the on-screen enum."""
+    from explorer.goal_schema import build_goal_schema
+
+    actions_with_tap_at = [
+        {"code": "tap", "arguments_schema": {}},
+        {"code": "tap_at", "arguments_schema": {}},
+    ]
+    schema = build_goal_schema(
+        test_data_keys=["phone"],
+        actions=actions_with_tap_at,
+        element_ids=["btn_a", "btn_b"],
+    )
+    el_schema = schema["properties"]["element_id"]
+    # Allow null for tap_at.
+    assert el_schema["type"] == ["string", "null"], el_schema
+    assert None in el_schema["enum"]
+    assert "btn_a" in el_schema["enum"]
+    assert "btn_b" in el_schema["enum"]
+
+    # Regression: without coord-only action, legacy non-null contract.
+    actions_without = [{"code": "tap", "arguments_schema": {}}]
+    schema_legacy = build_goal_schema(
+        test_data_keys=["phone"],
+        actions=actions_without,
+        element_ids=["btn_a"],
+    )
+    el_legacy = schema_legacy["properties"]["element_id"]
+    assert el_legacy["type"] == "string", el_legacy
+    assert None not in el_legacy.get("enum", [])
+
+
+@pytest.mark.asyncio
+async def test_T37_screenshot_max_dim_forwarded_to_controller() -> None:
+    """T37 (PER-163 retry): when the model passport carries
+    ``screenshot_max_dim``, the worker forwards it to
+    ``controller.take_screenshot(max_dim=N)`` instead of letting the
+    controller fall back to the legacy logical-points resize. This
+    is the contract the audit demanded: prove that the resize knob
+    is per-model, not just a controller-internal default."""
+
+    captured_kwargs: list[dict] = []
+
+    class _RecordingController(FakeController):
+        async def take_screenshot(self, **kwargs) -> str:
+            captured_kwargs.append(dict(kwargs))
+            return ""  # empty is fine — worker falls back to text-only
+
+    controller = _RecordingController()
+    llm = FakeLLMClient(responses=[_decision(done=True, reason="ok")])
+    events: list[dict] = []
+
+    async def sink(evt: dict) -> None:
+        events.append(evt)
+
+    from explorer.scenario_runner import ScenarioRunner
+
+    runner = ScenarioRunner(
+        controller=controller,
+        scenarios=[],
+        test_data={},
+        event_callback=sink,
+        llm_client=llm,
+        actions=[],
+        supports_multimodal_image=True,
+        screenshot_max_dim=1920,
+    )
+    runner._test_events = events  # type: ignore[attr-defined]
+    runner._settle_timeout_ms = 0
+    await runner._run_goal_node(
+        scenario_id="t37", step_idx=0,
+        data={"description": "go", "max_steps": 2}, node_id="g1",
+    )
+    assert captured_kwargs, "take_screenshot was never called"
+    # All calls must carry max_dim=1920 — not the controller-default
+    # logical-points path.
+    for kw in captured_kwargs:
+        assert kw.get("max_dim") == 1920, kw
+
+
+@pytest.mark.asyncio
+async def test_T38_screenshot_max_dim_omitted_when_passport_null() -> None:
+    """T38 (PER-163 retry): the controller-default (logical-points
+    resize) is preserved when the model passport does NOT set
+    ``screenshot_max_dim``. Guards against the worker silently
+    forcing high-res screenshots on cheaper models where bandwidth
+    matters."""
+
+    captured_kwargs: list[dict] = []
+
+    class _RecordingController(FakeController):
+        async def take_screenshot(self, **kwargs) -> str:
+            captured_kwargs.append(dict(kwargs))
+            return ""
+
+    controller = _RecordingController()
+    llm = FakeLLMClient(responses=[_decision(done=True, reason="ok")])
+    events: list[dict] = []
+
+    async def sink(evt: dict) -> None:
+        events.append(evt)
+
+    from explorer.scenario_runner import ScenarioRunner
+
+    runner = ScenarioRunner(
+        controller=controller,
+        scenarios=[],
+        test_data={},
+        event_callback=sink,
+        llm_client=llm,
+        actions=[],
+        supports_multimodal_image=True,
+        # screenshot_max_dim left at default None.
+    )
+    runner._test_events = events  # type: ignore[attr-defined]
+    runner._settle_timeout_ms = 0
+    await runner._run_goal_node(
+        scenario_id="t38", step_idx=0,
+        data={"description": "go", "max_steps": 2}, node_id="g1",
+    )
+    assert captured_kwargs, "take_screenshot was never called"
+    # max_dim must NOT be passed when passport is null — controller
+    # picks its own default (legacy logical-points resize).
+    for kw in captured_kwargs:
+        assert "max_dim" not in kw, kw

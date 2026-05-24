@@ -265,6 +265,11 @@ class ScenarioRunner:
         # ``pixels`` — raw pixels (Nemotron-style; scale down by
         # device retina factor).
         tap_at_coord_space: str = "points",
+        # PER-163 retry: per-model screenshot resize ceiling. ``None``
+        # = legacy logical-points behaviour (controller default).
+        # Integer = pass to controller.take_screenshot(max_dim=N) so
+        # vision-grounding models see near-native pixel detail.
+        screenshot_max_dim: int | None = None,
     ) -> None:
         self.controller = controller
         self.scenarios = scenarios or []
@@ -292,6 +297,10 @@ class ScenarioRunner:
         allowed_spaces = {"points", "normalized_1000", "pixels"}
         space = (tap_at_coord_space or "points").lower()
         self._tap_at_coord_space: str = space if space in allowed_spaces else "points"
+        # PER-163 retry: forward to controller.take_screenshot(max_dim=N).
+        self._screenshot_max_dim: int | None = (
+            int(screenshot_max_dim) if screenshot_max_dim else None
+        )
         # PER-85: cache (screen-fingerprint, description) → (matches, reason)
         # so each unique description is only verified once per visited
         # screen. Reset per scenario in _run_graph.
@@ -1476,8 +1485,31 @@ class ScenarioRunner:
             # tokens on text-only models like Nemotron.
             if self._supports_multimodal_image and callable(take_screenshot_fn):
                 try:
+                    # PER-163 retry: pass max_dim when the model wants
+                    # near-native pixel detail. Probe the controller's
+                    # signature first so FakeController in tests (no
+                    # max_dim kwarg) still works. Accept either an
+                    # explicit ``max_dim`` parameter or a ``**kwargs``
+                    # catch-all (the AXe controller has the explicit
+                    # param; recording fakes use **kwargs).
+                    shot_kwargs: dict[str, int] = {}
+                    if self._screenshot_max_dim:
+                        from inspect import signature as _sig, Parameter
+                        try:
+                            params = _sig(take_screenshot_fn).parameters
+                            accepts_max_dim = (
+                                "max_dim" in params
+                                or any(
+                                    p.kind == Parameter.VAR_KEYWORD
+                                    for p in params.values()
+                                )
+                            )
+                            if accepts_max_dim:
+                                shot_kwargs["max_dim"] = self._screenshot_max_dim
+                        except (TypeError, ValueError):
+                            pass
                     screenshot_b64 = await asyncio.wait_for(
-                        take_screenshot_fn(), timeout=10
+                        take_screenshot_fn(**shot_kwargs), timeout=10
                     )
                 except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
                     # Vision input is best-effort: a flaky screenshot

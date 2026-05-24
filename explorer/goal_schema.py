@@ -59,6 +59,18 @@ _ELEMENT_TARGETED_ACTIONS: frozenset[str] = frozenset({
 })
 
 
+# PER-163: actions that target the screen by coordinates, not by
+# accessibility id. For these the prompt explicitly tells the model
+# ``element_id`` should be ``null`` — and the schema must allow that
+# at the base level, otherwise the model is forced to attach a bogus
+# id (typically the app root container) which then poisons history,
+# anti-loop and visited tracking. Action dispatch ignores element_id
+# for these — only ``action_args.x/y`` matter.
+_COORD_ONLY_ACTIONS: frozenset[str] = frozenset({
+    "tap_at",
+})
+
+
 def _action_args_branch(
     action_code: str,
     args_schema: dict[str, Any],
@@ -129,6 +141,9 @@ def build_goal_schema(
     the worker from crashing while the operator fixes the dictionary.
     """
     action_codes = [a["code"] for a in actions if a.get("code")]
+    has_coord_only_action = any(
+        code in _COORD_ONLY_ACTIONS for code in action_codes
+    )
     value_source_enum = (
         [f"test_data.{k}" for k in test_data_keys] + list(SPECIAL_SOURCES)
     )
@@ -146,15 +161,31 @@ def build_goal_schema(
     # in _dispatch — but having the LLM pick *any* visible id is
     # cheap and keeps the grammar single-track.
     #
+    # PER-163: when the action set contains a coordinate-only action
+    # (tap_at), the base schema MUST allow ``element_id: null`` so
+    # the model can honour the prompt instruction. Otherwise the
+    # model is forced to attach a real id (typically the app root
+    # container) which corrupts visited_actions / anti-loop / history
+    # tracking — every coord tap looks like "tap on the same root".
+    # Per-branch oneOf still pins element-targeted actions to a
+    # non-null string from the enum (mostly enforced by llama-server,
+    # but where it isn't the dispatch layer catches it).
+    #
     # If element_ids is empty (blank screen, or the worker called
     # before AXe stabilised) we leave the field nullable: a
     # non-null enum with no values would make the whole schema
     # unsatisfiable and llama-server would 400.
     if element_ids:
-        element_id_schema: dict[str, Any] = {
-            "type": "string",
-            "enum": list(element_ids),
-        }
+        if has_coord_only_action:
+            element_id_schema: dict[str, Any] = {
+                "type": ["string", "null"],
+                "enum": list(element_ids) + [None],
+            }
+        else:
+            element_id_schema = {
+                "type": "string",
+                "enum": list(element_ids),
+            }
         required_fields = [
             "done",
             "action",

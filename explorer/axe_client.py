@@ -554,8 +554,24 @@ class AXeExplorerClient:
                     return None, None
         return None, None
 
-    async def take_screenshot(self) -> str:
-        """Screenshot via simctl, return base64 PNG (resized to logical)."""
+    async def take_screenshot(self, max_dim: int | None = None) -> str:
+        """Screenshot via simctl, return base64 PNG.
+
+        PER-163 retry: ``max_dim`` controls the resize ceiling:
+
+        * ``None`` (legacy) → downscale to logical-points
+          ``(self._width, self._height)``. Cheap, loses detail on
+          small UI controls (PIN keypad digits, app-icon grids).
+        * ``int`` → downscale only if larger than ``max_dim`` on the
+          longer side, preserve aspect ratio. Lets vision-precision
+          models see near-native pixel detail (iPhone 17 Pro Max is
+          1320×2868 — ``max_dim=1920`` keeps full height and 660px
+          width, well above the 440 logical points and far below the
+          context-blowing native bytes).
+
+        Worker reads the per-model passport ``screenshot_max_dim``
+        and forwards it; controller stays single-knob.
+        """
         import tempfile
         with tempfile.NamedTemporaryFile(
             prefix="axe_shot_", suffix=".png", delete=False
@@ -573,7 +589,15 @@ class AXeExplorerClient:
             img = Image.open(path)
             if img.mode == "RGBA":
                 img = img.convert("RGB")
-            img = img.resize((self._width, self._height), Image.LANCZOS)
+            if max_dim is None:
+                img = img.resize((self._width, self._height), Image.LANCZOS)
+            else:
+                longest = max(img.width, img.height)
+                if longest > max_dim:
+                    scale = max_dim / float(longest)
+                    new_w = int(round(img.width * scale))
+                    new_h = int(round(img.height * scale))
+                    img = img.resize((new_w, new_h), Image.LANCZOS)
             buf = BytesIO()
             img.save(buf, format="PNG")
             return base64.b64encode(buf.getvalue()).decode("utf-8")
