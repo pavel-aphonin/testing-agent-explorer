@@ -45,10 +45,14 @@ from explorer.axe_client import (
 )
 from explorer.expression import ExprError, evaluate as eval_expr
 from explorer.goal_schema import (
+    _COORD_ONLY_ACTIONS,
+    _ELEMENT_TARGETED_ACTIONS,
+    _is_container_id,
     build_actions_block,
     build_elements_block,
     build_goal_schema,
     build_test_data_block,
+    normalize_decision,
     resolve_value,
 )
 
@@ -270,6 +274,34 @@ class ScenarioRunner:
         # Integer = pass to controller.take_screenshot(max_dim=N) so
         # vision-grounding models see near-native pixel detail.
         screenshot_max_dim: int | None = None,
+        # PER-164: dedicated UI-grounder client. When the chat-LLM
+        # emits ``tap_at`` with ``args.target_description`` (e.g.
+        # "digit 8 on PIN keypad"), the dispatcher hands the
+        # screenshot + description to this client instead of
+        # trusting the chat-LLM's own (x, y) guess. ``None`` =
+        # pre-PER-164 behaviour: always use the chat-LLM's coords.
+        # The client itself silently falls back when no active
+        # grounder is configured in the DB, so passing one here is
+        # opt-in for the worker but transparent for the user.
+        grounder: Any | None = None,
+        # PER-164 followup: per-model sampling profile. Default
+        # values match the LLMModel column defaults so legacy runs
+        # without a passport keep the old behaviour (T=0.7 average).
+        # NULL on top_k/min_p = omit from request (server picks).
+        sampling_temperature: float = 0.7,
+        sampling_top_p: float = 0.9,
+        sampling_top_k: int | None = None,
+        sampling_min_p: float | None = None,
+        # PER-169: episodic memory layer (Graphiti + FalkorDB). When
+        # set, every dispatched action is written into the agent's
+        # knowledge graph (fire-and-forget) and each goal-decide
+        # call queries the graph for relevant past actions to
+        # inject as a memory_block into the prompt. None disables —
+        # the worker falls back to history_block + visited hints
+        # (pre-PER-169 behaviour). One EpisodicMemory instance is
+        # shared across runs; group_id scoping inside the wrapper
+        # isolates each run+goal.
+        memory: Any | None = None,
     ) -> None:
         self.controller = controller
         self.scenarios = scenarios or []
@@ -293,14 +325,65 @@ class ScenarioRunner:
         # PER-138 transport capabilities.
         self._supports_json_schema: bool = bool(supports_json_schema)
         self._supports_multimodal_image: bool = bool(supports_multimodal_image)
-        # PER-145 L1 coord-space normalization for tap_at.
-        allowed_spaces = {"points", "normalized_1000", "pixels"}
+        # PER-145 L1 / PER-164 coord-space normalization for tap_at.
+        # ``points``           — raw screen logical points (Gemma family).
+        # ``normalized_1000``  — 0–1000 (Qwen2.5/3-VL convention).
+        # ``pixels``           — raw native-device pixels (Nemotron-style;
+        #                       worker scales down by retina factor).
+        # ``image_pixels``     — PER-164: pixels of the IMAGE that was
+        #                       sent to the model (UI-TARS family). The
+        #                       image was resized to ``screenshot_max_dim``
+        #                       before sending, so coords must scale back
+        #                       to phone logical points by
+        #                       ``raw * screen_logical / image_dim``,
+        #                       NOT by retina factor.
+        allowed_spaces = {"points", "normalized_1000", "pixels", "image_pixels"}
         space = (tap_at_coord_space or "points").lower()
         self._tap_at_coord_space: str = space if space in allowed_spaces else "points"
         # PER-163 retry: forward to controller.take_screenshot(max_dim=N).
         self._screenshot_max_dim: int | None = (
             int(screenshot_max_dim) if screenshot_max_dim else None
         )
+        # PER-164: dedicated grounder client (None = pre-PER-164 behaviour).
+        self._grounder = grounder
+        # PER-164 followup: sampling profile threaded into every
+        # _goal_decide LLM call.
+        self._sampling_temperature: float = float(sampling_temperature)
+        self._sampling_top_p: float = float(sampling_top_p)
+        self._sampling_top_k: int | None = (
+            int(sampling_top_k) if sampling_top_k is not None else None
+        )
+        self._sampling_min_p: float | None = (
+            float(sampling_min_p) if sampling_min_p is not None else None
+        )
+        # PER-169: episodic memory layer.
+        self._memory = memory
+
+    async def _take_screenshot_bytes(self) -> tuple[bytes, int, int]:
+        """PER-164: capture screenshot + return (raw_bytes, width_px, height_px).
+
+        ``controller.take_screenshot`` returns base64-encoded PNG
+        (the chat-LLM wants it that way for image_url inlining).
+        The grounder wants raw bytes so it can do its own encoding,
+        AND when the grounder's coord_space is ``image_pixels``
+        the dispatcher needs the actual image dimensions to scale
+        UI-TARS-style "pixel of the input image" coordinates back
+        to phone logical points. We decode once here and probe
+        PIL for the dims — keeps that knowledge out of the
+        grounder client.
+        """
+        import base64 as _b64
+        import io as _io
+        from PIL import Image as _Image
+        b64 = await self.controller.take_screenshot(
+            max_dim=self._screenshot_max_dim,
+        )
+        if not isinstance(b64, str):
+            raise RuntimeError("take_screenshot returned non-string payload")
+        raw = _b64.b64decode(b64)
+        with _Image.open(_io.BytesIO(raw)) as img:
+            w, h = img.width, img.height
+        return raw, w, h
         # PER-85: cache (screen-fingerprint, description) → (matches, reason)
         # so each unique description is only verified once per visited
         # screen. Reset per scenario in _run_graph.
@@ -1110,6 +1193,21 @@ class ScenarioRunner:
         self._screen_match_cache[(fingerprint, description)] = result
         return result
 
+    async def _quick_ax_snapshot(self) -> list[dict] | None:
+        """One-shot AXe poll without settle / retries — used between
+        batch items to cheaply detect that the screen drifted from the
+        one the LLM planned the batch on.
+
+        Returns the element list, or None on failure. Bounded at 3s
+        so a slow AXe doesn't blow up batch dispatch latency more than
+        a single tap would. PER-170 retry (Codex QA #2)."""
+        try:
+            return await asyncio.wait_for(
+                self.controller.get_ui_elements(), timeout=3
+            )
+        except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+            return None
+
     async def _wait_for_screen_stable(
         self,
     ) -> tuple[list[dict], bool]:
@@ -1386,7 +1484,19 @@ class ScenarioRunner:
         plateau_window: deque[str] = deque(maxlen=10)
         backtrack_stack: list[str] = []
 
-        for inner_step in range(max_steps):
+        # PER-170: per-screen batch — each ``_goal_decide`` LLM call
+        # returns a list of actions to dispatch on the current screen,
+        # not a single decision. ``inner_step`` counts *dispatched
+        # actions*, not LLM calls — so a batch of 4 (e.g. PIN 8520)
+        # bumps it by 4 while costing only one Gemma 4 round-trip.
+        # The outer while replaces the old fixed-range for-loop so we
+        # can advance the counter from the inner batch loop too.
+        inner_step = 0
+        # Signal from the inner per-item loop that the outer loop must
+        # terminate (anti-loop break, max_steps hit, etc.). We can't
+        # use plain ``break`` because it only exits the inner ``for``.
+        outer_break = False
+        while inner_step < max_steps:
             # 1. Read the current screen. Both representations matter:
             #   - AXe accessibility dump → element_id enum + the text
             #     description the LLM uses to ground its decision
@@ -1531,6 +1641,30 @@ class ScenarioRunner:
                 visited_actions.get(structural_fp, set())
             )
 
+            # PER-169: pull episodic memory recall for this goal —
+            # the agent gets explicit "you already did X" context so
+            # it stops looping. Recall is time-bounded (3s); on
+            # timeout / no memory configured we get "" and fall
+            # through to the legacy history_block + visited hints.
+            memory_block = ""
+            if self._memory is not None:
+                goal_scope_recall = node_id or f"step_{step_idx}"
+                # Query phrased to surface action history relevant
+                # to the current goal.
+                recall_query = (
+                    f"What actions have I already taken toward this goal: {goal_text}. "
+                    f"What is the current progress?"
+                )
+                try:
+                    memory_block = await self._memory.summary_for_prompt(
+                        run_id=str(self.run_id or "no_run"),
+                        goal_id=goal_scope_recall,
+                        query=recall_query,
+                    )
+                except Exception:
+                    logger.exception("[memory] recall failed (non-fatal)")
+                    memory_block = ""
+
             # 2. Ask the LLM what to do (or whether we're done).
             decision = await self._goal_decide(
                 goal_text=goal_text,
@@ -1547,190 +1681,416 @@ class ScenarioRunner:
                 test_data_block=test_data_block,
                 screenshot_b64=screenshot_b64,
                 visited_summary=visited_summary,
+                memory_block=memory_block,
             )
             if decision is None:
                 last_reason = "llm_no_decision"
                 break
 
-            # Diagnostic log: every LLM decision lands in
-            # /tmp/ta-worker.log so we can debug "goal didn't progress"
-            # without instrumenting the prompt itself. Cheap, one line
-            # per inner step.
+            # PER-170: parse into the canonical batch shape — even if
+            # the model emitted a legacy single-action object we get a
+            # uniform ``{done, reason, expected_next_screen, actions}``
+            # back, so the inner dispatch loop has one branch to walk.
+            decision = normalize_decision(decision)
+            batch_actions = list(decision.get("actions") or [])
+
+            # Log the batch envelope once per LLM call (cheap one line).
+            # The per-item details are logged inside the inner loop with
+            # the same "[goal] decision step=…" prefix as before so
+            # downstream parsers / kibana dashboards keep working.
             logger.info(
-                "[goal] decision step=%d done=%s action=%s args=%s "
-                "element_id=%s label=%r value_source=%s reasoning=%r",
-                inner_step,
+                "[goal] batch decision: done=%s actions=%d reason=%r",
                 decision.get("done"),
-                decision.get("action"),
-                decision.get("action_args"),
-                decision.get("element_id"),
-                decision.get("element_label"),
-                decision.get("value_source"),
-                (decision.get("reasoning") or "")[:200],
+                len(batch_actions),
+                (decision.get("reason") or "")[:120],
             )
-            if decision.get("done"):
-                # In explore mode the system prompt forbids unsolicited
-                # done=true — but if the model insists, log + override
-                # rather than terminate prematurely on an open exploration.
+
+            if decision.get("done") and not batch_actions:
+                # "done with nothing to do" — terminal verdict with no
+                # actions to dispatch. Honour it (except explore mode,
+                # where the prompt forbids done=true and we just keep
+                # exploring until max_steps).
                 if mode == "explore":
                     logger.warning(
                         "[goal] model returned done=true in explore mode; "
                         "ignoring and continuing"
                     )
-                else:
-                    done = True
-                    last_reason = (decision.get("reason") or "goal reported as done")[:300]
+                    continue
+                done = True
+                last_reason = (decision.get("reason") or "goal reported as done")[:300]
+                break
+
+            # PER-170 inner loop: dispatch each action in the batch
+            # without another LLM call. Between items there's no
+            # _wait_for_screen_stable — that gates only the next
+            # _goal_decide. If the screen drifts mid-batch (modal pops,
+            # error appears), the *next* outer iteration will see the
+            # new screenshot and adapt; the in-batch dispatcher just
+            # plows ahead with what the LLM planned.
+            for batch_item_idx, action_item in enumerate(batch_actions):
+                if inner_step >= max_steps:
+                    outer_break = True
                     break
 
-            action = (decision.get("action") or "").strip().lower()
-            label = (decision.get("element_label") or "").strip() or None
-            element_id = (decision.get("element_id") or "").strip() or None
-            action_args = decision.get("action_args") or {}
-            if not isinstance(action_args, dict):
-                action_args = {}
-            # PER-111 v2: value resolved by the WORKER from value_source.
-            value = resolve_value(decision, self.test_data, improvised_memory)
-            value_source = decision.get("value_source") or ""
-
-            # Emit a granular event so the user's timeline can show
-            # what the LLM is actually doing inside the goal. Not
-            # persisted — broadcast-only via redis_bus.
-            await self._emit({
-                "type": "scenario.goal_action",
-                "scenario_id": scenario_id,
-                "step_idx": step_idx,
-                "node_id": node_id,
-                "inner_step": inner_step,
-                "action": action,
-                "element_label": label,
-                "value_source": value_source,
-                "reasoning": (decision.get("reasoning") or "")[:300],
-            })
-
-            # 3. Execute via the existing _dispatch contract.
-            # PER-111 v2: pass element_id + action_args alongside
-            # label. The dispatcher's id-first lookup matches the LLM's
-            # stable identifier even when the visible label changes
-            # (re-render, localization); action_args carry direction /
-            # ms / duration_ms for the gesture- and timing-based
-            # actions.
-            try:
-                ok, reason = await self._dispatch(
-                    action,
-                    label or element_id or "",
-                    value or "",
-                    element_id=element_id,
-                    action_args=action_args,
+                # Diagnostic log: every dispatched action lands in
+                # /tmp/ta-worker.log so we can debug "goal didn't progress"
+                # without instrumenting the prompt itself. Cheap, one line
+                # per inner step. The ``batch_item_idx/total`` suffix
+                # makes it obvious whether the model is running a
+                # multi-action plan or one-shotting per LLM call.
+                logger.info(
+                    "[goal] decision step=%d (batch %d/%d) done=%s action=%s args=%s "
+                    "element_id=%s label=%r value_source=%s reasoning=%r",
+                    inner_step,
+                    batch_item_idx + 1,
+                    len(batch_actions),
+                    decision.get("done"),
+                    action_item.get("action"),
+                    action_item.get("action_args"),
+                    action_item.get("element_id"),
+                    action_item.get("element_label"),
+                    action_item.get("value_source"),
+                    (action_item.get("reasoning") or "")[:200],
                 )
-            except Exception as exc:
-                ok, reason = False, f"crash: {exc}"
-            # PER-163: for coordinate-only actions (``tap_at``) the
-            # element_id the LLM picks is the app root container —
-            # carries no semantics. The real identity of the action
-            # is the (x, y) it tapped. We bucket coordinates to a
-            # 50pt grid so two visually-different taps don't get
-            # collapsed by anti-loop, but micro-jitter (model
-            # generating 670/675/680 for the same logical target)
-            # still groups into one bucket. ``tap_id`` is what we
-            # feed into visited_actions / oscillation_window /
-            # recent_attempts in place of bare element_id.
-            tap_id: str | None = element_id
-            tap_coord_hint = ""
-            if action == "tap_at":
-                _ax = action_args.get("x") if isinstance(action_args, dict) else None
-                _ay = action_args.get("y") if isinstance(action_args, dict) else None
+
+                action = (action_item.get("action") or "").strip().lower()
+                label = (action_item.get("element_label") or "").strip() or None
+                element_id = (action_item.get("element_id") or "").strip() or None
+                action_args = action_item.get("action_args") or {}
+                if not isinstance(action_args, dict):
+                    action_args = {}
+                # PER-111 v2: value resolved by the WORKER from value_source.
+                value = resolve_value(action_item, self.test_data, improvised_memory)
+                value_source = action_item.get("value_source") or ""
+
+                # PER-170 retry (Codex QA #1+#3): validate the batch
+                # item BEFORE dispatch — schema-side enforcement is
+                # unreliable because llama-server's GBNF compiler
+                # ignores per-branch oneOf constraints (we already saw
+                # this for tap/element_id=null at the base level).
+                # Without this guard, an action like
+                # ``{"action":"tap","element_id":null}`` reached
+                # _dispatch which called _find_element('') and either
+                # returned a misleading FAIL or — worse — landed on the
+                # app root container, corrupting visited_actions and
+                # anti-loop. Now we skip the item, push a synthetic
+                # «[SKIPPED: …]» history entry so the LLM sees it next
+                # turn and adapts, and break the batch — continuing
+                # would dispatch siblings that depended on this one
+                # (e.g. a Forward tap whose precondition was a digit
+                # tap that just got skipped).
+                skip_reason: str | None = None
+                if not action:
+                    skip_reason = "action is empty"
+                elif action in _ELEMENT_TARGETED_ACTIONS and not element_id:
+                    skip_reason = (
+                        f"{action!r} requires element_id but model "
+                        f"emitted element_id=null"
+                    )
+                elif (
+                    action in _ELEMENT_TARGETED_ACTIONS
+                    and element_id
+                    and _is_container_id(element_id)
+                ):
+                    # PER-172: the LLM picked a root / app-shell
+                    # container id when it really wanted a specific
+                    # control that isn't in the AX-tree (the classic
+                    # "PIN-screen Submit button is canvas-rendered"
+                    # failure mode). Tapping a container does nothing
+                    # visible, looks to the model like a no-op screen,
+                    # and the next turn re-emits the same plan. Skip
+                    # with a clear hint: the model gets «[SKIPPED:
+                    # container_tap_forbidden]» in history and is
+                    # expected to retry with tap_at + target_description.
+                    skip_reason = (
+                        f"{action!r} on container element_id={element_id!r} "
+                        f"is forbidden — use tap_at with target_description "
+                        f"to localise a non-AX button instead"
+                    )
+                elif action in _COORD_ONLY_ACTIONS:
+                    # tap_at: x,y OR target_description. The
+                    # arguments_schema (PER-164 followup) explicitly
+                    # makes both optional and delegates the «at least
+                    # one of (x,y)|target_description» check to the
+                    # runtime — when a grounder is wired up, the
+                    # model is encouraged to emit description only
+                    # and let UI-TARS resolve the pixel. Reject only
+                    # when BOTH are missing.
+                    _ax = action_args.get("x")
+                    _ay = action_args.get("y")
+                    _desc = action_args.get("target_description")
+                    has_xy = True
+                    try:
+                        int(_ax); int(_ay)
+                    except (TypeError, ValueError):
+                        has_xy = False
+                    has_desc = isinstance(_desc, str) and _desc.strip() != ""
+                    if not has_xy and not has_desc:
+                        skip_reason = (
+                            f"{action!r} requires either numeric x,y "
+                            f"or target_description, got neither"
+                        )
+                if skip_reason is not None:
+                    logger.warning(
+                        "[batch] item %d/%d invalid — %s; skipping and "
+                        "breaking batch so next LLM call sees the failure",
+                        batch_item_idx + 1, len(batch_actions), skip_reason,
+                    )
+                    history.append(
+                        f"{action or '?'} «{label or element_id or '?'}» "
+                        f"[SKIPPED: {skip_reason}]"
+                    )
+                    last_reason = f"invalid_batch_item: {skip_reason}"
+                    inner_step += 1
+                    # Break batch — don't run dependent siblings against
+                    # a now-uncertain screen.
+                    break
+
+                # Emit a granular event so the user's timeline can show
+                # what the LLM is actually doing inside the goal. Not
+                # persisted — broadcast-only via redis_bus.
+                await self._emit({
+                    "type": "scenario.goal_action",
+                    "scenario_id": scenario_id,
+                    "step_idx": step_idx,
+                    "node_id": node_id,
+                    "inner_step": inner_step,
+                    "action": action,
+                    "element_label": label,
+                    "value_source": value_source,
+                    "reasoning": (action_item.get("reasoning") or "")[:300],
+                })
+
+                # 3. Execute via the existing _dispatch contract.
+                # PER-111 v2: pass element_id + action_args alongside
+                # label. The dispatcher's id-first lookup matches the LLM's
+                # stable identifier even when the visible label changes
+                # (re-render, localization); action_args carry direction /
+                # ms / duration_ms for the gesture- and timing-based
+                # actions.
                 try:
-                    _bx = int(_ax) // 50 * 50
-                    _by = int(_ay) // 50 * 50
-                    tap_id = f"@({_bx},{_by})"
-                    tap_coord_hint = f" ({int(_ax)},{int(_ay)})"
-                except (TypeError, ValueError):
-                    pass
+                    ok, reason = await self._dispatch(
+                        action,
+                        label or element_id or "",
+                        value or "",
+                        element_id=element_id,
+                        action_args=action_args,
+                    )
+                except Exception as exc:
+                    ok, reason = False, f"crash: {exc}"
+                # PER-163: for coordinate-only actions (``tap_at``) the
+                # element_id the LLM picks is the app root container —
+                # carries no semantics. The real identity of the action
+                # is the (x, y) it tapped. We bucket coordinates to a
+                # 50pt grid so two visually-different taps don't get
+                # collapsed by anti-loop, but micro-jitter (model
+                # generating 670/675/680 for the same logical target)
+                # still groups into one bucket. ``tap_id`` is what we
+                # feed into visited_actions / oscillation_window /
+                # recent_attempts in place of bare element_id.
+                tap_id: str | None = element_id
+                tap_coord_hint = ""
+                if action == "tap_at":
+                    _ax = action_args.get("x") if isinstance(action_args, dict) else None
+                    _ay = action_args.get("y") if isinstance(action_args, dict) else None
+                    try:
+                        _bx = int(_ax) // 50 * 50
+                        _by = int(_ay) // 50 * 50
+                        tap_id = f"@({_bx},{_by})"
+                        tap_coord_hint = f" ({int(_ax)},{int(_ay)})"
+                    except (TypeError, ValueError):
+                        pass
 
-            history.append(
-                f"{action} «{label or tap_id or element_id or '?'}»"
-                + tap_coord_hint
-                + (
-                    # PER-143: enter_text also benefits from the
-                    # resolved-value annotation. Keeps the LLM's history
-                    # honest about WHICH source produced the typed
-                    # string when value_source was used.
-                    f" → {value} (via {value_source})"
-                    if action in ("input", "enter_text") and value else ""
+                history_line = (
+                    f"{action} «{label or tap_id or element_id or '?'}»"
+                    + tap_coord_hint
+                    + (
+                        # PER-143: enter_text also benefits from the
+                        # resolved-value annotation. Keeps the LLM's history
+                        # honest about WHICH source produced the typed
+                        # string when value_source was used.
+                        f" → {value} (via {value_source})"
+                        if action in ("input", "enter_text") and value else ""
+                    )
+                    + (" [OK]" if ok else f" [FAIL: {reason}]")
                 )
-                + (" [OK]" if ok else f" [FAIL: {reason}]")
-            )
-            last_reason = reason
+                history.append(history_line)
+                last_reason = reason
 
-            # PER-161: remember what we've successfully tried on this
-            # screen so the next turn's prompt can warn the model
-            # away from it. Only record successful actions — a failed
-            # try might genuinely deserve a retry on a different
-            # element (e.g. after the keyboard finally opens).
-            #
-            # PER-163: use ``tap_id`` (the bucketed coord) for tap_at
-            # so distinct taps don't all hash to (tap_at, app_root).
-            if ok:
-                visited_actions.setdefault(structural_fp, set()).add(
-                    (action, tap_id)
-                )
+                # PER-169: record the action into episodic memory so the
+                # next decision step can recall "you already tapped digit
+                # 8 here". Fire-and-forget — Graphiti's entity extraction
+                # takes ~15s per episode on the local Qwen3-8B and we
+                # must not block the agent on it.
+                if self._memory is not None:
+                    goal_scope = node_id or f"step_{step_idx}"
+                    target_hint = ""
+                    if isinstance(action_args, dict):
+                        desc = action_args.get("target_description")
+                        if isinstance(desc, str) and desc.strip():
+                            target_hint = f" target='{desc[:80]}'"
+                    # ``inner_step`` is the index within the current goal
+                    # (0..max_steps-1) — what we want in the memory so the
+                    # chat-LLM sees "Step 0, 1, 2…" as it walks PIN entry.
+                    # ``step_idx`` is the goal's position in the parent
+                    # scenario, which would always print "Step 0" for the
+                    # first goal (PER-169 smoke #1 bug — all episodes were
+                    # labelled Step 0 because each goal restarted the count).
+                    episode_text = (
+                        f"Step {inner_step} (goal {goal_scope}): "
+                        f"{action} on '{label or element_id or '?'}'"
+                        f"{tap_coord_hint}{target_hint}"
+                        + (f" with value '{value}' (via {value_source})"
+                           if action in ("input", "enter_text") and value else "")
+                        + (" — OK" if ok else f" — FAIL: {reason}")
+                    )
+                    try:
+                        await self._memory.add_action_fire_and_forget(
+                            run_id=str(self.run_id or "no_run"),
+                            goal_id=goal_scope,
+                            episode_text=episode_text,
+                            episode_name=f"step_{inner_step}_{action}",
+                        )
+                    except Exception:
+                        logger.exception("[memory] add_action dispatch failed (non-fatal)")
 
-            # Anti-loop check #1: if the same (action, element_id,
-            # value_source) failed `recent_attempts.maxlen` times in
-            # a row, the model isn't going to find a way out and the
-            # remaining max_steps would just be more of the same.
-            recent_attempts.append((action, tap_id, value_source, ok))
-            if (
-                len(recent_attempts) == recent_attempts.maxlen
-                and all(not entry[3] for entry in recent_attempts)
-                and len({entry[:3] for entry in recent_attempts}) == 1
-            ):
-                logger.warning(
-                    "[goal] anti-loop: %d identical failures of (%s, %s, %s); "
-                    "aborting goal early",
-                    recent_attempts.maxlen, action, element_id, value_source,
-                )
-                last_reason = (
-                    f"stuck_loop: {recent_attempts.maxlen}× same failing "
-                    f"({action}, element_id={element_id}, "
-                    f"value_source={value_source})"
-                )
+                # PER-161: remember what we've successfully tried on this
+                # screen so the next turn's prompt can warn the model
+                # away from it. Only record successful actions — a failed
+                # try might genuinely deserve a retry on a different
+                # element (e.g. after the keyboard finally opens).
+                #
+                # PER-163: use ``tap_id`` (the bucketed coord) for tap_at
+                # so distinct taps don't all hash to (tap_at, app_root).
+                if ok:
+                    visited_actions.setdefault(structural_fp, set()).add(
+                        (action, tap_id)
+                    )
+
+                # Anti-loop check #1: if the same (action, element_id,
+                # value_source) failed `recent_attempts.maxlen` times in
+                # a row, the model isn't going to find a way out and the
+                # remaining max_steps would just be more of the same.
+                # PER-170: anti-loop breaks BOTH the inner batch loop
+                # and the outer LLM loop — once we've decided the goal
+                # is stuck, dispatching the rest of the batch would
+                # only burn budget on the same failing pattern.
+                recent_attempts.append((action, tap_id, value_source, ok))
+                if (
+                    len(recent_attempts) == recent_attempts.maxlen
+                    and all(not entry[3] for entry in recent_attempts)
+                    and len({entry[:3] for entry in recent_attempts}) == 1
+                ):
+                    logger.warning(
+                        "[goal] anti-loop: %d identical failures of (%s, %s, %s); "
+                        "aborting goal early",
+                        recent_attempts.maxlen, action, element_id, value_source,
+                    )
+                    last_reason = (
+                        f"stuck_loop: {recent_attempts.maxlen}× same failing "
+                        f"({action}, element_id={element_id}, "
+                        f"value_source={value_source})"
+                    )
+                    outer_break = True
+                    break
+
+                # Anti-loop check #2: oscillation pattern (A,B,A,B,…).
+                # If the last 6 steps have only 2 unique (action, id)
+                # pairs the model is stuck in a 3-cycle between two
+                # actions and won't escape on its own. Mostly catches
+                # "tap Войти ↔ tap Back" loops where the model thinks
+                # each branch will help but the screen just toggles.
+                # PER-163: bucket the coord into the tuple so two
+                # tap_ats at meaningfully different points don't look
+                # identical here either.
+                oscillation_window.append((action, tap_id))
+                if (
+                    len(oscillation_window) == oscillation_window.maxlen
+                    and len(set(oscillation_window)) <= 2
+                ):
+                    unique_pairs = ", ".join(
+                        f"({a},{e})" for a, e in set(oscillation_window)
+                    )
+                    logger.warning(
+                        "[goal] anti-loop: oscillation in last %d steps "
+                        "(only 2 unique actions: %s); aborting goal early",
+                        oscillation_window.maxlen, unique_pairs,
+                    )
+                    last_reason = (
+                        f"stuck_loop: oscillation between {unique_pairs} "
+                        f"over last {oscillation_window.maxlen} steps"
+                    )
+                    outer_break = True
+                    break
+
+                # PER-170: tick the inner-step counter after each
+                # dispatched action — batch of N consumes N steps of
+                # max_steps budget. Outer ``while`` checks the same
+                # counter so we exit cleanly when budget is depleted.
+                inner_step += 1
+                await asyncio.sleep(0)
+
+                # PER-170 retry (Codex QA #2): in-batch screen-change
+                # check. If the structural fingerprint of the screen
+                # drifted significantly from the one we read at the
+                # start of the batch, the LLM's plan is operating on
+                # stale assumptions — break and let the next outer
+                # iteration grab a fresh screenshot + replan.
+                #
+                # We only check when there's a next item to dispatch
+                # (last-item break is meaningless), and only for
+                # actions that can plausibly change the screen
+                # (tap / tap_at / input). Navigation actions like
+                # back/swipe always change the screen — that's their
+                # whole point — so for those we trust the model
+                # planned the follow-up correctly.
+                #
+                # The check uses ``_quick_ax_snapshot`` (a single fast
+                # AXe poll, no settle / no screenshot) and compares
+                # the structural fingerprint that already lives at
+                # the top of the outer loop. Skip on failure — the
+                # check is a tripwire, not a hard requirement.
+                if batch_item_idx + 1 < len(batch_actions) and action in (
+                    "tap", "tap_at", "input", "enter_text"
+                ):
+                    try:
+                        snap = await self._quick_ax_snapshot()
+                    except Exception:
+                        snap = None
+                    if snap is not None:
+                        post_fp = screen_fingerprint_structural(snap)
+                        if post_fp != structural_fp:
+                            logger.info(
+                                "[batch] screen changed after item %d/%d "
+                                "(fingerprint %s → %s); breaking batch for "
+                                "fresh replan",
+                                batch_item_idx + 1, len(batch_actions),
+                                structural_fp[:12], post_fp[:12],
+                            )
+                            break
+            # ── end for action_item in batch_actions ──
+
+            # PER-170: propagate anti-loop / budget break from the
+            # inner batch loop to the outer LLM loop.
+            if outer_break:
                 break
 
-            # Anti-loop check #2: oscillation pattern (A,B,A,B,…).
-            # If the last 6 steps have only 2 unique (action, id)
-            # pairs the model is stuck in a 3-cycle between two
-            # actions and won't escape on its own. Mostly catches
-            # "tap Войти ↔ tap Back" loops where the model thinks
-            # each branch will help but the screen just toggles.
-            # PER-163: bucket the coord into the tuple so two
-            # tap_ats at meaningfully different points don't look
-            # identical here either.
-            oscillation_window.append((action, tap_id))
-            if (
-                len(oscillation_window) == oscillation_window.maxlen
-                and len(set(oscillation_window)) <= 2
-            ):
-                unique_pairs = ", ".join(
-                    f"({a},{e})" for a, e in set(oscillation_window)
-                )
-                logger.warning(
-                    "[goal] anti-loop: oscillation in last %d steps "
-                    "(only 2 unique actions: %s); aborting goal early",
-                    oscillation_window.maxlen, unique_pairs,
-                )
-                last_reason = (
-                    f"stuck_loop: oscillation between {unique_pairs} "
-                    f"over last {oscillation_window.maxlen} steps"
-                )
+            # PER-170: a batch where every item completed without
+            # tripping anti-loop, AND the model said done=true alongside,
+            # is the normal "goal complete" exit. (Pure done=true with
+            # no actions is handled before the inner loop above.)
+            # Explore mode never honours done — the prompt forbids it
+            # and the goal terminates on max_steps instead, mirroring
+            # the pre-PER-170 behaviour exercised by T13.
+            if decision.get("done") and mode != "explore":
+                done = True
+                last_reason = (decision.get("reason") or "goal reported as done")[:300]
                 break
-
-            # PER-127: settle is owned by _wait_for_screen_stable now —
-            # it polls AXe at the top of the next inner iteration. A
-            # flat sleep here would just delay the moment we start
-            # polling without giving us better data, so it's removed.
-            # We still yield to the event loop so cancel propagates.
-            await asyncio.sleep(0)
+            elif decision.get("done") and mode == "explore":
+                logger.warning(
+                    "[goal] model returned done=true in explore mode; "
+                    "ignoring and continuing"
+                )
 
         # 4. Optional expected_outcome verification once the LLM
         # claims done. Mismatch downgrades the result AND opens a
@@ -1843,6 +2203,26 @@ class ScenarioRunner:
             return (
                 "ВАЖНО про tap_at: координаты (x, y) задавай в raw "
                 "пикселях экрана. Worker масштабирует обратно."
+            )
+        if space == "image_pixels":
+            # PER-170 retry (Codex QA #5): the constructor accepts
+            # ``image_pixels`` in ``allowed_spaces`` but until now the
+            # prompt-hint method silently fell through to «emit in
+            # points». A chat-LLM mis-configured (or new chat-LLM
+            # whose author picked this space) would then receive a
+            # contradictory hint vs the dispatcher's actual
+            # interpretation. Wire it up: image_pixels means
+            # "coordinates of the input image we sent you", and the
+            # max image dim is owned by screenshot_max_dim (or the
+            # raw screenshot when no resize). We don't have the
+            # exact image dims at prompt-build time (they depend on
+            # the screenshot of the moment), so we emit a generic
+            # hint and trust the model to bound by what it sees.
+            return (
+                "ВАЖНО про tap_at: координаты (x, y) задавай в "
+                "ПИКСЕЛЯХ ИЗОБРАЖЕНИЯ, которое тебе показано (как "
+                "UI-TARS/Qwen-VL-grounder). Не пересчитывай в реальный "
+                "экран — это сделает worker. Не превышай размер картинки."
             )
         # points — пишем явный диапазон, чтобы модель не отправляла
         # пиксели «на всякий случай».
@@ -1961,6 +2341,10 @@ class ScenarioRunner:
         test_data_block: str,
         screenshot_b64: str | None = None,
         visited_summary: str = "",
+        # PER-169: episodic memory block — already-recalled text
+        # the caller wants prepended to the user prompt. Empty
+        # means no memory (no graphiti / no relevant episodes).
+        memory_block: str = "",
     ) -> dict[str, Any] | None:
         """One LLM round for a goal node (PER-111 v2).
 
@@ -2021,6 +2405,19 @@ class ScenarioRunner:
                 "history_block": history_block,
             },
         )
+        # PER-169: episodic memory recall as a prepended block.
+        # We prepend instead of using a template placeholder so the
+        # legacy DB system_prompts.user template (which has no
+        # {{memory_block}} marker) keeps working — agents on old
+        # workspaces get the same behaviour, opt-in is "wire
+        # EpisodicMemory into ScenarioRunner".
+        if memory_block:
+            user_prompt = (
+                "Память о ранее выполненных действиях в этой цели "
+                "(используй чтобы НЕ повторять уже сделанное):\n"
+                f"{memory_block}\n\n"
+                + user_prompt
+            )
 
         # PER-131-lite: if the active model carries a thinking
         # passport, we split the call into two passes — first a
@@ -2083,6 +2480,17 @@ class ScenarioRunner:
                 "user": effective_user,
                 "max_tokens": json_max_tokens,
                 "screenshot_b64": screenshot_b64,
+                # PER-164 followup: per-model sampling. Without this,
+                # llm_client.chat() defaulted to T=0.2 for every
+                # model — root cause of Gemma 4's "impulsive back-tap
+                # after one wait" on loading screens. Passport now
+                # forwards Gemma 4's recommended T=0.65/top_p=0.95/
+                # top_k=64/min_p=0.05, Qwen-family's T=0.7/top_p=0.8/
+                # top_k=20/min_p=0, etc.
+                "temperature": self._sampling_temperature,
+                "top_p": self._sampling_top_p,
+                "top_k": self._sampling_top_k,
+                "min_p": self._sampling_min_p,
             }
             if self._supports_json_schema:
                 chat_kwargs["response_format"] = {
@@ -2214,26 +2622,91 @@ class ScenarioRunner:
         # accessibilityIdentifier). Neither requires element_id — the
         # action argues directly with the screen, not via the AXe enum.
         if action == "tap_at":
-            try:
-                raw_x = int(args.get("x"))
-                raw_y = int(args.get("y"))
-            except (TypeError, ValueError):
-                return False, "tap_at requires integer x, y"
-            # PER-145 L1: scale incoming coordinates into screen points
-            # depending on the model's coord-space passport.
+            # PER-164: when the chat-LLM provides a
+            # ``target_description``, route the coordinate decision
+            # through the dedicated UI-grounder (UI-TARS et al)
+            # instead of trusting the chat-LLM's own (x, y) — dense
+            # general-purpose VLMs are unreliable at canvas-keypad
+            # localisation (see PER-163 retry #2 smoke comparison).
+            # The grounder returns its own (x, y) tagged with its
+            # own coord_space (UI-TARS = ``pixels``, Molmo =
+            # ``normalized_1000``, etc.), so the space used for
+            # scaling depends on which model produced the number.
+            target_description = (args.get("target_description") or "").strip()
+            grounder_used = False
+            raw_x: int
+            raw_y: int
+            space: str = self._tap_at_coord_space
+            # Image dims used by the grounder — needed when its
+            # coord_space is image_pixels so we can scale back to
+            # phone logical points. Zero = unknown / not applicable.
+            grounder_image_w: int = 0
+            grounder_image_h: int = 0
+            if target_description and self._grounder is not None:
+                shot: tuple[bytes, int, int] | None = None
+                try:
+                    shot = await self._take_screenshot_bytes()
+                except Exception:
+                    logger.exception(
+                        "tap_at: failed to capture screenshot for grounder "
+                        "— falling back to chat-LLM coords"
+                    )
+                if shot is not None:
+                    shot_bytes, grounder_image_w, grounder_image_h = shot
+                    try:
+                        located = await self._grounder.locate(shot_bytes, target_description)
+                    except Exception:
+                        logger.exception(
+                            "tap_at: grounder.locate raised — falling back to chat-LLM coords"
+                        )
+                        located = None
+                    if located is not None:
+                        raw_x = int(located.x)
+                        raw_y = int(located.y)
+                        space = located.coord_space
+                        grounder_used = True
+                        logger.info(
+                            "tap_at: grounder %s → (%d,%d) space=%s image=(%d,%d) target=%r",
+                            getattr(located, "raw_text", "")[:60] or "?",
+                            raw_x, raw_y, space,
+                            grounder_image_w, grounder_image_h,
+                            target_description,
+                        )
+            if not grounder_used:
+                try:
+                    raw_x = int(args.get("x"))
+                    raw_y = int(args.get("y"))
+                except (TypeError, ValueError):
+                    return False, (
+                        "tap_at requires integer x, y "
+                        "(or args.target_description when a grounder is active)"
+                    )
+            # PER-145 L1 / PER-164: scale into screen points by space.
             #   ``points``           → pass through (Gemma family)
             #   ``normalized_1000``  → 0–1000 normalized (Qwen2.5/3-VL)
             #   ``pixels``           → raw retina pixels (Nemotron)
+            #   ``image_pixels``     → PER-164: pixels of the sent image,
+            #                          which was resized to
+            #                          screenshot_max_dim BEFORE going to
+            #                          the grounder. Scale by
+            #                          screen_logical / image_dim, NOT
+            #                          retina factor — model never saw
+            #                          retina-native pixels.
             # Screen dimensions live on the AXe controller, captured
             # at connect-time. Fall back to (raw_x, raw_y) if dims are
             # missing — better to try than to crash.
             screen_w = int(getattr(self.controller, "_width", 0) or 0)
             screen_h = int(getattr(self.controller, "_height", 0) or 0)
             scale = float(getattr(self.controller, "_scale", 1.0) or 1.0)
-            space = self._tap_at_coord_space
             if space == "normalized_1000" and screen_w > 0 and screen_h > 0:
                 x = int(round(raw_x / 1000.0 * screen_w))
                 y = int(round(raw_y / 1000.0 * screen_h))
+            elif space == "image_pixels" and (
+                grounder_image_w > 0 and grounder_image_h > 0
+                and screen_w > 0 and screen_h > 0
+            ):
+                x = int(round(raw_x * screen_w / grounder_image_w))
+                y = int(round(raw_y * screen_h / grounder_image_h))
             elif space == "pixels" and scale > 0:
                 x = int(round(raw_x / scale))
                 y = int(round(raw_y / scale))

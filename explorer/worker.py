@@ -653,6 +653,47 @@ class RealExecutor:
                         tap_at_coord_space=str(
                             config.get("tap_at_coord_space", "points")
                         ),
+                        # PER-164: dedicated UI-grounder client.
+                        # Pulled lazily from backend on first use,
+                        # silently falls back to chat-LLM coords if
+                        # no active grounder is configured in
+                        # ``grounder_models``. Pass it unconditionally
+                        # — the client itself handles the "no grounder"
+                        # case so the worker has nothing to gate on.
+                        grounder=_make_grounder_client(
+                            config.get("_backend_url") or os.environ.get(
+                                "TA_BACKEND_URL", "http://localhost:8000"
+                            ),
+                            config.get("_worker_token") or os.environ.get(
+                                "TA_WORKER_TOKEN", ""
+                            ),
+                        ),
+                        # PER-164 followup: per-model sampling profile.
+                        # Backend's claim_next ships these from the
+                        # LLMModel row. Without them llm_client.chat()
+                        # hardcoded T=0.2 for every model, which fights
+                        # the Google-recommended T=0.65 for Gemma 4
+                        # and causes "impulsive back-tap" on loading
+                        # screens. Defaults below match the LLMModel
+                        # column defaults so legacy runs (no model
+                        # attached) keep the pre-PER-164 behaviour.
+                        sampling_temperature=float(
+                            config.get("default_temperature", 0.7)
+                        ),
+                        sampling_top_p=float(
+                            config.get("default_top_p", 0.9)
+                        ),
+                        sampling_top_k=config.get("default_top_k"),
+                        sampling_min_p=config.get("default_min_p"),
+                        # PER-169: episodic memory layer (Graphiti +
+                        # FalkorDB). Constructed once per worker
+                        # process (`_episodic_memory` instance attr),
+                        # shared across runs — group_id scoping
+                        # inside the wrapper isolates each run+goal.
+                        # None means no FalkorDB / no graphiti-core
+                        # → ScenarioRunner falls back to legacy
+                        # history_block + visited hints.
+                        memory=_get_episodic_memory(),
                     )
                     sr_summary = await sr.run_all()
                     logger.info("[scenario] summary: %s", sr_summary)
@@ -769,6 +810,91 @@ def _make_event_sink(client: BackendClient, run_id: str) -> EventSink:
         await client.post_event(run_id, event)
 
     return sink
+
+
+_EPISODIC_MEMORY_SINGLETON: Any | None = None
+
+
+def _get_episodic_memory() -> Any | None:
+    """PER-169: lazy-construct a shared EpisodicMemory instance.
+
+    One per worker process; reused across runs. ``None`` is
+    returned when ``graphiti-core`` isn't installed or when the
+    operator opts out via ``TA_EPISODIC_MEMORY=0``. The instance
+    itself lazy-connects on first use, so the only cost of
+    "always-on" is one import + one object — no FalkorDB
+    handshake at import time.
+
+    Environment overrides for FalkorDB location (defaults match
+    the docker-compose ports):
+
+    * ``TA_FALKORDB_HOST`` (default ``localhost``)
+    * ``TA_FALKORDB_PORT`` (default ``6380``)
+    * ``TA_EPISODIC_EXTRACTION_URL`` (default ``http://localhost:8083/v1``)
+    * ``TA_EPISODIC_EXTRACTION_MODEL`` (default ``rag-chat``)
+    * ``TA_EPISODIC_EMBED_URL`` (default ``http://localhost:8082/v1``)
+    * ``TA_EPISODIC_EMBED_MODEL`` (default ``embeddings``)
+    """
+    global _EPISODIC_MEMORY_SINGLETON
+    if _EPISODIC_MEMORY_SINGLETON is not None:
+        return _EPISODIC_MEMORY_SINGLETON
+    if os.environ.get("TA_EPISODIC_MEMORY", "1") == "0":
+        return None
+    try:
+        from explorer.episodic_memory import EpisodicMemory, EpisodicMemoryConfig
+    except ImportError:
+        logger.warning(
+            "explorer.episodic_memory unavailable — PER-169 disabled"
+        )
+        return None
+    cfg = EpisodicMemoryConfig(
+        falkordb_host=os.environ.get("TA_FALKORDB_HOST", "localhost"),
+        falkordb_port=int(os.environ.get("TA_FALKORDB_PORT", "6380")),
+        extraction_endpoint=os.environ.get(
+            "TA_EPISODIC_EXTRACTION_URL", "http://localhost:8083/v1"
+        ),
+        extraction_model=os.environ.get(
+            "TA_EPISODIC_EXTRACTION_MODEL", "rag-chat"
+        ),
+        embedding_endpoint=os.environ.get(
+            "TA_EPISODIC_EMBED_URL", "http://localhost:8082/v1"
+        ),
+        embedding_model=os.environ.get(
+            "TA_EPISODIC_EMBED_MODEL", "embeddings"
+        ),
+    )
+    _EPISODIC_MEMORY_SINGLETON = EpisodicMemory(cfg)
+    logger.info(
+        "Episodic memory factory: FalkorDB %s:%d, extraction=%s, embed=%s",
+        cfg.falkordb_host, cfg.falkordb_port,
+        cfg.extraction_endpoint, cfg.embedding_endpoint,
+    )
+    return _EPISODIC_MEMORY_SINGLETON
+
+
+def _make_grounder_client(backend_url: str, worker_token: str) -> Any:
+    """PER-164: build a GrounderClient if both backend_url + token are present.
+
+    Returns ``None`` when prerequisites are missing so the runner
+    silently uses chat-LLM coords (pre-PER-164 path). The client
+    itself handles the "no active grounder in DB" case by returning
+    ``None`` from ``locate()``, so this factory does not pre-check
+    /api/internal/grounder/dispatch.
+
+    Imported here (not at module top) to keep the worker bootable
+    on installs that pre-date the PER-164 module.
+    """
+    if not backend_url or not worker_token:
+        return None
+    try:
+        from explorer.grounder_client import GrounderClient
+    except ImportError:
+        logger.warning(
+            "explorer.grounder_client unavailable — PER-164 grounder disabled "
+            "(tap_at will use chat-LLM coords)"
+        )
+        return None
+    return GrounderClient(backend_url=backend_url, worker_token=worker_token)
 
 
 async def execute_one_run(

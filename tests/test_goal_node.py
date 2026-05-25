@@ -166,6 +166,15 @@ class FakeLLMClient:
         max_tokens: int = 400,
         response_format: dict | None = None,
         screenshot_b64: str | None = None,
+        *,
+        # PER-164 followup: accept sampling kwargs so the real
+        # ScenarioRunner can pass them through without exploding
+        # the fake. Tests rarely care about exact values — they
+        # land in self.calls for any test that wants to assert.
+        temperature: float = 0.2,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        min_p: float | None = None,
     ) -> str | None:
         self.calls.append(
             {
@@ -173,6 +182,10 @@ class FakeLLMClient:
                 "user": user,
                 "max_tokens": max_tokens,
                 "response_format": response_format,
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+                "min_p": min_p,
             }
         )
         if self.raise_once is not None:
@@ -305,7 +318,14 @@ async def test_T2_response_format_is_sent_with_test_data_enum() -> None:
     rf = llm.calls[0]["response_format"]
     assert rf["type"] == "json_schema"
     schema = rf["json_schema"]["schema"]
-    enum = schema["properties"]["value_source"]["enum"]
+    # PER-170: schema is now batch-shaped (top-level: done/reason/
+    # expected_next_screen/actions). The per-action constraints
+    # (value_source enum, element_id enum, action enum) moved into
+    # actions.items.* so each item in the batch is checked the same
+    # way the old single-action schema used to check the whole reply.
+    assert schema["required"] == ["done", "actions"]
+    item_schema = schema["properties"]["actions"]["items"]
+    enum = item_schema["properties"]["value_source"]["enum"]
     assert "test_data.phone" in enum
     assert "test_data.iban" in enum
     assert "goal_literal" in enum
@@ -317,12 +337,12 @@ async def test_T2_response_format_is_sent_with_test_data_enum() -> None:
     # per-branch oneOf constraints reliably (smoke run showed Gemma 4
     # returning element_id=null on tap despite the branch saying it
     # must be a string).
-    eid_prop = schema["properties"]["element_id"]
+    eid_prop = item_schema["properties"]["element_id"]
     assert eid_prop["type"] == "string"
     assert "phone_field" in eid_prop["enum"]
     assert "submit_btn" in eid_prop["enum"]
     assert None not in eid_prop["enum"]
-    assert "element_id" in schema["required"]
+    assert "element_id" in item_schema["required"]
 
 
 @pytest.mark.asyncio
@@ -666,7 +686,11 @@ def test_T15_element_targeted_actions_forbid_null_element_id() -> None:
         actions=actions,
         element_ids=["doneButton", "phone_field"],
     )
-    one_of = schema["allOf"][0]["oneOf"]
+    # PER-170: schema is now batch-shaped. The per-action ``allOf`` +
+    # ``oneOf`` discriminator that used to live at the schema root
+    # moved into ``actions.items``, since each item in the batch is
+    # validated the same way the old single-action schema was.
+    one_of = schema["properties"]["actions"]["items"]["allOf"][0]["oneOf"]
     by_action = {
         branch["properties"]["action"]["const"]: branch for branch in one_of
     }
@@ -1501,7 +1525,8 @@ def test_T36_schema_allows_null_element_id_when_tap_at_is_available() -> None:
         actions=actions_with_tap_at,
         element_ids=["btn_a", "btn_b"],
     )
-    el_schema = schema["properties"]["element_id"]
+    # PER-170: per-action constraints live inside actions.items now.
+    el_schema = schema["properties"]["actions"]["items"]["properties"]["element_id"]
     # Allow null for tap_at.
     assert el_schema["type"] == ["string", "null"], el_schema
     assert None in el_schema["enum"]
@@ -1515,7 +1540,7 @@ def test_T36_schema_allows_null_element_id_when_tap_at_is_available() -> None:
         actions=actions_without,
         element_ids=["btn_a"],
     )
-    el_legacy = schema_legacy["properties"]["element_id"]
+    el_legacy = schema_legacy["properties"]["actions"]["items"]["properties"]["element_id"]
     assert el_legacy["type"] == "string", el_legacy
     assert None not in el_legacy.get("enum", [])
 
@@ -1670,3 +1695,524 @@ async def test_T39_schema_null_leak_rejected_for_element_targeted_action() -> No
     # One LLM call consumed (the bad one); the done one was never
     # served because the loop aborted on the first None.
     assert len(llm.calls) == 1
+
+
+# ---------------------------------------------------------- PER-164 grounder
+
+
+class _FakeGrounder:
+    """Test double for explorer.grounder_client.GrounderClient.
+
+    Records every locate() call and returns a scripted result so we
+    can assert (a) when the dispatcher routes through the grounder,
+    (b) which (x, y, coord_space) tuple it ultimately taps.
+    """
+
+    def __init__(self, result):  # type: ignore[no-untyped-def]
+        self.result = result
+        self.calls: list[tuple[bytes, str]] = []
+
+    async def locate(self, screenshot_bytes: bytes, target_description: str):
+        self.calls.append((screenshot_bytes, target_description))
+        return self.result
+
+
+class _ControllerWithScreenshot(FakeController):
+    """Adds take_screenshot to FakeController for grounder tests.
+
+    Returns a real (tiny) PNG so PIL.Image.open inside the runner's
+    ``_take_screenshot_bytes`` can probe width/height — PER-164 needs
+    real dims for the ``image_pixels`` coord-space scaling. Defaults
+    mirror the resized portrait shape that ``screenshot_max_dim=1920``
+    produces from an iPhone 17 Pro Max native 1320×2868 capture.
+    """
+
+    fake_image_w: int = 884
+    fake_image_h: int = 1920
+
+    async def take_screenshot(self, max_dim: int | None = None) -> str:
+        import base64
+        import io
+        from PIL import Image
+        img = Image.new("RGB", (self.fake_image_w, self.fake_image_h), "white")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+@pytest.mark.asyncio
+async def test_T40_tap_at_routes_through_grounder_when_target_description() -> None:
+    """T40 (PER-164): when the chat-LLM emits tap_at with
+    ``target_description`` and a grounder is wired up, the runtime
+    must call ``grounder.locate(screenshot, description)`` and use
+    its (x, y) instead of the LLM's own coords. The grounder's
+    coord_space (pixels) drives the scaling — controller _scale=3.0,
+    so grounder pixel 600 → screen point 200.
+    """
+    from explorer.grounder_client import GrounderResult
+
+    controller = _ControllerWithScreenshot()
+    grounder = _FakeGrounder(GrounderResult(
+        x=600, y=1500, coord_space="pixels",
+        raw_text="click(start_box='(600,1500)')",
+    ))
+
+    decisions = [
+        _decision(
+            done=False, action="tap_at",
+            action_args={
+                # LLM provides bogus coords + a target_description;
+                # we expect the runtime to ignore (x, y) and use the
+                # grounder's answer.
+                "x": 999, "y": 999,
+                "target_description": "digit 8 on PIN keypad",
+            },
+            element_id=None,
+        ),
+        _decision(done=True, reason="ok"),
+    ]
+    llm = FakeLLMClient(responses=decisions)
+    runner = _make_runner(controller, llm, test_data={}, tap_at_coord_space="pixels")
+    runner._grounder = grounder  # bypass the no-grounder default
+    runner._settle_timeout_ms = 0
+    await runner._run_goal_node(
+        scenario_id="t40", step_idx=0,
+        data={"description": "tap 8", "max_steps": 3}, node_id="g1",
+    )
+    # Grounder was called with the description; LLM coords ignored.
+    assert len(grounder.calls) == 1, f"expected 1 grounder call, got {len(grounder.calls)}"
+    assert grounder.calls[0][1] == "digit 8 on PIN keypad"
+    # Final tap is grounder.x / scale, grounder.y / scale (pixels space).
+    assert controller.tap_at_calls == [(200, 500)], controller.tap_at_calls
+
+
+@pytest.mark.asyncio
+async def test_T41_tap_at_without_target_description_skips_grounder() -> None:
+    """T41 (PER-164): backward compat — when the chat-LLM emits
+    tap_at without ``target_description``, the runtime must NOT call
+    the grounder and must use the LLM's own (x, y) as before.
+
+    This preserves the pre-PER-164 behaviour for models that don't
+    speak the description-routing contract and for screens where
+    the LLM is confident in its own grounding (rare for canvas, but
+    routine for accessibility-rich elements where tap_at is an
+    escape hatch).
+    """
+    controller = _ControllerWithScreenshot()
+    grounder = _FakeGrounder(None)  # would return None even if called
+
+    decisions = [
+        _decision(
+            done=False, action="tap_at",
+            action_args={"x": 500, "y": 680},   # no target_description
+            element_id=None,
+        ),
+        _decision(done=True, reason="ok"),
+    ]
+    llm = FakeLLMClient(responses=decisions)
+    runner = _make_runner(controller, llm, test_data={}, tap_at_coord_space="normalized_1000")
+    runner._grounder = grounder
+    runner._settle_timeout_ms = 0
+    await runner._run_goal_node(
+        scenario_id="t41", step_idx=0,
+        data={"description": "tap by coords", "max_steps": 3}, node_id="g1",
+    )
+    assert grounder.calls == [], f"grounder should not have been called: {grounder.calls!r}"
+    # normalized_1000 with controller._width=440, _height=956 →
+    # x=500/1000*440=220, y=680/1000*956=650
+    assert controller.tap_at_calls == [(220, 650)], controller.tap_at_calls
+
+
+@pytest.mark.asyncio
+async def test_T42_grounder_image_pixels_scales_by_image_dim() -> None:
+    """T42 (PER-164): when the grounder returns coords in
+    ``image_pixels`` space (UI-TARS family), the dispatcher must
+    scale by ``screen_logical / image_dim``, NOT by retina factor.
+
+    UI-TARS sees the screenshot AFTER it was resized to
+    ``screenshot_max_dim``, so its coordinates are in image pixels
+    not phone-native pixels. The old retina-based scaling produces
+    a wrong target (taps end up far from the intended digit on a
+    PIN keypad).
+
+    Setup: image 884×1920 (portrait fit for 1920 max_dim from a
+    1320×2868 iPhone 17 Pro Max). Controller logical screen 440×956.
+    Grounder returns (442, 1280) — center-half pixel.
+    Expected screen point: (442 * 440 / 884, 1280 * 956 / 1920)
+                         = (219.99, 637.33) → (220, 637).
+    """
+    from explorer.grounder_client import GrounderResult
+
+    controller = _ControllerWithScreenshot()
+    controller.fake_image_w = 884
+    controller.fake_image_h = 1920
+    grounder = _FakeGrounder(GrounderResult(
+        x=442, y=1280, coord_space="image_pixels",
+        raw_text="click(start_box='(442,1280)')",
+    ))
+
+    decisions = [
+        _decision(
+            done=False, action="tap_at",
+            action_args={
+                "x": 0, "y": 0,  # LLM's coords don't matter — grounder wins
+                "target_description": "center of PIN keypad",
+            },
+            element_id=None,
+        ),
+        _decision(done=True, reason="ok"),
+    ]
+    llm = FakeLLMClient(responses=decisions)
+    runner = _make_runner(controller, llm, test_data={}, tap_at_coord_space="pixels")
+    runner._grounder = grounder
+    runner._settle_timeout_ms = 0
+    await runner._run_goal_node(
+        scenario_id="t42", step_idx=0,
+        data={"description": "tap center", "max_steps": 3}, node_id="g1",
+    )
+    assert len(grounder.calls) == 1
+    # Image-pixels scaling: raw * screen / image
+    assert controller.tap_at_calls == [(220, 637)], controller.tap_at_calls
+
+
+@pytest.mark.asyncio
+async def test_T43_sampling_profile_forwarded_to_llm_chat() -> None:
+    """T43 (PER-164 followup): the per-model sampling profile must
+    reach llm_client.chat() — not the worker's old hardcoded T=0.2.
+
+    Backend's claim_next ships ``default_temperature/_top_p/_top_k/
+    _min_p`` from the LLMModel row, worker passes them to
+    ScenarioRunner, ScenarioRunner threads them into every chat()
+    call so each model gets its family-appropriate band (Gemma 4
+    wants T=0.65/top_p=0.95/top_k=64/min_p=0.05, Qwen wants
+    T=0.7/top_p=0.8/top_k=20). Without this wire-through the
+    worker silently overrides every model with T=0.2 — the cause
+    of Gemma 4's impulsive single-step decisions on loading
+    screens in PER-164 smoke #5.
+    """
+    controller = FakeController()
+    llm = FakeLLMClient(responses=[_decision(done=True, reason="ok")])
+    events: list[dict] = []
+
+    async def sink(evt: dict) -> None:
+        events.append(evt)
+
+    from explorer.scenario_runner import ScenarioRunner
+
+    runner = ScenarioRunner(
+        controller=controller,
+        scenarios=[],
+        test_data={},
+        event_callback=sink,
+        llm_client=llm,
+        actions=[],
+        # Gemma 4-like passport.
+        sampling_temperature=0.65,
+        sampling_top_p=0.95,
+        sampling_top_k=64,
+        sampling_min_p=0.05,
+    )
+    runner._test_events = events  # type: ignore[attr-defined]
+    runner._settle_timeout_ms = 0
+    await runner._run_goal_node(
+        scenario_id="t43", step_idx=0,
+        data={"description": "go", "max_steps": 2}, node_id="g1",
+    )
+    assert llm.calls, "no LLM call made"
+    last = llm.calls[-1]
+    assert last["temperature"] == 0.65, last
+    assert last["top_p"] == 0.95, last
+    assert last["top_k"] == 64, last
+    assert last["min_p"] == 0.05, last
+
+
+# ---------------- PER-170 followup: id-keyword hints --------------------
+
+
+def test_T48_id_keyword_hint_disambiguates_unlabelled_back_forward() -> None:
+    """T48 (PER-170 followup): when two buttons live on the same screen
+    without accessibility labels (the iOS «(без подписи)» case), the
+    elements block must annotate them with hints derived from their
+    element_id so the chat-LLM can distinguish them by role.
+
+    Regression for the PER-170 smoke #2 bug: Gemma 4 reasoned «нажму
+    Вперёд для подтверждения» and then picked element_id=backButton —
+    because the prompt showed both buttons as
+    «id=backButton (без подписи)» / «id=forwardButton (без подписи)»
+    and the schema's element_id enum order is essentially random
+    from the model's POV.
+    """
+    from explorer.goal_schema import build_elements_block
+
+    elements = [
+        {"id": "backButton", "label": "", "kind": "button"},
+        {"id": "forwardButton", "label": "", "kind": "button"},
+        {"id": "submitBtn", "label": "", "kind": "button"},
+        # An element with a real label — hint must NOT override it.
+        {"id": "loginButton", "label": "Войти", "kind": "button"},
+        # An element whose id carries no recognisable keyword —
+        # fallback to bare «(без подписи)» (unchanged behaviour).
+        {"id": "Application_dengi_0", "label": "", "kind": "container"},
+    ]
+    block, ids = build_elements_block(elements)
+    assert "id=backButton" in block
+    assert "id=forwardButton" in block
+    assert "назад" in block.lower(), block
+    assert "вперёд" in block.lower(), block
+    assert "отправить" in block.lower(), block
+    # Real label survives untouched.
+    assert "Войти" in block, block
+    # The unrecognised id falls back to the legacy «(без подписи)»
+    # without a hint — we don't fabricate. ``Application_dengi_0``
+    # is the real-world root-container id we saw in PER-163 smokes,
+    # chosen as the «no hint» case because it's the most realistic
+    # noise id we'll encounter in production.
+    assert "Application_dengi_0 [container] (без подписи)" in block, block
+    # Crucially: no «вероятно …» annotation tacked on after.
+    assert "Application_dengi_0 [container] (без подписи; вероятно" not in block
+    # The id enum is unchanged.
+    assert ids == [
+        "backButton",
+        "forwardButton",
+        "submitBtn",
+        "loginButton",
+        "Application_dengi_0",
+    ]
+
+
+def test_T49_id_hint_tokenizes_snake_and_camel() -> None:
+    """T49: tokenizer recognises both camelCase (`backButton`) and
+    snake_case / kebab-case (`back_button`, `back-button`). Common
+    naming styles from iOS, Android, and web testing tools alike."""
+    from explorer.goal_schema import _hint_from_id
+
+    assert _hint_from_id("backButton") is not None
+    assert _hint_from_id("back_button") is not None
+    assert _hint_from_id("back-button") is not None
+    assert _hint_from_id("BackButton") is not None
+    # No recognisable keyword → no hint.
+    assert _hint_from_id("Application_dengi_0") is None
+    assert _hint_from_id("") is None
+
+
+# ---------------- PER-170 retry: Codex QA blockers ----------------------
+
+
+@pytest.mark.asyncio
+async def test_T50_batch_item_tap_without_element_id_is_skipped() -> None:
+    """T50 (PER-170 retry, Codex #1): when the LLM emits a batch item
+    like ``{"action":"tap","element_id":null}`` the runtime must reject
+    it before dispatch — schema grammar can't be trusted to enforce
+    per-branch oneOf constraints on llama-server. The item is recorded
+    in history with [SKIPPED: …] so the next LLM call sees the failure
+    and adapts; the rest of the batch is aborted (sibling actions
+    likely depended on the now-uncertain screen)."""
+    controller = FakeController(
+        elements=[{"id": "btn", "label": "Submit", "kind": "button"}]
+    )
+    # Batch with an invalid tap followed by a valid one — only the
+    # first should be processed (and skipped), the second must NOT
+    # dispatch because we break the batch on invalid items.
+    bad_decision = json.dumps({
+        "done": False,
+        "actions": [
+            {
+                "action": "tap",
+                "action_args": {},
+                "element_id": None,
+                "element_label": None,
+                "value_source": "none",
+                "value_literal": None,
+                "reasoning": "tap forward",
+            },
+            {
+                "action": "tap",
+                "action_args": {},
+                "element_id": "btn",
+                "element_label": "Submit",
+                "value_source": "none",
+                "value_literal": None,
+                "reasoning": "tap submit (should NOT run)",
+            },
+        ],
+    }, ensure_ascii=False)
+    # Second decision: model recovers after seeing [SKIPPED] in history.
+    good_decision = json.dumps({
+        "done": True,
+        "reason": "done",
+        "actions": [{
+            "action": "tap",
+            "action_args": {},
+            "element_id": "btn",
+            "element_label": "Submit",
+            "value_source": "none",
+            "value_literal": None,
+            "reasoning": "ok",
+        }],
+    }, ensure_ascii=False)
+    llm = FakeLLMClient(responses=[bad_decision, good_decision])
+    runner = _make_runner(controller, llm, test_data={})
+    await runner._run_goal_node(
+        scenario_id="t50", step_idx=0,
+        data={"description": "go", "max_steps": 5}, node_id="g1",
+    )
+    # The invalid first item must NOT have hit the controller.
+    # Only the recovery decision's tap on "btn" did.
+    assert controller.tap_calls == ["Submit"], controller.tap_calls
+
+
+@pytest.mark.asyncio
+async def test_T51_batch_item_tap_at_without_xy_or_desc_is_skipped() -> None:
+    """T51 (PER-170 retry, Codex #1 + PER-172 refinement): tap_at must
+    carry EITHER numeric x,y OR a non-empty target_description (which
+    the grounder uses to localise the target). Reject only when BOTH
+    are missing — the arguments_schema (PER-164 followup) explicitly
+    relaxes the required list at the JSON layer and delegates this
+    check to the runtime."""
+    controller = FakeController(
+        elements=[{"id": "btn", "label": "Cancel", "kind": "button"}]
+    )
+    # Empty action_args → no x, no y, no description → must skip.
+    bad = json.dumps({
+        "done": False,
+        "actions": [{
+            "action": "tap_at",
+            "action_args": {},
+            "element_id": None,
+            "element_label": None,
+            "value_source": "none",
+            "value_literal": None,
+            "reasoning": "tap somewhere",
+        }],
+    }, ensure_ascii=False)
+    recover = json.dumps({
+        "done": True,
+        "reason": "recovered",
+        "actions": [{
+            "action": "tap",
+            "action_args": {},
+            "element_id": "btn",
+            "element_label": "Cancel",
+            "value_source": "none",
+            "value_literal": None,
+            "reasoning": "ok",
+        }],
+    }, ensure_ascii=False)
+    llm = FakeLLMClient(responses=[bad, recover])
+    runner = _make_runner(controller, llm, test_data={})
+    await runner._run_goal_node(
+        scenario_id="t51", step_idx=0,
+        data={"description": "go", "max_steps": 5}, node_id="g1",
+    )
+    # tap_at without coords AND without target_description → no
+    # controller side-effect. Recovery tap on "Cancel" is the only
+    # thing that lands.
+    assert controller.tap_calls == ["Cancel"], controller.tap_calls
+    assert not getattr(controller, "tap_at_calls", [])
+
+
+def test_T52_quick_ax_snapshot_returns_elements_on_success() -> None:
+    """T52 (PER-170 retry, Codex #2): _quick_ax_snapshot is the cheap
+    AXe poll the runner uses between batch items to detect screen
+    drift. It must return the controller's elements as-is on success,
+    and None on failure / timeout — the in-batch break logic treats
+    None as "couldn't check, keep going" rather than aborting."""
+    controller = FakeController(
+        elements=[{"id": "x", "label": "X", "kind": "button"}]
+    )
+    runner = _make_runner(controller, FakeLLMClient(), test_data={})
+    import asyncio as _aio
+    snap = _aio.run(runner._quick_ax_snapshot())
+    assert snap is not None
+    assert isinstance(snap, list)
+    assert snap[0]["id"] == "x"
+
+
+# ---------------- PER-172: container-id detection ----------------------
+
+
+def test_T53_container_ids_are_detected() -> None:
+    """T53 (PER-172): root / app-shell ids are recognised so the
+    elements block can flag them and the runtime can refuse tap on
+    them. Catches the «Application_dengi_0», «AXWindow_root»,
+    «PinScreen_main» family without an app-specific hardcode."""
+    from explorer.goal_schema import _is_container_id
+
+    assert _is_container_id("Application_dengi_0") is True
+    assert _is_container_id("AXWindow_root") is True
+    assert _is_container_id("MainScaffold") is True
+    assert _is_container_id("RootView_42") is True
+    assert _is_container_id("PinScreen_main") is True
+    assert _is_container_id("login_page_root") is True
+
+    # Negatives: regular buttons / fields keep their meaning.
+    assert _is_container_id("phoneNumberTextFieldId") is False
+    assert _is_container_id("submitBtn") is False
+    assert _is_container_id("enter") is False
+    assert _is_container_id("") is False
+
+
+def test_T54_elements_block_marks_containers() -> None:
+    """T54: the elements block renders containers with the explicit
+    КОНТЕЙНЕР warning that the system prompt references."""
+    from explorer.goal_schema import build_elements_block
+
+    elements = [
+        {"id": "Application_dengi_0", "label": "", "kind": "container"},
+        {"id": "submitBtn", "label": "", "kind": "button"},
+    ]
+    block, _ = build_elements_block(elements)
+    assert "КОНТЕЙНЕР" in block
+    assert "tap_at" in block  # the hint suggests the alternative
+    # Real buttons keep the normal id-hint logic, no КОНТЕЙНЕР marker.
+    submit_line = [l for l in block.split("\n") if "submitBtn" in l][0]
+    assert "КОНТЕЙНЕР" not in submit_line
+
+
+@pytest.mark.asyncio
+async def test_T55_runtime_skips_tap_on_container_id() -> None:
+    """T55 (PER-172): even if the model picks a container element_id
+    (the «Application_dengi_0» fallback we saw live), the worker
+    refuses to dispatch it. The item is SKIPPED in history with a
+    clear reason and the batch is broken so the next LLM call sees
+    the failure and retries with tap_at."""
+    controller = FakeController(
+        elements=[
+            {"id": "Application_dengi_0", "label": "", "kind": "container"},
+            {"id": "submitBtn", "label": "Submit", "kind": "button"},
+        ]
+    )
+    bad = json.dumps({
+        "done": False,
+        "actions": [{
+            "action": "tap",
+            "action_args": {},
+            "element_id": "Application_dengi_0",
+            "element_label": None,
+            "value_source": "none",
+            "value_literal": None,
+            "reasoning": "no submit visible, tapping app",
+        }],
+    }, ensure_ascii=False)
+    recover = json.dumps({
+        "done": True,
+        "reason": "ok",
+        "actions": [{
+            "action": "tap",
+            "action_args": {},
+            "element_id": "submitBtn",
+            "element_label": "Submit",
+            "value_source": "none",
+            "value_literal": None,
+            "reasoning": "ok",
+        }],
+    }, ensure_ascii=False)
+    llm = FakeLLMClient(responses=[bad, recover])
+    runner = _make_runner(controller, llm, test_data={})
+    await runner._run_goal_node(
+        scenario_id="t55", step_idx=0,
+        data={"description": "go", "max_steps": 5}, node_id="g1",
+    )
+    # Container tap NEVER reached the controller; the recovery tap on
+    # the real Submit button did.
+    assert controller.tap_calls == ["Submit"], controller.tap_calls

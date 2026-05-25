@@ -6,3 +6,10 @@ hypothesis>=6.98.0
 Pillow>=10.2.0
 python-dotenv>=1.0.0
 python-json-logger>=3.0.0
+# PER-169: Graphiti episodic memory + FalkorDB graph backend.
+# Worker writes one episode per dispatched action (fire-and-forget);
+# queries the graph for relevant past actions before each goal
+# decision so chat-LLM sees explicit "you already tapped digit 8"
+# context. Fixes Gemma 4's PIN-loop where the model couldn't tell
+# from the screenshot how many dots were already filled.
+graphiti-core[falkordb]>=0.29.1,<0.30

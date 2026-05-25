@@ -92,6 +92,20 @@ class LLMClient:
         max_tokens: int = MAX_TOKENS,
         screenshot_b64: str | None = None,
         response_format: dict | None = None,
+        *,
+        # PER-164 followup: per-call sampling. Previously this method
+        # hardcoded ``temperature=0.2`` for every model — bug. Each
+        # family wants its own band: Gemma 4 wants T=0.65/top_p=0.95/
+        # top_k=64/min_p=0.05; Qwen-VL/3.x wants T=0.7/top_p=0.8/
+        # top_k=20/min_p=0. Worker pulls these from the LLMModel row
+        # via the run-claim response and threads them through here.
+        # NULL on top_k / min_p means "omit the field, let server
+        # use its default" — important because not every llama.cpp
+        # build accepts top_k=null on the wire.
+        temperature: float = 0.2,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        min_p: float | None = None,
     ) -> str | None:
         """Single-shot chat completion. Returns the assistant's text, or None on error.
 
@@ -140,8 +154,17 @@ class LLMClient:
                 {"role": "user", "content": user_content},
             ],
             "max_tokens": max_tokens,
-            "temperature": 0.2,
+            "temperature": float(temperature),
         }
+        # Only include optional sampling knobs when the caller provided
+        # them — keeps the payload compatible with older llama-server
+        # builds that reject unknown null fields.
+        if top_p is not None:
+            base_payload["top_p"] = float(top_p)
+        if top_k is not None:
+            base_payload["top_k"] = int(top_k)
+        if min_p is not None:
+            base_payload["min_p"] = float(min_p)
         try:
             async with httpx.AsyncClient(
                 timeout=self.timeout, trust_env=False
