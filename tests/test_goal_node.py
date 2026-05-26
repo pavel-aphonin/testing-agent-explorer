@@ -2256,3 +2256,25 @@ def test_T57_simulator_down_error_subclasses_runtime() -> None:
     assert issubclass(SimulatorDownError, RuntimeError)
     err = SimulatorDownError("simulator XYZ is no longer booted")
     assert "simulator" in str(err).lower()
+
+
+# ---------------- PER-144: empty LLM response diagnostics --------------
+
+
+@pytest.mark.asyncio
+async def test_T58_empty_llm_response_yields_explicit_no_decision_reason() -> None:
+    """T58 (PER-144): when the LLM returns an empty string the goal
+    must terminate with an explicit ``llm_no_decision`` reason, NOT
+    silently exit with a happy completion. The original bug logged a
+    warning but the runner kept the goal status as «done» — making it
+    hard to tell from the run summary whether the agent finished
+    naturally or was abandoned by an under-budgeted thinking pass."""
+    controller = FakeController()
+    llm = FakeLLMClient(responses=[""])  # one empty response
+    runner = _make_runner(controller, llm, test_data={})
+    ok, reason = await runner._run_goal_node(
+        scenario_id="t58", step_idx=0,
+        data={"description": "go", "max_steps": 2}, node_id="g1",
+    )
+    assert ok is False, "empty LLM response must not look like success"
+    assert reason == "llm_no_decision", reason

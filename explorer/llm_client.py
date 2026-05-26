@@ -145,7 +145,34 @@ class LLMClient:
             )
             response.raise_for_status()
             data = response.json()
-            return data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            content = choice.get("message", {}).get("content")
+            # PER-144 diagnostic: empty content is the symptom of a
+            # thinking-model JSON-pass that ran out of token budget
+            # inside <think>...</think> and never reached the closing
+            # tag. Before this branch we only logged "LLM chat call
+            # failed" with no signal as to why; live debugging was
+            # blind. Now we surface the three fields the operator
+            # needs to triage: finish_reason (length / stop / content
+            # filter), the actual completion_tokens used vs the
+            # max_tokens budget we allowed, and a preview of the
+            # reasoning_content channel (where Qwen-3.6 / DeepSeek-R1
+            # / Nemotron put their <think> when --jinja is on). The
+            # call still returns whatever `content` was — None / "" /
+            # malformed — so the caller can fail it as a no-decision.
+            if not (content or "").strip():
+                finish_reason = choice.get("finish_reason")
+                usage = data.get("usage") or {}
+                reasoning = choice.get("message", {}).get("reasoning_content")
+                logger.warning(
+                    "LLM returned empty content. finish_reason=%r "
+                    "usage=%r max_tokens=%r reasoning_preview=%r",
+                    finish_reason,
+                    {k: usage.get(k) for k in ("completion_tokens", "prompt_tokens", "total_tokens")},
+                    body.get("max_tokens"),
+                    (reasoning or "")[:200] if reasoning else None,
+                )
+            return content
 
         base_payload: dict = {
             "model": self.model_name,

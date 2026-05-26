@@ -2267,11 +2267,18 @@ class ScenarioRunner:
             raw = await self.llm_client.chat(
                 system=sysprompt_with_think,
                 user=user_prompt,
-                # Headroom for chain-of-thought. 1500 tokens is the
-                # sweet spot for Gemma 4 — long enough for a couple
-                # of paragraphs of reasoning, short enough that one
-                # bad request doesn't burn 30s of inference.
-                max_tokens=1500,
+                # PER-144: raised 1500 → 4000. Nemotron-style reasoning
+                # models on real goal-decide prompts (history + elements
+                # + screenshot) need >1500 tokens just to fit the
+                # <think> block; with the old cap the response hits
+                # finish_reason=length before the model closes
+                # </think> and content arrives empty. 4000 gives the
+                # tail enough breathing room to also write a JSON
+                # answer after the think block — measured on Nemotron
+                # 3 Nano Omni 30B-A3B and Qwen-3.6 with sane budgets.
+                # If you trim this back, also lower
+                # ``json_max_tokens`` in _goal_decide for symmetry.
+                max_tokens=4000,
                 screenshot_b64=screenshot_b64,
             )
         except Exception as exc:
