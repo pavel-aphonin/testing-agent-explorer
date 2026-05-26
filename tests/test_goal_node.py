@@ -2216,3 +2216,43 @@ async def test_T55_runtime_skips_tap_on_container_id() -> None:
     # Container tap NEVER reached the controller; the recovery tap on
     # the real Submit button did.
     assert controller.tap_calls == ["Submit"], controller.tap_calls
+
+
+# ---------------- PER-107: simulator-down detection ---------------------
+
+
+def test_T56_simulator_down_detector_catches_axe_and_simctl_messages() -> None:
+    """T56 (PER-107): _is_simulator_down recognises both AXe's and
+    simctl's «device not booted» error strings. Without this signal
+    the worker treats a dead simulator as a transient AXe glitch and
+    retries describe-ui for 18+ minutes (real incident: PER-107)."""
+    from explorer.axe_client import _is_simulator_down
+
+    # AXe variant — observed in PER-107
+    assert _is_simulator_down(
+        "Device 7B4EE110-EE1D-48CB-9CDC-16441EBEEEB5 is not booted"
+    )
+    # simctl variants
+    assert _is_simulator_down("Unable to find a device with state: Booted")
+    assert _is_simulator_down("No devices are booted.")
+    assert _is_simulator_down("Current state: Shutdown")
+    # Case-insensitive
+    assert _is_simulator_down("IS NOT BOOTED")
+
+    # Negatives — generic failures must NOT trigger fast-fail (we want
+    # to retry transient AXe glitches a few times before giving up).
+    assert not _is_simulator_down("Some other generic failure")
+    assert not _is_simulator_down("AXe describe-ui timed out")
+    assert not _is_simulator_down("")
+
+
+def test_T57_simulator_down_error_subclasses_runtime() -> None:
+    """T57: SimulatorDownError must subclass RuntimeError so existing
+    ``except Exception`` blocks still catch it as a last-resort fallback,
+    but it's distinct enough for the worker's outer loop to single it
+    out via isinstance() and present a clean error message."""
+    from explorer.axe_client import SimulatorDownError
+
+    assert issubclass(SimulatorDownError, RuntimeError)
+    err = SimulatorDownError("simulator XYZ is no longer booted")
+    assert "simulator" in str(err).lower()

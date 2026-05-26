@@ -22,6 +22,38 @@ from dataclasses import dataclass
 logger = logging.getLogger("explorer.axe_client")
 
 
+class SimulatorDownError(RuntimeError):
+    """Raised when AXe / simctl reports the simulator is no longer
+    booted. Separated from generic AXe failures (parse errors,
+    accidental crashes inside describe-ui) so the worker can react
+    differently — repeated transient AXe glitches are worth a retry,
+    but a dead simulator means the run is dead too and we should
+    fail it fast instead of looping ``describe-ui`` for 18 minutes
+    (PER-107). The message string is interchangeable; the type is
+    the signal."""
+
+
+# PER-107: substrings in stderr that mean «the simulator is gone».
+# Matched case-insensitively against the captured stderr — broad
+# enough to catch both axe's variant («Device * is not booted») and
+# simctl's variant («Unable to find a device with state: booted /
+# Booted»). Kept narrow on purpose: a generic «failed» does NOT count
+# as a dead simulator, only these explicit booted-state messages.
+_SIMULATOR_DOWN_MARKERS: tuple[str, ...] = (
+    "is not booted",
+    "unable to find a device with state",
+    "no devices are booted",
+    "current state: shutdown",
+)
+
+
+def _is_simulator_down(stderr: str) -> bool:
+    if not stderr:
+        return False
+    low = stderr.lower()
+    return any(m in low for m in _SIMULATOR_DOWN_MARKERS)
+
+
 # PER-111 v2: a short, alphanumeric slug used inside synthetic
 # element ids when AXUniqueId is missing. We transliterate Cyrillic
 # (Готово → gotovo) so the generated id stays purely ASCII — keeps
@@ -593,10 +625,21 @@ class AXeExplorerClient:
         ) as tf:
             path = tf.name
         try:
-            code, _, _ = await _run([
+            code, _, stderr = await _run([
                 "xcrun", "simctl", "io", self._udid, "screenshot", path
             ])
             if code != 0:
+                # PER-107: distinguish dead simulator from a transient
+                # simctl glitch (it's flaky under load). Worker outer
+                # loop catches SimulatorDownError and fails the run
+                # fast; empty-string return keeps the legacy soft path
+                # for everything else (screenshot loss is non-fatal —
+                # next step retries on its own).
+                if _is_simulator_down(stderr):
+                    raise SimulatorDownError(
+                        f"simulator {self._udid} is no longer booted "
+                        f"(simctl io screenshot: {stderr[:160]})"
+                    )
                 return ""
 
             from io import BytesIO
@@ -624,11 +667,24 @@ class AXeExplorerClient:
                 pass
 
     async def get_ui_elements(self) -> list[dict]:
-        """Get accessibility tree via AXe CLI."""
+        """Get accessibility tree via AXe CLI.
+
+        PER-107: a dead simulator (manual shutdown, OS sleep, memory
+        pressure under heavy llama load) makes ``axe describe-ui``
+        return stderr containing «is not booted» — we used to log a
+        warning, return [], and retry forever from the outer loop.
+        Now we surface ``SimulatorDownError`` so the worker can fail
+        the run quickly instead of looping for 18 minutes.
+        """
         code, stdout, stderr = await _run([
             AXE, "describe-ui", "--udid", self._udid
         ])
         if code != 0:
+            if _is_simulator_down(stderr):
+                raise SimulatorDownError(
+                    f"simulator {self._udid} is no longer booted "
+                    f"(axe describe-ui: {stderr[:160]})"
+                )
             logger.warning(f"AXe describe-ui failed: {stderr[:200]}")
             return []
 

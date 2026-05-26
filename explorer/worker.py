@@ -945,10 +945,33 @@ async def execute_one_run(
         # log and exit cleanly so the claim loop picks up the next run.
         logger.info("Run %s cancelled mid-execution: %s", run_id, exc)
     except Exception as exc:
-        logger.exception("Run %s failed", run_id)
-        await sink(
-            {"type": "error", "step_idx": 0, "message": str(exc)},
-        )
+        # PER-107: dead-simulator detection. axe_client raises
+        # SimulatorDownError specifically when AXe / simctl report
+        # «is not booted»; without this branch the previous behaviour
+        # was to keep calling describe-ui for 18+ minutes before a
+        # human killed the worker. Surface a distinct error_message
+        # so the run shows up in the UI as «simulator died» rather
+        # than a generic «Run failed: ... is not booted».
+        from explorer.axe_client import SimulatorDownError
+        if isinstance(exc, SimulatorDownError):
+            logger.warning(
+                "Run %s aborted — simulator down: %s", run_id, exc,
+            )
+            await sink(
+                {
+                    "type": "error",
+                    "step_idx": 0,
+                    "message": (
+                        "Симулятор завершил работу до конца run'а "
+                        f"({exc}). Перезапустите симулятор и run."
+                    ),
+                },
+            )
+        else:
+            logger.exception("Run %s failed", run_id)
+            await sink(
+                {"type": "error", "step_idx": 0, "message": str(exc)},
+            )
 
 
 async def worker_loop(
