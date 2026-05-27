@@ -959,6 +959,53 @@ async def execute_one_run(
     logger.info("%s", format_inventory(inventory))
     config["_role_resolver"] = role_resolver
 
+    # PER-196: instantiate per-role agent wrappers and stash on
+    # config so downstream call sites can pull them without
+    # re-importing the package. Agents resolve their endpoint lazily
+    # on first call — instantiation is free.
+    from explorer.agents import (
+        AmbiguityAgent, GrounderAgent, MemoryAgent, PlannerAgent, SafetyAgent,
+    )
+    agents = {
+        "planner": PlannerAgent(role_resolver),
+        "grounder": GrounderAgent(role_resolver),
+        "safety": SafetyAgent(role_resolver),
+        "ambiguity": AmbiguityAgent(role_resolver),
+        "memory": MemoryAgent(role_resolver),
+    }
+    config["_agents"] = agents
+    logger.info("PER-196 agents ready: %s", sorted(agents.keys()))
+
+    # PER-196 smoke probe: ask the Ambiguity agent to resolve the
+    # scenario goal once at run start. Result is logged for the
+    # operator and stashed for downstream Planner calls — proves the
+    # whole resolve → llama-swap → grammar-JSON path works end-to-
+    # end on a real assignment. Failure is non-fatal; the legacy
+    # monolith path still drives the rest of the run.
+    task_desc = (
+        config.get("scenario_title")
+        or config.get("title")
+        or f"Free exploration of {config.get('bundle_id', 'app')}"
+    )
+    try:
+        canonical = await agents["ambiguity"].resolve(
+            task_description=task_desc,
+            screen_description="(launch — screen not yet captured)",
+        )
+        if canonical is None:
+            logger.info(
+                "PER-196 Ambiguity probe: role unassigned or model error — "
+                "scenario proceeds with raw goal.",
+            )
+        else:
+            logger.info(
+                "PER-196 Ambiguity → ambiguous=%s confidence=%.2f canonical=%r",
+                canonical.is_ambiguous, canonical.confidence, canonical.canonical_path[:120],
+            )
+            config["_canonical_path"] = canonical.canonical_path
+    except Exception as exc:
+        logger.warning("PER-196 Ambiguity probe errored (non-fatal): %s", exc)
+
     try:
         await executor.run(config, sink)
         await sink(
