@@ -171,6 +171,33 @@ class BackendClient:
                 "post_defect rejected: %s %s", resp.status_code, resp.text,
             )
 
+    async def get_module_assignment(self, role: str) -> dict[str, Any] | None:
+        """PER-195: resolve a ModuleRole to its assigned LLM passport.
+
+        Returns the flat passport dict (model_name, endpoint_url,
+        sampling defaults, vision flag, …) or ``None`` when the role
+        is unassigned (backend 404) or unreachable. Caller (the role
+        resolver) decides if None is fatal — PLANNER missing is, but
+        GROUNDING_VERIFIER missing is the supported logprobs-only mode.
+        """
+        try:
+            resp = await self._client.get(
+                f"{self._base_url}/api/internal/module-assignments/{role}",
+                headers=self._headers,
+            )
+        except httpx.HTTPError as exc:
+            logger.warning("get_module_assignment(%s) failed: %s", role, exc)
+            return None
+        if resp.status_code == 404:
+            return None
+        if resp.status_code >= 300:
+            logger.warning(
+                "get_module_assignment(%s) rejected: %s %s",
+                role, resp.status_code, resp.text,
+            )
+            return None
+        return resp.json()
+
     async def aclose(self) -> None:
         await self._client.aclose()
 
@@ -921,6 +948,16 @@ async def execute_one_run(
     # backend rejects with 401 - silently dropping all RAG checks).
     config["_backend_url"] = client._base_url
     config["_worker_token"] = client.worker_token
+
+    # PER-195: build a per-run role resolver and probe the inventory
+    # of role → model assignments. Logged at run start so an operator
+    # can spot a missing PLANNER assignment before the run wastes
+    # minutes hitting it on a hot path.
+    from explorer.role_resolver import RoleResolver, format_inventory
+    role_resolver = RoleResolver(client)
+    inventory = await role_resolver.probe_inventory()
+    logger.info("%s", format_inventory(inventory))
+    config["_role_resolver"] = role_resolver
 
     try:
         await executor.run(config, sink)
