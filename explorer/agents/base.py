@@ -13,6 +13,7 @@ RoleResolver's TTL cache governs how soon the change takes effect).
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
@@ -25,9 +26,15 @@ logger = logging.getLogger("explorer.agents")
 
 
 # Where llama-swap listens for chat completions. Used as the default
-# when an ``LLMModel.endpoint_url`` is NULL (the common case — most
-# models live behind llama-swap on localhost:8080).
-DEFAULT_LLAMA_SWAP_URL = "http://host.docker.internal:8080"
+# when an ``LLMModel.endpoint_url`` is NULL.
+#
+# PER-201 #3: the worker is a HOST process (it drives the iOS simulator),
+# so llama-swap on the same host is reachable at plain localhost — NOT
+# host.docker.internal (that only resolves from inside a container).
+# Overridable via TA_LLAMA_SWAP_URL for setups that route differently.
+DEFAULT_LLAMA_SWAP_URL = os.environ.get(
+    "TA_LLAMA_SWAP_URL", "http://localhost:8080"
+)
 
 
 @dataclass
