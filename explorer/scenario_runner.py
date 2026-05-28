@@ -59,6 +59,34 @@ from explorer.goal_schema import (
 logger = logging.getLogger("explorer.scenario_runner")
 
 
+def _loop_breaker_hint(history: list[str] | None) -> str | None:
+    """PER-200 loop-breaker: detect 3+ near-identical recent actions and
+    return a «you're stuck» rule. Pure string heuristic — no LLM.
+
+    Compares the last 3 history entries after stripping digits and
+    whitespace (so «tap_at цифра 8» and «tap_at цифра 0» count as the
+    same *kind* of repeated action — re-tapping the keypad). None when
+    fewer than 3 entries or they differ.
+    """
+    if not history or len(history) < 3:
+        return None
+    import re as _re
+
+    def _norm(s: str) -> str:
+        return _re.sub(r"\d+|\s+", "", s.lower())[:60]
+
+    last3 = [_norm(h) for h in history[-3:]]
+    if last3[0] and last3[0] == last3[1] == last3[2]:
+        return (
+            "⚠️ ЦИКЛ: последние 3 действия практически одинаковы и НЕ "
+            "продвигают к цели. ОБЯЗАТЕЛЬНО выбери ДРУГОЕ действие — "
+            "другой элемент, другой тип действия (например tap_at по "
+            "видимой кнопке подтверждения внизу экрана), либо проверь, "
+            "не нужно ли подтвердить уже введённые данные."
+        )
+    return None
+
+
 # PER-111: prompt template fetched from backend (/api/internal/system-
 # prompts). Cache for 60s — admin edits propagate within a minute,
 # which is fast enough for hot-reload and slow enough that thousands
@@ -2478,6 +2506,16 @@ class ScenarioRunner:
         ctx_hint = await self._context_pin_hint(elements_block, history)
         if ctx_hint:
             user_prompt = ctx_hint + "\n\n" + user_prompt
+
+        # PER-200 (loop-breaker, pure-Python slice): if the last 3
+        # history entries are near-identical the agent is stuck in a
+        # cycle (the «tap 8 ×5» pattern). Inject a hard «this isn't
+        # working, do something DIFFERENT» rule. Cheap — no LLM call —
+        # and complements the Context Identifier hint for the general
+        # case (non-PIN loops too).
+        loop_hint = _loop_breaker_hint(history)
+        if loop_hint:
+            user_prompt = loop_hint + "\n\n" + user_prompt
 
         # PER-169: episodic memory recall as a prepended block.
         # We prepend instead of using a template placeholder so the
