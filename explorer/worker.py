@@ -266,15 +266,11 @@ class RealExecutor:
         prior_provider = None
         mode_config = MODE_CONFIGS[mode]
         if mode_config.use_llm_priors:
-            llm_url = os.environ.get("TA_LLM_BASE_URL", "http://localhost:8080")
-            # PER-106 #5: prefer the per-run model name from the claim
-            # response. The backend resolves it from the user's pick or
-            # AgentSettings default; ``None`` here means "no override",
-            # and we fall back to the worker's env var as before.
-            llm_model = (
-                config.get("llm_model_name")
-                or os.environ.get("TA_LLM_MODEL_NAME", "embeddings")
-            )
+            # PER-196: resolve PLANNER role first. If an assignment
+            # exists, use its endpoint+model; otherwise fall back to
+            # the legacy env var (back-compat for ops who haven't
+            # rolled onto the 12-module config).
+            llm_url, llm_model = await _resolve_planner_endpoint(config)
             try:
                 from explorer.llm_client import LLMClient, LLMPriorProvider
 
@@ -283,8 +279,8 @@ class RealExecutor:
                     llm, vision_enabled=mode_config.vision_enabled
                 )
                 logger.info(
-                    "LLM prior provider enabled (mode=%s, vision=%s)",
-                    mode.value, mode_config.vision_enabled,
+                    "LLM prior provider enabled (mode=%s, vision=%s, url=%s, model=%s)",
+                    mode.value, mode_config.vision_enabled, llm_url, llm_model,
                 )
             except Exception:
                 logger.exception("LLM prior provider failed — uniform priors")
@@ -507,14 +503,10 @@ class RealExecutor:
             # Three modes, three execution paths. Each one is the
             # documented runtime for that mode (see modes.py). No
             # silent aliasing.
-            llm_url = os.environ.get("TA_LLM_BASE_URL", "http://localhost:8080")
-            # PER-106 #5: same per-run override as the prior_provider
-            # branch above; keep the two in sync so AI mode actually
-            # honours the user's selection.
-            llm_model_name = (
-                config.get("llm_model_name")
-                or os.environ.get("TA_LLM_MODEL_NAME", "embeddings")
-            )
+            # PER-196: PLANNER assignment drives the AI / Hybrid loop URL too —
+            # same resolution path as the prior_provider branch above. Stays
+            # env-var-compatible when no PER-175 assignment exists.
+            llm_url, llm_model_name = await _resolve_planner_endpoint(config)
 
             if mode is ExplorationMode.AI:
                 # AI: LLM picks every action. Routes through
@@ -897,6 +889,40 @@ def _get_episodic_memory() -> Any | None:
         cfg.extraction_endpoint, cfg.embedding_endpoint,
     )
     return _EPISODIC_MEMORY_SINGLETON
+
+
+async def _resolve_planner_endpoint(config: dict[str, Any]) -> tuple[str, str]:
+    """PER-196: figure out which (url, model_name) the legacy
+    LLMClient / LLMExplorationLoop should hit for the PLANNER role.
+
+    Resolution order (first hit wins):
+      1. ``config["_role_resolver"]``.resolve(PLANNER) → use its
+         endpoint_url + model_name. Requires PER-193+PER-195 wiring.
+      2. ``config["llm_model_name"]`` from the claim payload combined
+         with ``TA_LLM_BASE_URL`` env. The legacy per-run override.
+      3. Pure env-var defaults — last-resort backward compat.
+
+    Returns ``(base_url, model_name)`` ready to pass straight to
+    ``LLMClient(base_url=..., model_name=...)``.
+    """
+    resolver = config.get("_role_resolver")
+    if resolver is not None:
+        try:
+            from explorer.role_resolver import ModuleRole
+            endpoint = await resolver.resolve(ModuleRole.PLANNER, required=False)
+        except Exception as exc:
+            logger.warning("PLANNER resolve failed (will fall back to env): %s", exc)
+            endpoint = None
+        if endpoint is not None and endpoint.endpoint_url:
+            return endpoint.endpoint_url, endpoint.model_name
+
+    # Legacy paths
+    llm_url = os.environ.get("TA_LLM_BASE_URL", "http://localhost:8080")
+    llm_model = (
+        config.get("llm_model_name")
+        or os.environ.get("TA_LLM_MODEL_NAME", "embeddings")
+    )
+    return llm_url, llm_model
 
 
 def _make_grounder_client(backend_url: str, worker_token: str) -> Any:
