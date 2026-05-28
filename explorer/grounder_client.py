@@ -71,6 +71,33 @@ class GrounderResult:
     y: int
     coord_space: str
     raw_text: str
+    # PER-199: mean top-1 token probability of the grounding output
+    # (0..1), or None when the server didn't return logprobs. Low =
+    # the model was unsure where to click.
+    confidence: float | None = None
+
+
+def _grounding_confidence(data: dict) -> float | None:
+    """PER-199: mean top-1 token probability across the response.
+
+    Reads the OpenAI-style ``logprobs.content[*].logprob`` list and
+    returns ``mean(exp(logprob))``. None when the server didn't return
+    logprobs (older llama-server, or the field is absent). Cheap,
+    no extra model — this IS the Grounding Verifier.
+    """
+    import math
+    try:
+        content = data["choices"][0]["logprobs"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    probs = []
+    for tok in content or []:
+        lp = tok.get("logprob")
+        if lp is not None:
+            probs.append(math.exp(lp))
+    if not probs:
+        return None
+    return sum(probs) / len(probs)
 
 
 class GrounderClient:
@@ -168,6 +195,12 @@ class GrounderClient:
             "max_tokens": 64,
             "temperature": cfg.default_temperature,
             "top_p": cfg.default_top_p,
+            # PER-199: ask llama-server for per-token logprobs so we can
+            # compute a confidence on the grounding output (Grounding
+            # Verifier = calibration, no separate model). top_logprobs
+            # gives us the top-2 gap on each token of the coordinate.
+            "logprobs": True,
+            "top_logprobs": 2,
             "messages": [{
                 "role": "user",
                 "content": [
@@ -191,6 +224,17 @@ class GrounderClient:
         except Exception:
             logger.exception("Grounder HTTP call to %s failed", url)
             return None
+
+        # PER-199: compute grounding confidence from logprobs. Mean of
+        # the per-token top-1 probability across the response; low mean
+        # means the model was unsure where to click. Logged for every
+        # grounding so we can calibrate a threshold from real data.
+        confidence = _grounding_confidence(data)
+        if confidence is not None:
+            logger.info(
+                "[PER-199 verifier] grounding confidence=%.3f target=%r",
+                confidence, target_description.strip()[:60],
+            )
 
         if not text:
             logger.warning("Grounder returned empty content (model=%s)", cfg.name)
@@ -227,4 +271,5 @@ class GrounderClient:
             x=x, y=y,
             coord_space=cfg.tap_at_coord_space,
             raw_text=text,
+            confidence=confidence,
         )
