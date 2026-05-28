@@ -348,6 +348,10 @@ class ScenarioRunner:
         # prompt — the behavioural fix the routing-only refactor
         # (PER-196) couldn't deliver. None → legacy behaviour.
         self.context_agent: Any | None = None
+        # PER-200: Reflection agent — invoked when the loop-breaker
+        # detects the agent is stuck, to produce a specific «try this
+        # instead» recommendation. Set externally by the worker.
+        self.reflection_agent: Any | None = None
         self._actions: list[dict[str, Any]] = list(actions or [])
         # PER-127 settle config. Sane defaults if the backend ships
         # nothing (legacy workspace pre-migration, or test fixtures).
@@ -2414,6 +2418,37 @@ class ScenarioRunner:
             "экрана\". Это единственный способ продвинуться дальше."
         )
 
+    def _credential_routing_hint(self) -> str | None:
+        """PER-200: tell the Planner which test_data key maps to which
+        code-entry screen, so it stops grabbing the wrong credential.
+
+        The PER-198 smoke showed the model entering ``sms_code`` (0000)
+        on a PIN screen instead of ``pin_code`` (8520) — the goal text
+        crams four similar credentials together and the 4B model can't
+        disambiguate. This static routing table is injected on every
+        goal decision (cheap, no LLM) and only references keys that
+        actually exist in test_data, with values MASKED (we never put
+        real secrets in the prompt beyond what value_source already
+        does).
+        """
+        keys = set(self.test_data.keys())
+        rules: list[str] = []
+        if "pin_code" in keys:
+            rules.append("экран ПИН-кода (4 цифры, заголовок про код/PIN) → используй test_data.pin_code")
+        if "sms_code" in keys:
+            rules.append("экран кода из СМС (упоминание SMS/смс/одноразовый код) → используй test_data.sms_code")
+        if "password" in keys:
+            rules.append("экран временного пароля / пароля → используй test_data.password")
+        if "phone" in keys:
+            rules.append("экран номера телефона → используй test_data.phone")
+        if len(rules) < 2:
+            return None  # nothing to disambiguate
+        return (
+            "📋 СООТВЕТСТВИЕ ДАННЫХ И ЭКРАНОВ (выбирай value_source строго "
+            "по типу текущего экрана, НЕ путай коды между собой):\n  - "
+            + "\n  - ".join(rules)
+        )
+
     async def _goal_decide(
         self,
         *,
@@ -2515,7 +2550,33 @@ class ScenarioRunner:
         # case (non-PIN loops too).
         loop_hint = _loop_breaker_hint(history)
         if loop_hint:
+            # PER-200: when stuck, escalate to the Reflection agent for a
+            # specific «try this instead» recommendation (LLM, but only
+            # fires on the rare stuck-event, not every step). Falls back
+            # to the static hint when reflection is unavailable / fails.
+            if self.reflection_agent is not None and goal_text:
+                try:
+                    note = await self.reflection_agent.review(goal_text, history or [])
+                except Exception as exc:
+                    logger.debug("reflection review failed: %s", exc)
+                    note = None
+                if note is not None and note.recommendation:
+                    logger.info(
+                        "[PER-200 reflection] stuck=%s rec=%s",
+                        note.stuck, note.recommendation[:120],
+                    )
+                    loop_hint = (
+                        loop_hint
+                        + f"\n🧭 РЕКОМЕНДАЦИЯ РЕФЛЕКСИИ: {note.recommendation}"
+                    )
             user_prompt = loop_hint + "\n\n" + user_prompt
+
+        # PER-200: credential→screen routing. Always-on (cheap) so the
+        # model picks the right test_data key per screen type — the
+        # direct fix for the «entered sms_code on the PIN screen» bug.
+        cred_hint = self._credential_routing_hint()
+        if cred_hint:
+            user_prompt = cred_hint + "\n\n" + user_prompt
 
         # PER-169: episodic memory recall as a prepended block.
         # We prepend instead of using a template placeholder so the

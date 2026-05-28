@@ -14,6 +14,12 @@ agent for an unassigned role is asked for.
 
 from explorer.agents.ambiguity import AmbiguityAgent
 from explorer.agents.base import RoleAgent, RoleAgentResult
+from explorer.agents.critic import (
+    ReflectionAgent,
+    ReflectionNote,
+    RewardCriticAgent,
+    RewardScore,
+)
 from explorer.agents.grounder import GrounderAgent
 from explorer.agents.memory import MemoryAgent
 from explorer.agents.perception import (
@@ -36,6 +42,10 @@ __all__ = [
     "MemoryAgent",
     "ParsedScreen",
     "PlannerAgent",
+    "ReflectionAgent",
+    "ReflectionNote",
+    "RewardCriticAgent",
+    "RewardScore",
     "RoleAgent",
     "RoleAgentResult",
     "ScreenParserAgent",
