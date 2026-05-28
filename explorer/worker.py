@@ -714,6 +714,9 @@ class RealExecutor:
                         # history_block + visited hints.
                         memory=_get_episodic_memory(),
                     )
+                    # PER-198: hand the Context Identifier agent to the
+                    # runner so goal decisions get the PIN-screen hint.
+                    sr.context_agent = (config.get("_agents") or {}).get("context")
                     sr_summary = await sr.run_all()
                     logger.info("[scenario] summary: %s", sr_summary)
                 except RunCancelled:
@@ -990,7 +993,8 @@ async def execute_one_run(
     # re-importing the package. Agents resolve their endpoint lazily
     # on first call — instantiation is free.
     from explorer.agents import (
-        AmbiguityAgent, GrounderAgent, MemoryAgent, PlannerAgent, SafetyAgent,
+        AmbiguityAgent, ContextIdentifierAgent, DynamicPerceiverAgent,
+        GrounderAgent, MemoryAgent, PlannerAgent, ScreenParserAgent, SafetyAgent,
     )
     agents = {
         "planner": PlannerAgent(role_resolver),
@@ -998,6 +1002,10 @@ async def execute_one_run(
         "safety": SafetyAgent(role_resolver),
         "ambiguity": AmbiguityAgent(role_resolver),
         "memory": MemoryAgent(role_resolver),
+        # PER-198 perception agents
+        "context": ContextIdentifierAgent(role_resolver),
+        "dynamic_perceiver": DynamicPerceiverAgent(role_resolver),
+        "screen_parser": ScreenParserAgent(role_resolver),
     }
     config["_agents"] = agents
     logger.info("PER-196 agents ready: %s", sorted(agents.keys()))

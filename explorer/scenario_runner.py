@@ -312,6 +312,14 @@ class ScenarioRunner:
         self.defect_callback = defect_callback
         self.run_id = run_id
         self.llm_client = llm_client
+        # PER-198: optional Context Identifier agent. Set externally by
+        # the worker after construction (sr.context_agent = ...). When
+        # present, each goal decision is preceded by a screen-type
+        # classification; a PIN_entry verdict + >=4 digit taps in
+        # history injects a hard «press submit now» rule into the
+        # prompt — the behavioural fix the routing-only refactor
+        # (PER-196) couldn't deliver. None → legacy behaviour.
+        self.context_agent: Any | None = None
         self._actions: list[dict[str, Any]] = list(actions or [])
         # PER-127 settle config. Sane defaults if the backend ships
         # nothing (legacy workspace pre-migration, or test fixtures).
@@ -2331,6 +2339,53 @@ class ScenarioRunner:
                 parts.append(action)
         return ", ".join(parts)
 
+    async def _context_pin_hint(
+        self, elements_block: str, history: list[str] | None
+    ) -> str | None:
+        """PER-198: classify the screen and, on a PIN/secret-code screen
+        with >=4 digit taps already in history, return a hard rule for
+        the Planner. None when no context agent, classification fails,
+        screen isn't PIN, or fewer than 4 digits entered.
+
+        Counting heuristic: a «digit tap» is any history entry that
+        mentions tap/tap_at plus a single 0-9 token (the keypad presses
+        our own logs render as «tap_at … цифра 8 …» / «input … pin»).
+        Deliberately loose — over-counting only makes the submit hint
+        fire one step earlier, which is harmless; under-counting is the
+        failure we're fixing.
+        """
+        if self.context_agent is None:
+            return None
+        try:
+            result = await self.context_agent.classify(elements_block)
+        except Exception as exc:  # never break the decision loop
+            logger.debug("context classify failed: %s", exc)
+            return None
+        if result is None or not result.is_pin_entry:
+            return None
+
+        import re as _re
+        digit_taps = 0
+        for h in (history or []):
+            hl = h.lower()
+            if ("tap" in hl or "input" in hl or "ввод" in hl) and _re.search(r"\b\d\b|цифр|pin|код", hl):
+                digit_taps += 1
+
+        logger.info(
+            "[PER-198 context] screen=%s conf=%.2f digit_taps=%d",
+            result.label, result.confidence, digit_taps,
+        )
+        if digit_taps < 4:
+            return None
+        return (
+            "⚠️ КОНТЕКСТ ЭКРАНА: это экран ввода PIN/секретного кода, и "
+            f"ты уже ввёл {digit_taps} цифр (достаточно для полного кода). "
+            "НЕ нажимай больше цифры и НЕ нажимай «Назад». СЛЕДУЮЩЕЕ "
+            "действие ОБЯЗАНО быть подтверждением: action=tap_at с "
+            "target_description=\"кнопка Вперёд/Продолжить/Войти внизу "
+            "экрана\". Это единственный способ продвинуться дальше."
+        )
+
     async def _goal_decide(
         self,
         *,
@@ -2412,6 +2467,18 @@ class ScenarioRunner:
                 "history_block": history_block,
             },
         )
+        # PER-198: Context Identifier hint. Classify the current screen
+        # (DeBERTa zero-shot microservice); on a PIN/secret-code screen
+        # count how many digit taps already happened this goal and, once
+        # >=4, inject a hard rule that the submit button is mandatory.
+        # This is the behavioural lever for the PER-172 PIN bug: the
+        # Planner now *knows* the screen type and the digit count, so it
+        # stops re-tapping the keypad. Best-effort — failure / unassigned
+        # role just skips the hint (legacy behaviour).
+        ctx_hint = await self._context_pin_hint(elements_block, history)
+        if ctx_hint:
+            user_prompt = ctx_hint + "\n\n" + user_prompt
+
         # PER-169: episodic memory recall as a prepended block.
         # We prepend instead of using a template placeholder so the
         # legacy DB system_prompts.user template (which has no
