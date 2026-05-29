@@ -185,7 +185,10 @@ class ModuleRunner:
                         {"role": "system", "content": payload.get("system_prompt", "")},
                         {"role": "user", "content": inputs["user_prompt"]},
                     ],
-                    max_tokens=1024,
+                    # PER-144: batch JSON for a multi-action screen needs
+                    # headroom; 1024 truncated mid-array (observed). 2048
+                    # fits done+reason+a full action array.
+                    max_tokens=2048,
                     # Enforce the PER-170 batch schema so the model emits
                     # valid {actions:[...]} with action enums from the
                     # workspace dictionary — not freelanced names like
