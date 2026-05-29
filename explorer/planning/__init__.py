@@ -12,6 +12,7 @@ from explorer.planning.hints import (
     count_digit_taps,
     credential_routing_hint,
     loop_breaker_hint,
+    pin_keypad_hint,
     pin_submit_hint,
 )
 
@@ -19,5 +20,6 @@ __all__ = [
     "count_digit_taps",
     "credential_routing_hint",
     "loop_breaker_hint",
+    "pin_keypad_hint",
     "pin_submit_hint",
 ]

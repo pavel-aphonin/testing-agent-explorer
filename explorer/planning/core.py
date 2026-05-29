@@ -23,6 +23,7 @@ from explorer.planning.hints import (
     count_digit_taps,
     credential_routing_hint,
     loop_breaker_hint,
+    pin_keypad_hint,
     pin_submit_hint,
 )
 
@@ -102,9 +103,10 @@ def build_planner_inputs(
     # Prepend hints in the same sequence as scenario_runner (each goes
     # to the front, so the last prepended ends up on top).
     if context_is_pin:
-        pin = pin_submit_hint(count_digit_taps(history))
-        if pin:
-            user_prompt = pin + "\n\n" + user_prompt
+        # >=4 digits already → submit now; otherwise → keypad strategy
+        # (tap digit buttons one by one as a batch, never enter_text).
+        pin = pin_submit_hint(count_digit_taps(history)) or pin_keypad_hint()
+        user_prompt = pin + "\n\n" + user_prompt
 
     loop = loop_breaker_hint(history)
     if loop:

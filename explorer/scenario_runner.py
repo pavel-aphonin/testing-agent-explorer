@@ -65,6 +65,7 @@ from explorer.planning.hints import (  # noqa: E402
     count_digit_taps as _count_digit_taps,
     credential_routing_hint as _credential_routing_hint_fn,
     loop_breaker_hint as _loop_breaker_hint,
+    pin_keypad_hint as _pin_keypad_hint,
     pin_submit_hint as _pin_submit_hint,
 )
 
@@ -2400,7 +2401,9 @@ class ScenarioRunner:
             "[PER-198 context] screen=%s conf=%.2f digit_taps=%d",
             result.label, result.confidence, digit_taps,
         )
-        return _pin_submit_hint(digit_taps)
+        # >=4 digits → submit; else → keypad strategy (tap digit buttons,
+        # never enter_text on a canvas keypad).
+        return _pin_submit_hint(digit_taps) or _pin_keypad_hint()
 
     def _credential_routing_hint(self) -> str | None:
         """PER-200: tell the Planner which test_data key maps to which
