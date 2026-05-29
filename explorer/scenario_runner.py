@@ -334,6 +334,14 @@ class ScenarioRunner:
         # detects the agent is stuck, to produce a specific «try this
         # instead» recommendation. Set externally by the worker.
         self.reflection_agent: Any | None = None
+        # PER-203 Phase 4: when TA_BUS_MODE=1, the goal loop publishes
+        # screen.captured and awaits ground.produced from the bus
+        # runners instead of calling _goal_decide + per-action grounding
+        # synchronously. Sync path stays the default (flag off). The
+        # BusClient is lazy-created on first use.
+        import os as _os
+        self._bus_mode: bool = _os.environ.get("TA_BUS_MODE", "0") == "1"
+        self._bus = None  # type: ignore[assignment]
         self._actions: list[dict[str, Any]] = list(actions or [])
         # PER-127 settle config. Sane defaults if the backend ships
         # nothing (legacy workspace pre-migration, or test fixtures).
@@ -1688,7 +1696,10 @@ class ScenarioRunner:
                     memory_block = ""
 
             # 2. Ask the LLM what to do (or whether we're done).
-            decision = await self._goal_decide(
+            # PER-203 Phase 4: in bus mode the plan+ground happens on the
+            # message bus (context→planner→grounder runners), returning a
+            # decision with pre-resolved coords. Sync path unchanged.
+            _decide_kwargs = dict(
                 goal_text=goal_text,
                 mode=mode,
                 success_criteria=success_criteria,
@@ -1705,6 +1716,10 @@ class ScenarioRunner:
                 visited_summary=visited_summary,
                 memory_block=memory_block,
             )
+            if self._bus_mode:
+                decision = await self._bus_goal_decide(**_decide_kwargs)
+            else:
+                decision = await self._goal_decide(**_decide_kwargs)
             if decision is None:
                 last_reason = "llm_no_decision"
                 break
@@ -2402,6 +2417,95 @@ class ScenarioRunner:
         """
         # PER-203 Phase 3: delegated to shared planning.hints.
         return _credential_routing_hint_fn(set(self.test_data.keys()))
+
+    async def _bus_goal_decide(
+        self,
+        *,
+        goal_text: str,
+        mode: str,
+        success_criteria: str,
+        elements: list,
+        history: list[str],
+        step_idx: int,
+        max_steps: int,
+        system_prompt: str,
+        user_template: str,
+        actions: list[dict],
+        actions_block: str,
+        test_data_block: str,
+        screenshot_b64: str | None = None,
+        visited_summary: str = "",
+        memory_block: str = "",
+    ) -> dict[str, Any] | None:
+        """PER-203 Phase 4: bus-mode replacement for ``_goal_decide``.
+
+        Publishes ``screen.captured`` with the full screen state and
+        awaits ``ground.produced`` from the runner chain (context →
+        planner → grounder). Returns the canonical
+        ``{done, reason, expected_next_screen, actions}`` decision with
+        the grounder's coords merged into each action's ``action_args``
+        (x, y) — so the EXISTING inner dispatch loop taps pre-resolved
+        coordinates and runs the whole batch atomically, no per-action
+        grounding, no mid-batch re-planning. None on timeout.
+        """
+        from explorer.bus import BusClient, Envelope, MsgType
+
+        if self._bus is None:
+            self._bus = BusClient(consumer_name=f"worker-{self.run_id}")
+            await self._bus.connect()
+            await self._bus.ensure_group(MsgType.GROUND_PRODUCED, "g.worker")
+
+        payload = {
+            "goal_text": goal_text,
+            "mode": mode,
+            "success_criteria": success_criteria,
+            "elements": elements,
+            "elements_block": build_elements_block(elements)[0],
+            "history": history,
+            "step_idx": step_idx,
+            "max_steps": max_steps,
+            "system_prompt": system_prompt,
+            "user_template": user_template,
+            "actions": actions,
+            "actions_block": actions_block,
+            "test_data_block": test_data_block,
+            "test_data_keys": list(self.test_data.keys()),
+            "visited_summary": visited_summary,
+            "memory_block": memory_block,
+            "screenshot_b64": screenshot_b64,
+        }
+        await self._bus.publish(Envelope(
+            run_id=str(self.run_id), step_id=step_idx,
+            type=MsgType.SCREEN_CAPTURED, payload=payload,
+        ))
+        logger.info("[bus] published screen.captured step=%d — awaiting ground.produced", step_idx)
+
+        import time as _time
+        deadline = _time.time() + 150.0
+        while _time.time() < deadline:
+            got = await self._bus.consume(MsgType.GROUND_PRODUCED, "g.worker", count=5, block_ms=5000)
+            for entry_id, env in got:
+                await self._bus.ack(MsgType.GROUND_PRODUCED, "g.worker", entry_id)
+                if env.run_id != str(self.run_id) or env.step_id != step_idx:
+                    continue
+                ga = env.payload.get("grounded_actions") or env.payload.get("actions") or []
+                # Merge grounder coords into action_args.x/y so the
+                # existing tap_at dispatch uses them directly.
+                for a in ga:
+                    coords = a.get("coords")
+                    if coords and len(coords) == 2:
+                        aa = a.get("action_args") if isinstance(a.get("action_args"), dict) else {}
+                        aa["x"], aa["y"] = coords[0], coords[1]
+                        a["action_args"] = aa
+                logger.info("[bus] ground.produced step=%d actions=%d", step_idx, len(ga))
+                return {
+                    "done": bool(env.payload.get("done", False)),
+                    "reason": env.payload.get("reason"),
+                    "expected_next_screen": env.payload.get("expected_next_screen"),
+                    "actions": ga,
+                }
+        logger.warning("[bus] timeout awaiting ground.produced step=%d", step_idx)
+        return None
 
     async def _goal_decide(
         self,

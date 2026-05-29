@@ -111,21 +111,29 @@ class ModuleRunner:
 
         if self.role is ModuleRole.GROUNDER:
             # Batch grounding: resolve coords for EVERY tap_at action in
-            # the plan, in order, in one stage (the user's "all coords
-            # with sequence" requirement).
-            from explorer.agents import GrounderAgent
-            agent = GrounderAgent(resolver)
+            # the plan, in order, one stage (the "all coords with
+            # sequence" requirement). Uses the real GrounderClient
+            # (backend dispatch → UI-TARS); the target_description may
+            # live at the top level or inside action_args.
+            import base64
+            from explorer.grounder_client import GrounderClient
+            grounder = GrounderClient(self._backend_url, self._worker_token)
+
+            def _target(act: dict) -> str | None:
+                aa = act.get("action_args") if isinstance(act.get("action_args"), dict) else {}
+                return act.get("target_description") or aa.get("target_description")
 
             async def handle(payload: dict) -> dict | None:
                 actions = payload.get("actions") or []
                 screenshot_b64 = payload.get("screenshot_b64")
-                import base64
                 shot = base64.b64decode(screenshot_b64) if screenshot_b64 else b""
                 grounded: list[dict] = []
                 for act in actions:
-                    if act.get("action") == "tap_at" and act.get("target_description"):
-                        coords = await agent.locate(act["target_description"], shot)
-                        grounded.append({**act, "coords": list(coords) if coords else None})
+                    desc = _target(act)
+                    if act.get("action") == "tap_at" and desc and shot:
+                        res = await grounder.locate(desc, shot)
+                        coords = [res.x, res.y] if res else None
+                        grounded.append({**act, "coords": coords})
                     else:
                         grounded.append(act)
                 out = dict(payload)
@@ -214,6 +222,11 @@ class ModuleRunner:
                     return None
                 out = dict(payload)
                 out["actions"] = actions
+                # Carry the batch terminal verdict forward so the worker
+                # (consuming ground.produced) honours done/reason.
+                out["done"] = bool(parsed.get("done", False))
+                out["reason"] = parsed.get("reason")
+                out["expected_next_screen"] = parsed.get("expected_next_screen")
                 return out
             return handle
 
