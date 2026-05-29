@@ -58,33 +58,15 @@ from explorer.goal_schema import (
 
 logger = logging.getLogger("explorer.scenario_runner")
 
-
-def _loop_breaker_hint(history: list[str] | None) -> str | None:
-    """PER-200 loop-breaker: detect 3+ near-identical recent actions and
-    return a «you're stuck» rule. Pure string heuristic — no LLM.
-
-    Compares the last 3 history entries after stripping digits and
-    whitespace (so «tap_at цифра 8» and «tap_at цифра 0» count as the
-    same *kind* of repeated action — re-tapping the keypad). None when
-    fewer than 3 entries or they differ.
-    """
-    if not history or len(history) < 3:
-        return None
-    import re as _re
-
-    def _norm(s: str) -> str:
-        return _re.sub(r"\d+|\s+", "", s.lower())[:60]
-
-    last3 = [_norm(h) for h in history[-3:]]
-    if last3[0] and last3[0] == last3[1] == last3[2]:
-        return (
-            "⚠️ ЦИКЛ: последние 3 действия практически одинаковы и НЕ "
-            "продвигают к цели. ОБЯЗАТЕЛЬНО выбери ДРУГОЕ действие — "
-            "другой элемент, другой тип действия (например tap_at по "
-            "видимой кнопке подтверждения внизу экрана), либо проверь, "
-            "не нужно ли подтвердить уже введённые данные."
-        )
-    return None
+# PER-203 Phase 3: planner hints extracted to explorer.planning.hints so
+# the bus planner-runner reuses the identical intelligence. Imported
+# under the old private name to keep call sites unchanged.
+from explorer.planning.hints import (  # noqa: E402
+    count_digit_taps as _count_digit_taps,
+    credential_routing_hint as _credential_routing_hint_fn,
+    loop_breaker_hint as _loop_breaker_hint,
+    pin_submit_hint as _pin_submit_hint,
+)
 
 
 # PER-111: prompt template fetched from backend (/api/internal/system-
@@ -2396,27 +2378,14 @@ class ScenarioRunner:
         if result is None or not result.is_pin_entry:
             return None
 
-        import re as _re
-        digit_taps = 0
-        for h in (history or []):
-            hl = h.lower()
-            if ("tap" in hl or "input" in hl or "ввод" in hl) and _re.search(r"\b\d\b|цифр|pin|код", hl):
-                digit_taps += 1
-
+        # PER-203 Phase 3: counting + hint text now live in the shared
+        # planning.hints module (reused by the bus planner-runner).
+        digit_taps = _count_digit_taps(history)
         logger.info(
             "[PER-198 context] screen=%s conf=%.2f digit_taps=%d",
             result.label, result.confidence, digit_taps,
         )
-        if digit_taps < 4:
-            return None
-        return (
-            "⚠️ КОНТЕКСТ ЭКРАНА: это экран ввода PIN/секретного кода, и "
-            f"ты уже ввёл {digit_taps} цифр (достаточно для полного кода). "
-            "НЕ нажимай больше цифры и НЕ нажимай «Назад». СЛЕДУЮЩЕЕ "
-            "действие ОБЯЗАНО быть подтверждением: action=tap_at с "
-            "target_description=\"кнопка Вперёд/Продолжить/Войти внизу "
-            "экрана\". Это единственный способ продвинуться дальше."
-        )
+        return _pin_submit_hint(digit_taps)
 
     def _credential_routing_hint(self) -> str | None:
         """PER-200: tell the Planner which test_data key maps to which
@@ -2431,23 +2400,8 @@ class ScenarioRunner:
         real secrets in the prompt beyond what value_source already
         does).
         """
-        keys = set(self.test_data.keys())
-        rules: list[str] = []
-        if "pin_code" in keys:
-            rules.append("экран ПИН-кода (4 цифры, заголовок про код/PIN) → используй test_data.pin_code")
-        if "sms_code" in keys:
-            rules.append("экран кода из СМС (упоминание SMS/смс/одноразовый код) → используй test_data.sms_code")
-        if "password" in keys:
-            rules.append("экран временного пароля / пароля → используй test_data.password")
-        if "phone" in keys:
-            rules.append("экран номера телефона → используй test_data.phone")
-        if len(rules) < 2:
-            return None  # nothing to disambiguate
-        return (
-            "📋 СООТВЕТСТВИЕ ДАННЫХ И ЭКРАНОВ (выбирай value_source строго "
-            "по типу текущего экрана, НЕ путай коды между собой):\n  - "
-            + "\n  - ".join(rules)
-        )
+        # PER-203 Phase 3: delegated to shared planning.hints.
+        return _credential_routing_hint_fn(set(self.test_data.keys()))
 
     async def _goal_decide(
         self,
