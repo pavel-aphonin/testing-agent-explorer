@@ -146,12 +146,72 @@ class ModuleRunner:
             return handle
 
         if self.role is ModuleRole.PLANNER:
-            # Phase 3 will wire planner_core here. Stub for now so the
-            # chain is structurally complete and testable end-to-end
-            # without the rich planner relocation.
+            # Phase 3b: real planner — assemble the prompt with the
+            # shared build_planner_inputs (same hints as the sync path)
+            # and call the resolved PLANNER endpoint. Emits an ACTION
+            # ARRAY (batch incl. submit) in plan.produced.
+            import json
+            import re as _re
+            from explorer.agents import PlannerAgent
+            from explorer.planning.core import build_planner_inputs
+            agent = PlannerAgent(resolver)
+
+            def _strip(text: str) -> str:
+                # 8B-Think emits a <think>…</think> block before the JSON.
+                text = _re.sub(r"<think>.*?</think>", "", text, flags=_re.DOTALL)
+                text = _re.sub(r"^```(?:json)?\s*", "", text.strip())
+                return _re.sub(r"\s*```$", "", text)
+
             async def handle(payload: dict) -> dict | None:
-                logger.warning("PLANNER bus handler is a Phase-3 stub — no plan produced")
-                return None
+                inputs = build_planner_inputs(
+                    goal_text=payload.get("goal_text", ""),
+                    mode=payload.get("mode", "hybrid"),
+                    success_criteria=payload.get("success_criteria", ""),
+                    elements=payload.get("elements", []),
+                    history=payload.get("history", []),
+                    step_idx=int(payload.get("step_idx", 0)),
+                    max_steps=int(payload.get("max_steps", 30)),
+                    user_template=payload.get("user_template", ""),
+                    actions=payload.get("actions", []),
+                    actions_block=payload.get("actions_block", ""),
+                    test_data_block=payload.get("test_data_block", ""),
+                    test_data_keys=payload.get("test_data_keys", []),
+                    visited_summary=payload.get("visited_summary", ""),
+                    memory_block=payload.get("memory_block", ""),
+                    context_is_pin=bool(payload.get("context_is_pin")),
+                )
+                res = await agent.call(
+                    messages=[
+                        {"role": "system", "content": payload.get("system_prompt", "")},
+                        {"role": "user", "content": inputs["user_prompt"]},
+                    ],
+                    max_tokens=1024,
+                    # Enforce the PER-170 batch schema so the model emits
+                    # valid {actions:[...]} with action enums from the
+                    # workspace dictionary — not freelanced names like
+                    # "input_pin_code" (observed with loose json_object).
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {"name": "goal_plan", "schema": inputs["schema"]},
+                    },
+                )
+                if res is None:
+                    return None
+                try:
+                    parsed = json.loads(_strip(res.content))
+                except json.JSONDecodeError:
+                    logger.warning("planner JSON parse failed: %s", res.content[:160])
+                    return None
+                # Accept either {actions:[...]} (batch) or a single action object.
+                if isinstance(parsed, dict) and isinstance(parsed.get("actions"), list):
+                    actions = parsed["actions"]
+                elif isinstance(parsed, dict):
+                    actions = [parsed]
+                else:
+                    return None
+                out = dict(payload)
+                out["actions"] = actions
+                return out
             return handle
 
         raise ValueError(f"No bus handler for role {self.role}")
