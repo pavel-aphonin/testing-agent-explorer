@@ -64,6 +64,15 @@ logger = logging.getLogger("explorer.engine")
 # by the third self-loop, the action is clearly not leading anywhere.
 MAX_STUCK_COUNT = 3
 
+# PER-207: consecutive steps with ZERO graph growth before we declare a
+# dead-end and stop the run. The «Local frontier exhausted → navigate →
+# still exhausted» branch otherwise loops until max_steps, circling the
+# same screens (observed in run bbbb2222: ~20 identical iterations after
+# the scenario goal failed). 25 leaves ample room to legitimately
+# exhaust one complex screen's actions (which may all self-loop) before
+# tripping, while saving the bulk of a 200-step budget.
+MAX_NO_PROGRESS_STEPS = 25
+
 # Type aliases for the optional engine callbacks.
 PriorProvider = Callable[[ScreenNode], "dict[str, float] | Awaitable[dict[str, float]]"]
 EventCallback = Callable[[dict], "None | Awaitable[None]"]
@@ -122,6 +131,12 @@ class ExplorationEngine:
         self.current_screen_id: str | None = None
         self._stuck_count = 0
         self.step_idx = 0
+        # PER-207: dead-end watchdog. ``_last_node_count`` is the graph
+        # size at the last step that grew it; ``_no_progress_steps``
+        # counts consecutive steps since then. Abort when it crosses
+        # MAX_NO_PROGRESS_STEPS.
+        self._last_node_count = 0
+        self._no_progress_steps = 0
 
         # PUCT selector and Go-Explore archive are the brains of the loop.
         # Both are stateful and live for the duration of one engine run.
@@ -180,6 +195,36 @@ class ExplorationEngine:
             while self.step_idx < self.max_steps:
                 self.step_idx += 1
                 step = self.step_idx
+
+                # PER-207: dead-end watchdog. Runs at the TOP of every
+                # iteration so it also counts the frontier-exhausted
+                # branch (which ``continue``s past the end of the loop
+                # body). If the graph hasn't grown for
+                # MAX_NO_PROGRESS_STEPS consecutive steps we're circling
+                # — stop with a clear reason instead of burning the rest
+                # of max_steps.
+                cur_node_count = len(self.graph.nodes)
+                if cur_node_count > self._last_node_count:
+                    self._last_node_count = cur_node_count
+                    self._no_progress_steps = 0
+                else:
+                    self._no_progress_steps += 1
+                if self._no_progress_steps >= MAX_NO_PROGRESS_STEPS:
+                    logger.warning(
+                        "[Step %d] Dead-end: no new screen in %d consecutive "
+                        "steps (graph=%d nodes) — aborting exploration early.",
+                        step, self._no_progress_steps, cur_node_count,
+                    )
+                    await self._safe_emit({
+                        "type": "log",
+                        "step_idx": step,
+                        "message": (
+                            f"Тупик: за {self._no_progress_steps} шагов не "
+                            f"открылось ни одного нового экрана — "
+                            f"останавливаю исследование."
+                        ),
+                    })
+                    break
 
                 # Dismiss system popups (Save Password, Allow Notifications,
                 # etc.) BEFORE doing anything else. These create spurious

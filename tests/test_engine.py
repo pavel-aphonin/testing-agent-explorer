@@ -245,3 +245,102 @@ async def test_action_id_format_matches_graph_signature():
     aid = action_id_for(el)
     # Format: tap|<label>|<test_id>|<x>,<y>
     assert aid == "tap|Login button|login_button|100,200"
+
+
+# ----------------------------------------------------------------- PER-207
+
+
+@dataclass
+class _DeadEndController:
+    """A simulator stuck on ONE screen whose every tap is a self-loop.
+
+    Models run bbbb2222's tail: the agent circles a screen that opens no
+    new screens. Tapping records a self-loop edge, so the local frontier
+    empties; the engine then keeps asking Go-Explore for a frontier,
+    navigating, and re-landing on the same screen — never growing the
+    graph. Without the watchdog this circles until max_steps; with it,
+    the run aborts ~MAX_NO_PROGRESS_STEPS in.
+    """
+
+    current: str = "stuck"
+    tap_log: list = field(default_factory=list)
+
+    async def get_ui_elements(self) -> list[dict]:
+        # Two buttons, neither of which transitions anywhere.
+        return [
+            {
+                "type": "Button", "label": "Войти", "value": None,
+                "identifier": "voiti", "enabled": True,
+                "frame": {"x": 100, "y": 200, "width": 100, "height": 40},
+                "children": [],
+            },
+            {
+                "type": "Button", "label": "Стать клиентом", "value": None,
+                "identifier": "become", "enabled": True,
+                "frame": {"x": 100, "y": 300, "width": 100, "height": 40},
+                "children": [],
+            },
+        ]
+
+    async def take_screenshot(self) -> str:
+        return "<fake-png-stuck>"
+
+    async def tap_at(self, x: int, y: int) -> _Result:
+        self.tap_log.append((x, y))
+        return _Result()  # ok, but screen never changes
+
+    async def go_back(self) -> _Result:
+        return _Result()
+
+    async def terminate_app(self, bundle_id: str) -> None:
+        pass
+
+    async def launch_app(self, bundle_id: str) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_engine_aborts_on_dead_end_loop(tmp_path):
+    """PER-207: a single-screen dead end aborts well before max_steps
+    instead of circling the exhausted frontier to the budget limit
+    (run bbbb2222's failure mode)."""
+    from explorer.engine import MAX_NO_PROGRESS_STEPS
+
+    controller = _DeadEndController()
+    engine = ExplorationEngine(
+        controller=controller,
+        app_bundle_id="test.app",
+        output_dir=str(tmp_path),
+        mode=ExplorationMode.MC,
+        max_steps=200,
+    )
+
+    await engine.run()
+
+    # Only ever saw one screen…
+    assert len(engine.graph.nodes) == 1
+    # …and stopped near the no-progress threshold, NOT at max_steps.
+    # Allowance: a few steps to register the screen + exhaust its actions
+    # before the watchdog's consecutive-no-growth counter trips.
+    assert engine.step_idx < 200
+    assert engine.step_idx <= MAX_NO_PROGRESS_STEPS + 5
+
+
+@pytest.mark.asyncio
+async def test_engine_dead_end_does_not_fire_on_healthy_app(tmp_path):
+    """PER-207 guard: the watchdog must NOT abort a normal exploration
+    that keeps discovering screens. The 3-screen app finishes by frontier
+    exhaustion with all screens found."""
+    controller = _make_three_screen_app()
+    engine = ExplorationEngine(
+        controller=controller,
+        app_bundle_id="test.app",
+        output_dir=str(tmp_path),
+        mode=ExplorationMode.MC,
+        max_steps=50,
+    )
+
+    await engine.run()
+
+    # All three screens discovered — the watchdog didn't cut it short.
+    assert len(engine.graph.nodes) == 3
