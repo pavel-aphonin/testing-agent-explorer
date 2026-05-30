@@ -105,6 +105,28 @@ class EpisodicMemory:
         # smoke). We keep a set, add a done_callback to discard, so the
         # set stays bounded.
         self._inflight_tasks: set[asyncio.Task[None]] = set()
+        # PER-206: latch so a dead extraction endpoint logs ONE warning
+        # with a traceback instead of one per dispatched action.
+        self._add_warn_logged = False
+
+    @staticmethod
+    async def _probe_http(base_url: str, timeout: float = 3.0) -> bool:
+        """PER-206: quick reachability probe for an OpenAI-compatible
+        endpoint. GET ``{base}/models``; True iff it answers (any
+        non-5xx). FalkorDB being healthy is NOT enough — ``add_episode``
+        also calls the extraction LLM + embedder, and when those are
+        down every write throws an httpx ConnectError with a full
+        traceback. Probing here lets us disable memory cleanly.
+        """
+        import httpx
+
+        url = base_url.rstrip("/") + "/models"
+        try:
+            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as c:
+                r = await c.get(url)
+            return r.status_code < 500
+        except Exception:
+            return False
 
     async def _ensure_init(self) -> Any | None:
         """Lazy-connect to FalkorDB + Graphiti. Returns instance or None on failure."""
@@ -136,6 +158,22 @@ class EpisodicMemory:
             # benign placeholder if not already set.
             os.environ.setdefault("OPENAI_API_KEY", "local-llamacpp")
             cfg = self._config
+            # PER-206: probe the extraction LLM + embedder before we
+            # commit to memory. If either is unreachable, disable cleanly
+            # with a single actionable warning instead of letting every
+            # add_episode throw an httpx ConnectError + traceback.
+            extraction_ok = await self._probe_http(cfg.extraction_endpoint)
+            embedding_ok = await self._probe_http(cfg.embedding_endpoint)
+            if not (extraction_ok and embedding_ok):
+                logger.warning(
+                    "Episodic memory disabled: extraction LLM %s reachable=%s, "
+                    "embedder %s reachable=%s. Start these llama-servers or set "
+                    "TA_EPISODIC_MEMORY=0. Agent runs without memory recall.",
+                    cfg.extraction_endpoint, extraction_ok,
+                    cfg.embedding_endpoint, embedding_ok,
+                )
+                self._init_failed = True
+                return None
             llm_cfg = LLMConfig(
                 base_url=cfg.extraction_endpoint,
                 model=cfg.extraction_model,
@@ -225,11 +263,23 @@ class EpisodicMemory:
                     reference_time=datetime.now(timezone.utc),
                     group_id=self._group_id(run_id, goal_id),
                 )
-            except Exception:
-                logger.exception(
-                    "Episodic memory add_episode failed (run=%s, goal=%s)",
-                    run_id, goal_id,
-                )
+            except Exception as exc:
+                # PER-206: full traceback once, then terse debug — a dead
+                # extraction endpoint must not dump a traceback on every
+                # dispatched action (observed: hundreds of identical
+                # tracebacks in one run).
+                if not self._add_warn_logged:
+                    self._add_warn_logged = True
+                    logger.warning(
+                        "Episodic memory add_episode failed (run=%s, goal=%s): "
+                        "%s: %s — suppressing further tracebacks this process.",
+                        run_id, goal_id, type(exc).__name__, exc,
+                    )
+                else:
+                    logger.debug(
+                        "Episodic memory add_episode failed again (run=%s): %s",
+                        run_id, exc,
+                    )
         task = asyncio.create_task(_bg())
         self._inflight_tasks.add(task)
         # Drop the strong ref once the task finishes so the set

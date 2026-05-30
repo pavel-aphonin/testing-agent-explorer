@@ -175,6 +175,66 @@ def test_T47_recall_uses_scoped_driver_clone() -> None:
     assert captured["group_ids"] == [expected_group]
 
 
+def test_T49_init_disabled_when_extraction_endpoint_unreachable() -> None:
+    """PER-206: FalkorDB being healthy is NOT enough — add_episode also
+    calls the extraction LLM + embedder. When those are down (the run
+    bbbb2222 case: killed during OOM cleanup), _ensure_init must disable
+    memory cleanly (latch _init_failed, return None) instead of letting
+    every add_episode throw an httpx ConnectError + traceback."""
+    async def _run() -> Any:
+        em = EpisodicMemory()
+
+        async def _probe_down(base_url: str, timeout: float = 3.0) -> bool:
+            return False  # both extraction + embedder unreachable
+
+        em._probe_http = _probe_down  # type: ignore[method-assign]
+        g = await em._ensure_init()
+        return g, em._init_failed
+
+    g, failed = asyncio.run(_run())
+    assert g is None
+    assert failed is True
+
+
+def test_T50_add_episode_failure_logged_once(caplog) -> None:
+    """PER-206: a dead extraction endpoint must not dump a traceback on
+    EVERY dispatched action. The first failure logs a WARNING; subsequent
+    ones drop to DEBUG. Regresses the hundreds-of-identical-tracebacks
+    behaviour observed in run bbbb2222."""
+    async def _run() -> None:
+        em = EpisodicMemory()
+        stub_g = MagicMock()
+
+        async def _boom(**kw: Any) -> None:
+            raise ConnectionError("extraction endpoint refused")
+
+        stub_g.add_episode = AsyncMock(side_effect=_boom)
+
+        async def _ensure() -> Any:
+            return stub_g
+        em._ensure_init = _ensure  # type: ignore[method-assign]
+
+        # Fire three episodes that all fail at add_episode.
+        for i in range(3):
+            await em.add_action_fire_and_forget(
+                run_id="r1", goal_id="g1",
+                episode_text=f"t{i}", episode_name=f"ep_{i}",
+            )
+        # Let the background tasks run.
+        await asyncio.sleep(0.05)
+
+    import logging
+    with caplog.at_level(logging.WARNING, logger="explorer.episodic_memory"):
+        asyncio.run(_run())
+    warns = [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and "add_episode failed" in r.getMessage()
+    ]
+    # Exactly one WARNING despite three failures.
+    assert len(warns) == 1
+
+
 def test_T48_close_waits_for_inflight_tasks() -> None:
     """``close()`` must give pending add_episode tasks a chance to
     flush — otherwise a worker shutdown right after the last action
