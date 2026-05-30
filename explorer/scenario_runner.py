@@ -48,6 +48,7 @@ from explorer.goal_schema import (
     _COORD_ONLY_ACTIONS,
     _ELEMENT_TARGETED_ACTIONS,
     _is_container_id,
+    _is_editable_kind,
     build_actions_block,
     build_elements_block,
     build_goal_schema,
@@ -62,6 +63,7 @@ logger = logging.getLogger("explorer.scenario_runner")
 # the bus planner-runner reuses the identical intelligence. Imported
 # under the old private name to keep call sites unchanged.
 from explorer.planning.hints import (  # noqa: E402
+    append_pin_submit as _append_pin_submit,
     count_digit_taps as _count_digit_taps,
     credential_routing_hint as _credential_routing_hint_fn,
     loop_breaker_hint as _loop_breaker_hint,
@@ -331,6 +333,10 @@ class ScenarioRunner:
         # prompt — the behavioural fix the routing-only refactor
         # (PER-196) couldn't deliver. None → legacy behaviour.
         self.context_agent: Any | None = None
+        # PER-204: last PIN-screen verdict from _context_pin_hint, read
+        # by _goal_decide to stamp the decision so the submit-macro
+        # fires in _run_goal_node. Defensive default before first classify.
+        self._context_is_pin_last: bool = False
         # PER-200: Reflection agent — invoked when the loop-breaker
         # detects the agent is stuck, to produce a specific «try this
         # instead» recommendation. Set externally by the worker.
@@ -1729,7 +1735,16 @@ class ScenarioRunner:
             # the model emitted a legacy single-action object we get a
             # uniform ``{done, reason, expected_next_screen, actions}``
             # back, so the inner dispatch loop has one branch to walk.
+            # PER-204: read the PIN verdict BEFORE normalize_decision
+            # (which drops non-canonical keys), then apply the submit
+            # macro. Bus path already grounded a submit on the bus →
+            # the macro detects it and no-ops; sync path gets the submit
+            # appended here and grounded inline at dispatch.
+            _context_is_pin = bool(decision.get("context_is_pin"))
             decision = normalize_decision(decision)
+            decision["actions"] = _append_pin_submit(
+                decision.get("actions"), _context_is_pin
+            )
             batch_actions = list(decision.get("actions") or [])
 
             # Log the batch envelope once per LLM call (cheap one line).
@@ -1765,6 +1780,22 @@ class ScenarioRunner:
             # error appears), the *next* outer iteration will see the
             # new screenshot and adapt; the in-batch dispatcher just
             # plows ahead with what the LLM planned.
+            # PER-205: map element_id → is-editable for THIS screen so
+            # the batch validator can reject input / enter_text aimed at
+            # a non-field (heading, label, button) — typing there is a
+            # silent device no-op that makes the agent loop.
+            _editable_by_id: dict[str, bool] = {}
+            for _e in elements:
+                if isinstance(_e, dict):
+                    _eid = str(
+                        _e.get("id") or _e.get("identifier")
+                        or _e.get("test_id") or ""
+                    )
+                    if _eid:
+                        _editable_by_id[_eid] = _is_editable_kind(
+                            _e.get("kind") or _e.get("type")
+                        )
+
             for batch_item_idx, action_item in enumerate(batch_actions):
                 if inner_step >= max_steps:
                     outer_break = True
@@ -1820,6 +1851,26 @@ class ScenarioRunner:
                 skip_reason: str | None = None
                 if not action:
                     skip_reason = "action is empty"
+                elif (
+                    action in ("input", "enter_text")
+                    and element_id
+                    and element_id in _editable_by_id
+                    and not _editable_by_id[element_id]
+                ):
+                    # PER-205: the model aimed text entry at a non-field
+                    # element (e.g. a heading). Typing there does nothing
+                    # on the device. Skip with explicit feedback so the
+                    # next LLM turn taps a real field / keypad instead of
+                    # silently looping on a no-op. element_id must be in
+                    # the map (i.e. an element actually on this screen) —
+                    # an unknown id falls through to other validators.
+                    skip_reason = (
+                        f"{action!r} targets element_id={element_id!r}, "
+                        f"which is NOT a text field — typing there does "
+                        f"nothing. Tap a text field first, or for an "
+                        f"on-screen keypad use tap_at on the digit/letter "
+                        f"buttons."
+                    )
                 elif action in _ELEMENT_TARGETED_ACTIONS and not element_id:
                     skip_reason = (
                         f"{action!r} requires element_id but model "
@@ -2385,12 +2436,17 @@ class ScenarioRunner:
         failure we're fixing.
         """
         if self.context_agent is None:
+            self._context_is_pin_last = False
             return None
         try:
             result = await self.context_agent.classify(elements_block)
         except Exception as exc:  # never break the decision loop
             logger.debug("context classify failed: %s", exc)
+            self._context_is_pin_last = False
             return None
+        # PER-204: cache the PIN verdict so _goal_decide can stamp the
+        # decision and the submit-macro fires in _run_goal_node.
+        self._context_is_pin_last = bool(result and result.is_pin_entry)
         if result is None or not result.is_pin_entry:
             return None
 
@@ -2506,6 +2562,11 @@ class ScenarioRunner:
                     "reason": env.payload.get("reason"),
                     "expected_next_screen": env.payload.get("expected_next_screen"),
                     "actions": ga,
+                    # PER-204: carry the context runner's PIN verdict so
+                    # the submit-macro in _run_goal_node knows the screen
+                    # type (the bus runner already appended+grounded a
+                    # submit, so this is the idempotent safety net).
+                    "context_is_pin": bool(env.payload.get("context_is_pin")),
                 }
         logger.warning("[bus] timeout awaiting ground.produced step=%d", step_idx)
         return None
@@ -2815,6 +2876,9 @@ class ScenarioRunner:
                 decoded_action,
             )
             return None
+        # PER-204: stamp the cached PIN verdict (set by _context_pin_hint
+        # above) so _run_goal_node can fire the submit-macro.
+        obj["context_is_pin"] = self._context_is_pin_last
         return obj
 
     async def _dispatch(

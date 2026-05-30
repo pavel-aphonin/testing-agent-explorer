@@ -9,6 +9,7 @@ behavioural fixes.
 """
 
 from explorer.planning.hints import (
+    append_pin_submit,
     count_digit_taps,
     credential_routing_hint,
     loop_breaker_hint,
@@ -17,6 +18,7 @@ from explorer.planning.hints import (
 )
 
 __all__ = [
+    "append_pin_submit",
     "count_digit_taps",
     "credential_routing_hint",
     "loop_breaker_hint",

@@ -113,3 +113,106 @@ def pin_submit_hint(digit_taps: int) -> str | None:
         "target_description=\"кнопка Вперёд/Продолжить/Войти внизу "
         "экрана\". Это единственный способ продвинуться дальше."
     )
+
+
+# ── PER-204: deterministic PIN-submit macro ──────────────────────────
+# The keypad hint (pin_keypad_hint) gets the planner to emit a batch of
+# digit taps 8→5→2→0, but GUI-Owl-8B-Think reliably DROPS the final
+# submit tap from the structured output (the reasoning↔action mismatch
+# of PER-175). Rather than trust the model, we append the submit in code
+# once the batch already holds a full set of digit taps and no submit.
+# Pure + transport-agnostic: the bus planner-runner applies it before
+# the grounder (so the submit gets grounded coords), and the sync
+# _goal_decide applies it before returning (grounded at dispatch time).
+
+_PIN_SUBMIT_TARGET = "кнопка подтверждения внизу экрана (Вперёд / Продолжить / Войти)"
+
+# Submit-button vocabulary (Russian + English). Substring match on a
+# lowered target description / label.
+_SUBMIT_KEYWORDS: tuple[str, ...] = (
+    "вперёд", "вперед", "продолж", "войти", "готово", "подтверд",
+    "далее", "submit", "continue", "next", "done", "enter", "forward",
+    "login", "sign in",
+)
+
+
+def _tap_target_text(action: dict) -> str:
+    """Lowered description of what a tap action targets — checks
+    ``action_args.target_description`` (where tap_at carries it) first,
+    then the top-level mirror, then the human label."""
+    if not isinstance(action, dict):
+        return ""
+    aa = action.get("action_args")
+    aa = aa if isinstance(aa, dict) else {}
+    text = (
+        action.get("target_description")
+        or aa.get("target_description")
+        or action.get("element_label")
+        or ""
+    )
+    return str(text).lower()
+
+
+def _is_digit_tap(action: dict) -> bool:
+    """True when an action is a keypad digit press (``tap_at`` whose
+    target names a digit / «цифра»)."""
+    if not isinstance(action, dict):
+        return False
+    if (action.get("action") or "").strip().lower() != "tap_at":
+        return False
+    text = _tap_target_text(action)
+    return bool(re.search(r"цифр|digit", text) or re.search(r"\b\d\b", text))
+
+
+def _is_submit_tap(action: dict) -> bool:
+    """True when an action looks like pressing a submit / continue
+    button (a ``tap`` or ``tap_at`` whose target matches the submit
+    vocabulary)."""
+    if not isinstance(action, dict):
+        return False
+    if (action.get("action") or "").strip().lower() not in ("tap", "tap_at"):
+        return False
+    text = _tap_target_text(action)
+    return any(kw in text for kw in _SUBMIT_KEYWORDS)
+
+
+def append_pin_submit(
+    actions: list[dict] | None,
+    context_is_pin: bool,
+    *,
+    min_digit_taps: int = 4,
+) -> list[dict]:
+    """PER-204: ensure a PIN batch ends with a submit tap.
+
+    When the Context Identifier says this is a PIN screen and the batch
+    already contains ``>= min_digit_taps`` digit presses but NO submit
+    button tap anywhere, append a ``tap_at`` on the confirm button as
+    the final action. The model batches the whole code at once, so the
+    in-batch digit count equals the code the model decided to enter —
+    a missing submit means it simply forgot the last step.
+
+    No-op (returns the list unchanged) when: not a PIN screen, fewer
+    than ``min_digit_taps`` digits, or a submit tap is already present.
+    Returns a NEW list when it appends; never mutates the input.
+    """
+    if not context_is_pin or not actions:
+        return actions or []
+    digit_taps = sum(1 for a in actions if _is_digit_tap(a))
+    if digit_taps < min_digit_taps:
+        return actions
+    if any(_is_submit_tap(a) for a in actions):
+        return actions
+    submit = {
+        "action": "tap_at",
+        "action_args": {"target_description": _PIN_SUBMIT_TARGET},
+        "target_description": _PIN_SUBMIT_TARGET,
+        "element_id": None,
+        "element_label": "кнопка подтверждения",
+        "value_source": "none",
+        "value_literal": None,
+        "reasoning": (
+            "PER-204: код из нужного числа цифр введён — добавляю "
+            "подтверждение, чтобы экран продвинулся дальше."
+        ),
+    }
+    return list(actions) + [submit]

@@ -220,6 +220,15 @@ class ModuleRunner:
                     actions = [parsed]
                 else:
                     return None
+                # PER-204: on a PIN screen, append the submit tap to the
+                # batch BEFORE the grounder stage so the «Вперёд» button
+                # gets grounded coords on the bus (GUI-Owl reliably omits
+                # it — PER-175 reasoning↔action gap). No-op off-PIN or if
+                # the model already included a submit.
+                from explorer.planning.hints import append_pin_submit
+                actions = append_pin_submit(
+                    actions, bool(payload.get("context_is_pin"))
+                )
                 out = dict(payload)
                 out["actions"] = actions
                 # Carry the batch terminal verdict forward so the worker

@@ -492,6 +492,35 @@ _CONTAINER_ID_KEYWORDS: tuple[str, ...] = (
 )
 
 
+# PER-205: AX element kinds that accept typed text. ``enter_text`` /
+# ``input`` on anything else (a heading, label, button, container) is a
+# silent no-op on the device — the keystrokes go nowhere and the planner
+# loops thinking it «typed» the value. We surface this both in the
+# elements block (so the model targets a real field) and as a dispatch
+# guard (skip + feedback when the model still picks a non-field).
+_EDITABLE_KINDS: tuple[str, ...] = (
+    "textfield",
+    "securetextfield",
+    "textview",
+    "searchfield",
+    "combobox",
+)
+
+
+def _is_editable_kind(kind: str | None) -> bool:
+    """Heuristic: does this AX element kind accept typed text?
+
+    Matches on a separator-stripped lowercase form so iOS variants
+    («TextField», «Text Field», «Secure Text Field», «text_field») all
+    resolve the same. False for headings / labels / buttons / images /
+    containers — the kinds where typing does nothing.
+    """
+    if not kind:
+        return False
+    compact = kind.lower().replace(" ", "").replace("_", "").replace("-", "")
+    return any(k in compact for k in _EDITABLE_KINDS)
+
+
 def _is_container_id(elem_id: str) -> bool:
     """Heuristic: does this element_id look like a root / shell
     container rather than an interactive control?
@@ -656,7 +685,15 @@ def build_elements_block(elements: list[dict[str, Any]]) -> tuple[str, list[str]
         container_marker = ""
         if _is_container_id(elem_id):
             container_marker = " [КОНТЕЙНЕР — не тапать; используй tap_at]"
-        lines.append(f"  - id={elem_id} [{kind}] {label_display}{container_marker}")
+        # PER-205: flag text-input fields so the model only sends
+        # input / enter_text at elements that actually accept text.
+        editable_marker = ""
+        if _is_editable_kind(kind):
+            editable_marker = " ✏️[поле ввода — можно input/enter_text]"
+        lines.append(
+            f"  - id={elem_id} [{kind}] {label_display}"
+            f"{container_marker}{editable_marker}"
+        )
     if len(elements) > 50:
         lines.append(f"  …и ещё {len(elements) - 50}.")
     return "\n".join(lines), ids
