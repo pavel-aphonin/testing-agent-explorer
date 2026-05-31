@@ -170,3 +170,42 @@ Older notes:
 Sources (titles; URLs were in the 3 verifier agents that didn't finish):
 UI-TARS-2, Holo1.5, Aria-UI, UI-Venus 1.5, Ferret-UI Lite, Agent S2,
 CODA, OmniParser V2, Set-of-Mark, Screen2AX, ScreenSeekeR, GUI-Critic-R1.
+
+## Phase F — operational steps remaining (code is DONE: A–F committed)
+
+ALL CODE for the 13-module integration is built, tested (91 unit + 162
+regression green), committed and pushed through commit 1b06be1. Holo2 is
+downloaded: volumes/llm-models/Holo2-8B.Q4_K_M.gguf (4.68 GB) +
+Holo2-8B.mmproj-f16.gguf (1.08 GB). What remains is OPERATIONAL — best done
+with a working terminal (this session's tool output was broken):
+
+1. Register Holo2 as a model passport (llm_models row): provider=llama_cpp,
+   supports_vision=true, supports_json_schema=false (it's Thinking — parse
+   tolerates), endpoint_url=http://localhost:8186, family=holo2.
+2. Repoint the CONTEXT_IDENTIFIER ModuleAssignment from
+   context-identifier-deberta → the new Holo2 passport. (The VisionContextAgent
+   activates only when the role resolves to a vision chat model with
+   provider != pytorch_microservice — so this swap is what turns it on.)
+3. Start Holo2 on :8186 —
+   llama-server -m volumes/llm-models/Holo2-8B.Q4_K_M.gguf \
+     --mmproj volumes/llm-models/Holo2-8B.mmproj-f16.gguf \
+     --host 127.0.0.1 --port 8186 --ctx-size 16384 --n-gpu-layers 99 \
+     --alias context --jinja
+4. Start the rest of the fleet: docker compose up -d; planner GUI-Owl :8187;
+   grounder UI-TARS :8081; perception :8090 (still serves Dynamic Perceiver
+   SigLIP); ambiguity Qwen3-4B :8183; safety Llama-Guard :8182; memory
+   Qwen3-Embedding :8184. Memory budget ~21 GB of models — check `top`
+   (36 GB free seen earlier; OK but tight).
+5. ./scripts/start-bus-runners.sh   (all 13 runners)
+6. Start worker: TA_BUS_MODE=1 .venv/bin/python -m explorer.worker ... -v
+7. Insert a pending run for scenario «Для демо» (630eccd8-...), workspace
+   aa274f1b-..., user 50ae7d34-..., bundle com.aweassist.app, app_file_path
+   d39a5408-bfef-4589-9e7d-c7851ceee5f7/AWeassist.app, iPhone-17-Pro-Max.
+8. Watch /tmp/ta-worker.log: expect classify_vision_vlm → screen_type pin_entry
+   (confident, not 0.09) → keypad gate fires on the REAL PIN screen → digit
+   taps 8-5-2-0 + submit → login completes.
+
+Risk note: Reward Critic / Safety / Ambiguity side-stages add LLM calls per
+step → each step slower than the 4-module chain. If too slow, those three
+side-consumers can be left unassigned (they degrade to no-op) for a first
+green run, then enabled.
