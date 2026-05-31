@@ -80,7 +80,35 @@ the system runs while stages fill in.
     a `resolve_value` callable, not 0-9. 158 tests green.
   - NOT yet wired into the decision loop — see Phase C.
 
-## Phase C — START HERE next session (the wiring)
+## Phase C — IN PROGRESS
+
+DONE & pushed (commit 3cc44e3):
+- **Context Identifier (bus) produces an AffordanceMap** — vision
+  screen_type (SigLIP2 /classify_vision) + Screen Parser /parse boxes
+  (scaled via screen_w/h now on the bus) + AX editable rects (hybrid).
+  Revives Screen Parser. Falls back to text classifier with no
+  screenshot. Emits `affordance_map` on context.classified.
+- **Platform Adapter (resolve_plan) runs in the bus PLANNER handler**
+  before grounding (PER-205 routing + PER-204 submit). Legacy concrete
+  actions pass through.
+- **Secrets stay off the bus** (PER-208 filed): keypad digit-expansion is
+  worker-side; bus path only appends submit for now.
+
+REMAINING Phase C:
+- **Planner emits intents** (`provide_credential`/`submit`/…) not
+  mechanisms — goal_schema + planner prompt + intent vocabulary. (Until
+  this lands the resolver mostly passes concrete actions through; the
+  PER-205/204 rules still apply.)
+- **Sync path** (`_goal_decide`): build AffordanceMap + run resolve_plan
+  with a real `resolve_value` bound to test_data (full keypad expansion,
+  secrets in-memory). Replace `context_is_pin` usage with AffordanceMap.
+- **Grounder → Holo2-8B selectable** (UI-TARS default), ScreenSeekeR
+  stage, Grounding Verifier gate.
+- Screen Parser /parse returns boxes WITHOUT OCR text — fine for the
+  keypad (adapter taps by description), add OCR (ocrmac/easyocr) for
+  richer labels later.
+
+Older notes:
 
 1. **Context Identifier produces an AffordanceMap** and puts it on the bus
    (`context.classified` payload carries `affordance_map`): call
