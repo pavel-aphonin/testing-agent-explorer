@@ -83,13 +83,31 @@ the system runs while stages fill in.
 - **F** backend model passports (Holo1.5-7B, GUI-Critic-R1-7B) + role
   assignments; **future**: per-module model-select + tuning UI.
 
+## Decisions locked (user, this session)
+
+- **Holo2-8B → Context Identifier** (vision perception: screen_type +
+  affordance map). NOT the grounder. Rationale: Holo2-8B is fine-tuned
+  from Qwen3-VL-8B-**Thinking** — the reasoning channel is worth it for
+  screen understanding (a rare per-screen call) but adds latency we don't
+  want on every grounding call. Verified: `mradermacher/Holo2-8B-GGUF`
+  has llama.cpp quants + a vision projector (`mmproj-f16.gguf` 1.3 GB),
+  Apache-2.0. Beats Holo1.5-7B (ScreenSpot-Pro 58.9 vs 57.9,
+  ScreenSpot-v2 93.2 vs ~92). Holo2 also ships 4B/8B/30B for the future
+  per-module model picker.
+- **Grounder stays UI-TARS-1.5-7B** (fast, no thinking; the frequent
+  coordinate call). Holo2/Holo1.5 kept as selectable alternatives.
+- **Specialised models per role** (NOT one shared VLM across 7 roles).
+
 ## Models to add (downloads)
 
-- `Holo1.5-7B` GGUF (llama.cpp) — Grounder + screen-QA. Replaces UI-TARS
-  as default grounder (UI-TARS kept as a selectable alternative).
+- `Holo2-8B` GGUF + mmproj (`mradermacher/Holo2-8B-GGUF`, Q4_K_M ~5 GB +
+  mmproj-f16 1.3 GB) — Context Identifier (vision screen-type + affordance
+  reasoning via its UI-QA mode).
 - `GUI-Critic-R1-7B` (Qwen2.5-VL-7B based) — Reward Critic.
-- Keep: GUI-Owl-1.5-8B (Planner/Reflection), OmniParser-v2, SigLIP2,
+- Keep: GUI-Owl-1.5-8B (Planner/Reflection), UI-TARS-1.5-7B (Grounder),
+  OmniParser-v2 (Screen Parser), SigLIP2 (Dynamic Perceiver),
   Qwen3-4B (Ambiguity), Llama-Guard-3 (Safety), Qwen3-Embedding (Memory).
+- Holo1.5-7B — optional selectable Grounder/Context alternative.
 
 Sources (titles; URLs were in the 3 verifier agents that didn't finish):
 UI-TARS-2, Holo1.5, Aria-UI, UI-Venus 1.5, Ferret-UI Lite, Agent S2,
