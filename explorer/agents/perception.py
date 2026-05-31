@@ -58,10 +58,12 @@ class ContextResult:
     def is_pin_entry(self) -> bool:
         """True when the top label looks like a PIN/secret-code screen.
 
-        Used by scenario_runner to inject the «after N digits, the
-        submit button is mandatory» hint into the Planner prompt — the
-        behavioural fix the routing-only refactor (PER-196) couldn't
-        deliver on its own.
+        Handles BOTH the legacy text-classifier labels (e.g. "PIN code
+        entry screen") and the new vision screen-type keys (e.g.
+        "pin_entry"). Used by scenario_runner to inject the «after N
+        digits, the submit button is mandatory» hint into the Planner
+        prompt — the behavioural fix the routing-only refactor (PER-196)
+        couldn't deliver on its own.
         """
         l = self.label.lower()
         return "pin" in l or "secret" in l or "код" in l
@@ -93,6 +95,42 @@ class ContextIdentifierAgent(_PerceptionAgent):
             return None
         return ContextResult(
             label=data["label"],
+            confidence=float(data["confidence"]),
+            all_scores=data.get("all_scores", {}),
+        )
+
+    async def classify_vision(
+        self,
+        png: bytes,
+        candidate_types: dict[str, str] | None = None,
+        *,
+        timeout: float = 30.0,
+    ) -> ContextResult | None:
+        """PER-175 Phase B: classify the screen TYPE from the SCREENSHOT
+        (SigLIP2 zero-shot), not the AX-tree text.
+
+        This is the blindness fix: on a canvas keypad the AX-tree is empty
+        but the image is unambiguous. Returns a ``ContextResult`` whose
+        ``label`` is the short screen-type key (e.g. ``pin_entry``).
+        ``None`` when the role is unassigned / service down → caller falls
+        back to the text classifier or legacy behaviour.
+        """
+        base = await self._base_url()
+        if base is None:
+            return None
+        body: dict = {"png_b64": base64.b64encode(png).decode()}
+        if candidate_types:
+            body["candidate_types"] = candidate_types
+        try:
+            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as c:
+                r = await c.post(f"{base}/classify_vision", json=body)
+            r.raise_for_status()
+            data = r.json()
+        except (httpx.HTTPError, KeyError, ValueError) as exc:
+            logger.warning("ContextIdentifier.classify_vision failed: %s", exc)
+            return None
+        return ContextResult(
+            label=data["screen_type"],
             confidence=float(data["confidence"]),
             all_scores=data.get("all_scores", {}),
         )
