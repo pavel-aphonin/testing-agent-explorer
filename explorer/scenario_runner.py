@@ -2512,7 +2512,10 @@ class ScenarioRunner:
         if self._bus is None:
             self._bus = BusClient(consumer_name=f"worker-{self.run_id}")
             await self._bus.connect()
-            await self._bus.ensure_group(MsgType.GROUND_PRODUCED, "g.worker")
+            # PER-175 full chain: the worker awaits the TERMINAL stage,
+            # ground.verified (Grounding Verifier), not ground.produced —
+            # so the whole 13-module pipeline runs before the worker acts.
+            await self._bus.ensure_group(MsgType.GROUND_VERIFIED, "g.worker")
 
         payload = {
             "goal_text": goal_text,
@@ -2543,14 +2546,14 @@ class ScenarioRunner:
             run_id=str(self.run_id), step_id=step_idx,
             type=MsgType.SCREEN_CAPTURED, payload=payload,
         ))
-        logger.info("[bus] published screen.captured step=%d — awaiting ground.produced", step_idx)
+        logger.info("[bus] published screen.captured step=%d — awaiting ground.verified", step_idx)
 
         import time as _time
-        deadline = _time.time() + 150.0
+        deadline = _time.time() + 180.0
         while _time.time() < deadline:
-            got = await self._bus.consume(MsgType.GROUND_PRODUCED, "g.worker", count=5, block_ms=5000)
+            got = await self._bus.consume(MsgType.GROUND_VERIFIED, "g.worker", count=5, block_ms=5000)
             for entry_id, env in got:
-                await self._bus.ack(MsgType.GROUND_PRODUCED, "g.worker", entry_id)
+                await self._bus.ack(MsgType.GROUND_VERIFIED, "g.worker", entry_id)
                 if env.run_id != str(self.run_id) or env.step_id != step_idx:
                     continue
                 ga = env.payload.get("grounded_actions") or env.payload.get("actions") or []
@@ -2562,7 +2565,7 @@ class ScenarioRunner:
                         aa = a.get("action_args") if isinstance(a.get("action_args"), dict) else {}
                         aa["x"], aa["y"] = coords[0], coords[1]
                         a["action_args"] = aa
-                logger.info("[bus] ground.produced step=%d actions=%d", step_idx, len(ga))
+                logger.info("[bus] ground.verified step=%d actions=%d", step_idx, len(ga))
                 # PER-175 Phase C: deterministic keypad macro. The vision
                 # Context Identifier put an affordance_map on the bus; if it
                 # says this is a PIN screen and we hold the code, drive the
