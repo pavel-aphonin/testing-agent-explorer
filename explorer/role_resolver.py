@@ -51,9 +51,23 @@ class ModuleRole(str, Enum):
     SAFETY_GUARD = "SAFETY_GUARD"
     REWARD_CRITIC = "REWARD_CRITIC"
     AMBIGUITY_RESOLVER = "AMBIGUITY_RESOLVER"
+    # PER-175 full integration: the 12th module — pure code, no model, so
+    # it has no assignable endpoint, but it gets a role so it appears in
+    # the inventory and the (future) per-module config UI as a first-class
+    # pipeline citizen.
+    PLATFORM_ADAPTER = "PLATFORM_ADAPTER"
+    # ScreenSeekeR — algorithmic region-narrowing grounding refinement.
+    # Also code-only; a role so it's configurable (e.g. max iterations).
+    SCREEN_SEEKER = "SCREEN_SEEKER"
 
 
 ALL_MODULE_ROLES: tuple[ModuleRole, ...] = tuple(ModuleRole)
+
+# PER-175: modules implemented purely in code (no LLM/model endpoint).
+# They still carry a ModuleRole so the startup inventory and the future
+# per-module config UI treat them as first-class pipeline citizens, but
+# RoleResolver never expects an endpoint for them.
+CODE_ONLY_ROLES = frozenset({ModuleRole.PLATFORM_ADAPTER, ModuleRole.SCREEN_SEEKER})
 
 
 @dataclass

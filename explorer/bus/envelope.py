@@ -26,13 +26,39 @@ class MsgType(str, Enum):
 
     The value is also the stream-name suffix (see streams.stream_for).
     Append-only; renaming a value renames its stream.
+
+    PER-175 full integration — every one of the 12 modules (+ ScreenSeekeR
+    as a 13th grounding-refinement stage) has a link, so all are exercised
+    in one decision cycle:
+
+        screen.captured     worker emits raw screen state (screenshot + AX)
+        → screen.parsed     Screen Parser (OmniParser) — element boxes/types
+        → screen.perceived  Dynamic Perceiver (SigLIP2) — novelty / Δ vs last
+        → context.classified Context Identifier — screen_type + AffordanceMap (VISION)
+        → plan.produced     Planner — INTENTS (what), via Ambiguity/Memory/Reflection
+        → plan.critiqued    Reward Critic — pre-operative verdict (Safety side-consumes)
+        → actions.resolved  Platform Adapter (12th, pure code) — intent+affordance → batch (how)
+        → ground.refined    ScreenSeekeR — region narrowing for small targets
+        → ground.produced   Grounder — coordinates
+        → ground.verified   Grounding Verifier — confidence gate (worker consumes)
+        → action.dispatched worker post-dispatch (Memory side-consumes to record)
+
+    The legacy subset (screen.captured → context.classified → plan.produced
+    → ground.produced) stays valid so the pipeline keeps running while
+    stages are filled in.
     """
 
-    SCREEN_CAPTURED = "screen.captured"      # worker → context/planner
-    CONTEXT_CLASSIFIED = "context.classified"  # context → planner
-    PLAN_PRODUCED = "plan.produced"          # planner → grounder (action array)
-    GROUND_PRODUCED = "ground.produced"      # grounder → worker (coord array)
-    ACTION_DISPATCHED = "action.dispatched"  # worker → (telemetry / memory)
+    SCREEN_CAPTURED = "screen.captured"
+    SCREEN_PARSED = "screen.parsed"
+    SCREEN_PERCEIVED = "screen.perceived"
+    CONTEXT_CLASSIFIED = "context.classified"
+    PLAN_PRODUCED = "plan.produced"
+    PLAN_CRITIQUED = "plan.critiqued"
+    ACTIONS_RESOLVED = "actions.resolved"
+    GROUND_REFINED = "ground.refined"
+    GROUND_PRODUCED = "ground.produced"
+    GROUND_VERIFIED = "ground.verified"
+    ACTION_DISPATCHED = "action.dispatched"
 
 
 @dataclass
