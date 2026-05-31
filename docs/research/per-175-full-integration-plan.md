@@ -66,13 +66,43 @@ the system runs while stages fill in.
 - The boolean `context_is_pin` is **deleted**; `screen_type` +
   `AffordanceMap` replace it.
 
+## STATUS (resume here)
+
+- **A — DONE** (commit e3c4333): affordances.py, full bus MsgType chain,
+  PLATFORM_ADAPTER+SCREEN_SEEKER roles, Platform Adapter + tests.
+- **B — capability DONE, wiring is Phase C.** Done & pushed:
+  - `/classify_vision` SigLIP2 zero-shot screen-type endpoint (infra
+    commit 37c11c4) — the blindness fix, perception side.
+  - `affordance_builder.py` (commit fed2298) — vision boxes→AffordanceMap,
+    canvas-keypad + stray-digit rules unit-locked.
+  - `ContextIdentifierAgent.classify_vision()` (fed2298).
+  - Adapter fix (commit 4787a86): keypad path taps the SECRET's digits via
+    a `resolve_value` callable, not 0-9. 158 tests green.
+  - NOT yet wired into the decision loop — see Phase C.
+
+## Phase C — START HERE next session (the wiring)
+
+1. **Context Identifier produces an AffordanceMap** and puts it on the bus
+   (`context.classified` payload carries `affordance_map`): call
+   `classify_vision(screenshot)` for screen_type + take Screen Parser
+   `/parse` boxes, feed both to `build_affordance_map`. Replace the boolean
+   `context_is_pin` everywhere with `AffordanceMap`.
+2. **Planner emits intents** (`provide_credential`/`submit`/…) not
+   mechanisms — update goal_schema + planner prompt + bus PLANNER handler.
+3. **Resolver in the loop**: worker (sync `_goal_decide` and bus
+   `_bus_goal_decide`) calls `platform_adapter.resolve_plan(intents,
+   amap, test_data_keys, resolve_value=...)` BEFORE grounding. Pass a
+   `resolve_value` bound to the run's test_data.
+4. Grounder→Holo2-8B selectable (UI-TARS stays default), ScreenSeekeR
+   stage, Grounding Verifier gate.
+   Note: Screen Parser `/parse` returns boxes WITHOUT text/OCR — fine for
+   the keypad (adapter taps by description, grounder localises), but add
+   OCR (ocrmac/easyocr) when richer affordance labels are needed.
+
 ## Phases (Linear under PER-175; tasks #88–93 locally)
 
-- **A** shared contracts: `affordances.py` ✓, bus chain ✓, add
-  `PLATFORM_ADAPTER`+`SCREEN_SEEKER` roles, Platform Adapter + tests.
-- **B** vision perception: SigLIP2 screen-type + OmniParser→affordances in
-  the perception service; Context Identifier returns `AffordanceMap`;
-  Screen Parser + Dynamic Perceiver become live stages.
+- **A** shared contracts — DONE.
+- **B** vision perception capability — DONE (wiring → C).
 - **C** planner intents + resolver live + Grounder→Holo1.5 (selectable) +
   ScreenSeekeR + Grounding Verifier gate.
 - **D** Reward Critic (GUI-Critic-R1) + Safety + Memory + Reflection all on
