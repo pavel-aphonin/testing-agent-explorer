@@ -94,18 +94,91 @@ class ModuleRunner:
         resolver = RoleResolver(backend)
 
         if self.role is ModuleRole.CONTEXT_IDENTIFIER:
-            from explorer.agents import ContextIdentifierAgent
+            # PER-175 Phase C: the blindness fix in the hot path. Build a
+            # VISION AffordanceMap (screen_type via SigLIP2 + element boxes
+            # via Screen Parser/OmniParser) instead of classifying AX-tree
+            # text. This revives Screen Parser (a previously-dead module)
+            # in the same stage. Falls back to the text classifier when
+            # there's no screenshot or vision is unavailable, so the chain
+            # never wedges.
+            import base64
+            from explorer.agents import ContextIdentifierAgent, ScreenParserAgent
+            from explorer.affordance_builder import build_affordance_map
+            from explorer.affordances import AffordanceMap
             agent = ContextIdentifierAgent(resolver)
+            parser = ScreenParserAgent(resolver)
+
+            def _editable_regions_from_ax(elements: list) -> list[tuple]:
+                """AX-derived text-field rects (pixel space) so the builder
+                can mark a vision box editable even when vision can't tell.
+                Hybrid perception: vision sees the canvas, AX confirms real
+                fields when the tree isn't empty."""
+                from explorer.goal_schema import _is_editable_kind
+                regions: list[tuple] = []
+                for e in elements or []:
+                    if not isinstance(e, dict):
+                        continue
+                    if not _is_editable_kind(e.get("kind") or e.get("type")):
+                        continue
+                    fr = e.get("frame") or {}
+                    try:
+                        x, y = int(fr["x"]), int(fr["y"])
+                        w, h = int(fr["width"]), int(fr["height"])
+                        regions.append((x, y, x + w, y + h))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                return regions
 
             async def handle(payload: dict) -> dict | None:
-                text = payload.get("elements_block") or payload.get("screen_text") or ""
-                res = await agent.classify(text)
-                # Echo the screen payload forward + attach the label so
-                # the planner stage needs no join.
                 out = dict(payload)
-                out["context_label"] = res.label if res else None
-                out["context_confidence"] = res.confidence if res else 0.0
-                out["context_is_pin"] = bool(res and res.is_pin_entry)
+                shot_b64 = payload.get("screenshot_b64")
+                amap: AffordanceMap | None = None
+                if shot_b64:
+                    shot = base64.b64decode(shot_b64)
+                    # screen TYPE from the screenshot (SigLIP2 zero-shot)
+                    ctx = await agent.classify_vision(shot)
+                    # element BOXES from the screenshot (OmniParser); the
+                    # parser returns normalized bboxes → scale to pixels.
+                    parsed = await parser.parse(shot)
+                    boxes: list[dict] = []
+                    if parsed:
+                        iw = int(payload.get("screen_w") or 0)
+                        ih = int(payload.get("screen_h") or 0)
+                        for el in parsed.elements:
+                            bb = el.get("bbox") or []
+                            if len(bb) == 4 and iw and ih:
+                                bb = [int(bb[0] * iw), int(bb[1] * ih),
+                                      int(bb[2] * iw), int(bb[3] * ih)]
+                            boxes.append({
+                                "bbox": bb if len(bb) == 4 else None,
+                                "text": el.get("text") or el.get("content") or "",
+                                "confidence": el.get("confidence", 0.0),
+                            })
+                    if ctx is not None or boxes:
+                        amap = build_affordance_map(
+                            screen_type=(ctx.label if ctx else "unknown"),
+                            screen_confidence=(ctx.confidence if ctx else 0.0),
+                            boxes=boxes,
+                            editable_regions=_editable_regions_from_ax(
+                                payload.get("elements") or []
+                            ),
+                            source="vision",
+                        )
+                if amap is None:
+                    # Fallback: legacy text classifier over the AX block.
+                    text = payload.get("elements_block") or payload.get("screen_text") or ""
+                    res = await agent.classify(text)
+                    amap = AffordanceMap(
+                        screen_type=(res.label if res else "unknown"),
+                        screen_confidence=(res.confidence if res else 0.0),
+                        source="ax_text",
+                    )
+                # Attach the affordance map (Platform Adapter consumes it)
+                # and keep the legacy fields for back-compat consumers.
+                out["affordance_map"] = amap.to_dict()
+                out["context_label"] = amap.screen_type
+                out["context_confidence"] = amap.screen_confidence
+                out["context_is_pin"] = bool(amap.is_pin_entry)
                 return out
             return handle
 
@@ -220,15 +293,36 @@ class ModuleRunner:
                     actions = [parsed]
                 else:
                     return None
-                # PER-204: on a PIN screen, append the submit tap to the
-                # batch BEFORE the grounder stage so the «Вперёд» button
-                # gets grounded coords on the bus (GUI-Owl reliably omits
-                # it — PER-175 reasoning↔action gap). No-op off-PIN or if
-                # the model already included a submit.
+                # PER-175 Phase C: Platform Adapter (12th module) resolves
+                # the plan against the screen's AffordanceMap — intents →
+                # concrete batch, choosing mechanism from what the screen
+                # affords (PER-205: enter_text only into editable fields;
+                # submit routing). Concrete actions a legacy planner already
+                # emitted pass through unchanged.
+                #
+                # SECRETS: we deliberately do NOT pass a resolve_value here.
+                # Expanding a keypad credential into its digit taps needs
+                # the actual secret (8-5-2-0), and the codebase keeps secrets
+                # in the worker's memory only (PER-111 value_source) — they
+                # must not ride the Redis bus. So on the bus path the keypad
+                # *digit* expansion is deferred to the worker (it has
+                # test_data); here we only ensure the PER-204 submit press
+                # is appended after the model's own digit taps. Worker-side
+                # bus digit-expansion is a follow-up.
+                from explorer.affordances import AffordanceMap
+                from explorer.platform_adapter import resolve_plan
                 from explorer.planning.hints import append_pin_submit
-                actions = append_pin_submit(
-                    actions, bool(payload.get("context_is_pin"))
+                amap = AffordanceMap.from_dict(payload.get("affordance_map") or {})
+                actions = resolve_plan(
+                    actions, amap,
+                    test_data_keys=payload.get("test_data_keys", []),
+                    resolve_value=None,   # secrets stay worker-side
                 )
+                # PER-204 submit rule (keypad → ensure a trailing submit).
+                # Uses the vision screen_type when present, else the legacy
+                # context_is_pin flag.
+                is_pin = bool(amap.is_pin_entry) or bool(payload.get("context_is_pin"))
+                actions = append_pin_submit(actions, is_pin)
                 out = dict(payload)
                 out["actions"] = actions
                 # Carry the batch terminal verdict forward so the worker

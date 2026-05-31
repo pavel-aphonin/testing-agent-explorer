@@ -2532,6 +2532,12 @@ class ScenarioRunner:
             "visited_summary": visited_summary,
             "memory_block": memory_block,
             "screenshot_b64": screenshot_b64,
+            # PER-175 Phase C: screen pixel dims so the Context Identifier
+            # runner can scale OmniParser's normalized bboxes into the
+            # affordance map's pixel space. Secrets (test_data values) are
+            # deliberately NOT put on the bus — they stay in the worker.
+            "screen_w": int(getattr(self.controller, "_width", 0) or 0),
+            "screen_h": int(getattr(self.controller, "_height", 0) or 0),
         }
         await self._bus.publish(Envelope(
             run_id=str(self.run_id), step_id=step_idx,
