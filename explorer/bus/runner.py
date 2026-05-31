@@ -49,27 +49,89 @@ class RoleWiring:
     group: str
 
 
-# Per-role bus wiring. The linearized chain + side-consumers.
+# PER-175 full integration: bus wiring for ALL 13 modules. The linearized
+# main chain advances one link per stage; side-consumers read a link
+# without producing the next. Topology (validated by test_bus_chain):
+#
+#   screen.captured
+#     → SCREEN_PARSER      → screen.parsed
+#     → DYNAMIC_PERCEIVER  → screen.perceived
+#     → CONTEXT_IDENTIFIER → context.classified
+#     → PLANNER            → plan.produced
+#     → REWARD_CRITIC      → plan.critiqued      (SAFETY_GUARD side-consumes plan.produced)
+#                                                (REFLECTION side-consumes plan.produced)
+#     → PLATFORM_ADAPTER   → actions.resolved    (AMBIGUITY side-consumes context.classified)
+#     → SCREEN_SEEKER      → ground.refined
+#     → GROUNDER           → ground.produced
+#     → GROUNDING_VERIFIER → ground.verified     (worker consumes; MEMORY side-consumes)
+#
+# Every module has exactly one runner. Code-only modules (PLATFORM_ADAPTER,
+# SCREEN_SEEKER) run their pure logic in the handler — no model endpoint.
 ROLE_WIRING: dict[ModuleRole, RoleWiring] = {
-    ModuleRole.CONTEXT_IDENTIFIER: RoleWiring(
+    ModuleRole.SCREEN_PARSER: RoleWiring(
         consumes=MsgType.SCREEN_CAPTURED,
+        produces=MsgType.SCREEN_PARSED,
+        group="g.screenparser",
+    ),
+    ModuleRole.DYNAMIC_PERCEIVER: RoleWiring(
+        consumes=MsgType.SCREEN_PARSED,
+        produces=MsgType.SCREEN_PERCEIVED,
+        group="g.perceiver",
+    ),
+    ModuleRole.CONTEXT_IDENTIFIER: RoleWiring(
+        consumes=MsgType.SCREEN_PERCEIVED,
         produces=MsgType.CONTEXT_CLASSIFIED,
         group="g.context",
+    ),
+    ModuleRole.AMBIGUITY_RESOLVER: RoleWiring(
+        consumes=MsgType.CONTEXT_CLASSIFIED,
+        produces=None,  # side-consumer: canonicalises the goal, annotates only
+        group="g.ambiguity",
     ),
     ModuleRole.PLANNER: RoleWiring(
         consumes=MsgType.CONTEXT_CLASSIFIED,
         produces=MsgType.PLAN_PRODUCED,
         group="g.planner",
     ),
-    ModuleRole.GROUNDER: RoleWiring(
+    ModuleRole.SAFETY_GUARD: RoleWiring(
         consumes=MsgType.PLAN_PRODUCED,
+        produces=None,  # side-consumer: vetoes unsafe actions, doesn't advance
+        group="g.safety",
+    ),
+    ModuleRole.REFLECTION: RoleWiring(
+        consumes=MsgType.PLAN_PRODUCED,
+        produces=None,  # side-consumer: stuck-review, annotates only
+        group="g.reflection",
+    ),
+    ModuleRole.REWARD_CRITIC: RoleWiring(
+        consumes=MsgType.PLAN_PRODUCED,
+        produces=MsgType.PLAN_CRITIQUED,
+        group="g.critic",
+    ),
+    ModuleRole.PLATFORM_ADAPTER: RoleWiring(
+        consumes=MsgType.PLAN_CRITIQUED,
+        produces=MsgType.ACTIONS_RESOLVED,
+        group="g.adapter",
+    ),
+    ModuleRole.SCREEN_SEEKER: RoleWiring(
+        consumes=MsgType.ACTIONS_RESOLVED,
+        produces=MsgType.GROUND_REFINED,
+        group="g.seeker",
+    ),
+    ModuleRole.GROUNDER: RoleWiring(
+        consumes=MsgType.GROUND_REFINED,
         produces=MsgType.GROUND_PRODUCED,
         group="g.grounder",
     ),
-    ModuleRole.SAFETY_GUARD: RoleWiring(
-        consumes=MsgType.PLAN_PRODUCED,
-        produces=None,  # side-consumer: annotates / vetoes, doesn't advance the chain
-        group="g.safety",
+    ModuleRole.GROUNDING_VERIFIER: RoleWiring(
+        consumes=MsgType.GROUND_PRODUCED,
+        produces=MsgType.GROUND_VERIFIED,
+        group="g.verifier",
+    ),
+    ModuleRole.MEMORY: RoleWiring(
+        consumes=MsgType.GROUND_VERIFIED,
+        produces=None,  # side-consumer: records the step into episodic memory
+        group="g.memory",
     ),
 }
 
