@@ -2563,6 +2563,30 @@ class ScenarioRunner:
                         aa["x"], aa["y"] = coords[0], coords[1]
                         a["action_args"] = aa
                 logger.info("[bus] ground.produced step=%d actions=%d", step_idx, len(ga))
+                # PER-175 Phase C: deterministic keypad macro. The vision
+                # Context Identifier put an affordance_map on the bus; if it
+                # says this is a PIN screen and we hold the code, drive the
+                # canvas keypad ourselves (tap digits in order + submit)
+                # instead of trusting the planner's mechanism choice — the
+                # exact fix for the cccc3333 canvas no-op loop. Secret is
+                # read here worker-side; never rode the bus.
+                amap_dict = env.payload.get("affordance_map") or {}
+                screen_type = amap_dict.get("screen_type", "")
+                from explorer.platform_adapter import keypad_macro
+                macro = keypad_macro(screen_type, self.test_data)
+                if macro:
+                    logger.info(
+                        "[bus] keypad macro fired (screen_type=%s) → %d actions "
+                        "(digit taps + submit, grounded by description)",
+                        screen_type, len(macro),
+                    )
+                    return {
+                        "done": False,
+                        "reason": env.payload.get("reason"),
+                        "expected_next_screen": env.payload.get("expected_next_screen"),
+                        "actions": macro,
+                        "context_is_pin": True,
+                    }
                 return {
                     "done": bool(env.payload.get("done", False)),
                     "reason": env.payload.get("reason"),

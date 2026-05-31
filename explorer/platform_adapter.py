@@ -242,6 +242,54 @@ def resolve_intent(
     return [intent]
 
 
+def keypad_macro(
+    screen_type: str,
+    test_data: dict[str, str] | None,
+    *,
+    credential: str | None = None,
+) -> list[dict[str, Any]] | None:
+    """PER-175 Phase C: deterministic PIN-keypad driver.
+
+    The blindness-fix payoff. When VISION classifies the screen as a
+    PIN/secret-code entry (``screen_type``) and we hold the code in
+    ``test_data``, we DON'T ask the planner how to type it — on a canvas
+    keypad the answer is always "tap the digit buttons in order, then
+    submit". This sidesteps the run-cccc3333 failure where the planner
+    chose ``enter_text`` on a canvas (a no-op) and looped.
+
+    Returns the concrete batch (digit taps by description + submit) for the
+    worker to dispatch — each ``tap_at`` carries only a ``target_description``
+    so the proven Grounder-by-description path (UI-TARS localised these at
+    >0.88 confidence in cccc3333) places the actual coordinate. The secret
+    is read here in pure worker-side code and never leaves the process.
+
+    ``None`` when the screen isn't a PIN entry or we have no code — the
+    normal planner flow then handles the screen.
+    """
+    st = (screen_type or "").lower()
+    is_pin = "pin" in st or "secret" in st or ("код" in st and "qr" not in st)
+    if not is_pin:
+        return None
+    cred = credential or "pin_code"
+    value = (test_data or {}).get(cred)
+    digits = [c for c in str(value or "") if c.isdigit()]
+    if not digits:
+        return None
+    batch = [
+        _action(
+            "tap_at",
+            target_description=f"цифра {d} на экранной клавиатуре",
+            reasoning=f"PER-175 keypad macro: tap digit {d} (grounded by description)",
+        )
+        for d in digits
+    ]
+    batch.append(_action(
+        "tap_at", target_description=_SUBMIT_DESC,
+        reasoning="PER-204: submit after the code is entered.",
+    ))
+    return batch
+
+
 def resolve_plan(
     intents: list[dict[str, Any]] | None,
     amap: AffordanceMap,
