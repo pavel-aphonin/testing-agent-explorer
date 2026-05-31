@@ -2571,14 +2571,27 @@ class ScenarioRunner:
                 # exact fix for the cccc3333 canvas no-op loop. Secret is
                 # read here worker-side; never rode the bus.
                 amap_dict = env.payload.get("affordance_map") or {}
-                screen_type = amap_dict.get("screen_type", "")
-                from explorer.platform_adapter import keypad_macro
-                macro = keypad_macro(screen_type, self.test_data)
+                from explorer.affordances import AffordanceMap
+                from explorer.platform_adapter import (
+                    keypad_macro, should_fire_keypad_macro,
+                )
+                amap_obj = AffordanceMap.from_dict(amap_dict)
+                # PER-175 Phase C SAFETY (smoke dddd4444): fire ONLY on
+                # corroborated evidence — a real keypad grid (OmniParser
+                # >=6 digit keys) or a high-confidence PIN screen_type. The
+                # SigLIP label alone (uniform ~0.09) fired the macro on the
+                # LOGIN screen, nearly typing the PIN there. Otherwise fall
+                # through to the planner — never type a secret on an
+                # unverified screen.
+                macro = None
+                if should_fire_keypad_macro(amap_obj):
+                    macro = keypad_macro(self.test_data)
                 if macro:
                     logger.info(
-                        "[bus] keypad macro fired (screen_type=%s) → %d actions "
-                        "(digit taps + submit, grounded by description)",
-                        screen_type, len(macro),
+                        "[bus] keypad macro fired (screen_type=%s conf=%.2f "
+                        "keypad_keys=%d) → %d actions (digit taps + submit)",
+                        amap_obj.screen_type, amap_obj.screen_confidence,
+                        len(amap_obj.keypad_keys), len(macro),
                     )
                     return {
                         "done": False,

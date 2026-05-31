@@ -242,34 +242,51 @@ def resolve_intent(
     return [intent]
 
 
+def should_fire_keypad_macro(amap: AffordanceMap) -> bool:
+    """PER-175 Phase C SAFETY gate (smoke dddd4444 lesson).
+
+    Decide whether to drive the keypad deterministically. The trigger must
+    be CORROBORATED evidence, never a weak label:
+
+      * PRIMARY — ``has_keypad``: OmniParser detected >=6 single-digit keys.
+        A numeric-keypad grid is unambiguous; a login screen never has one.
+        This alone is sufficient (and independent of the screen-type model).
+      * SECONDARY — a high-confidence PIN screen_type (>=0.6). Only useful
+        once the screen classifier is a real VLM (Holo2); the SigLIP
+        zero-shot label is uniform ~0.09 and must NOT trigger on its own —
+        it fired the macro on the LOGIN screen in dddd4444.
+
+    Returns False when there's no trustworthy evidence → the planner
+    handles the screen and we never type a secret on an unverified screen.
+    """
+    if amap.has_keypad:
+        return True
+    return bool(amap.is_pin_entry and amap.screen_confidence >= 0.6)
+
+
 def keypad_macro(
-    screen_type: str,
     test_data: dict[str, str] | None,
     *,
     credential: str | None = None,
 ) -> list[dict[str, Any]] | None:
     """PER-175 Phase C: deterministic PIN-keypad driver.
 
-    The blindness-fix payoff. When VISION classifies the screen as a
-    PIN/secret-code entry (``screen_type``) and we hold the code in
-    ``test_data``, we DON'T ask the planner how to type it — on a canvas
-    keypad the answer is always "tap the digit buttons in order, then
-    submit". This sidesteps the run-cccc3333 failure where the planner
-    chose ``enter_text`` on a canvas (a no-op) and looped.
+    The blindness-fix payoff. The CALLER decides *whether* this is a keypad
+    screen (see ``should_fire_keypad_macro`` — gated on corroborated
+    evidence, not a weak label). This function only BUILDS the batch: tap
+    the secret's digits in order, then submit. On a canvas keypad that's
+    always the right mechanism — it sidesteps the run-cccc3333 failure where
+    the planner chose ``enter_text`` on a canvas (a no-op) and looped.
 
-    Returns the concrete batch (digit taps by description + submit) for the
-    worker to dispatch — each ``tap_at`` carries only a ``target_description``
-    so the proven Grounder-by-description path (UI-TARS localised these at
-    >0.88 confidence in cccc3333) places the actual coordinate. The secret
-    is read here in pure worker-side code and never leaves the process.
+    Returns the concrete batch (digit taps by description + submit) — each
+    ``tap_at`` carries only a ``target_description`` so the proven
+    Grounder-by-description path (UI-TARS localised these at >0.88 in
+    cccc3333) places the actual coordinate. The secret is read here in pure
+    worker-side code and never leaves the process.
 
-    ``None`` when the screen isn't a PIN entry or we have no code — the
-    normal planner flow then handles the screen.
+    ``None`` when we have no code for ``credential`` — caller falls back to
+    the planner.
     """
-    st = (screen_type or "").lower()
-    is_pin = "pin" in st or "secret" in st or ("код" in st and "qr" not in st)
-    if not is_pin:
-        return None
     cred = credential or "pin_code"
     value = (test_data or {}).get(cred)
     digits = [c for c in str(value or "") if c.isdigit()]
