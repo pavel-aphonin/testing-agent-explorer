@@ -83,58 +83,85 @@ def _action(
     }
 
 
+def _submit_action(amap: AffordanceMap) -> dict[str, Any]:
+    """PER-204 as a rule: the submit press that ends a keypad entry.
+    Prefer a detected submit affordance; else ground by description."""
+    subs = amap.submit_buttons
+    if subs:
+        c = subs[0].center()
+        return _action(
+            "tap_at",
+            target_description=subs[0].label or _SUBMIT_DESC,
+            x=c[0] if c else None,
+            y=c[1] if c else None,
+            reasoning="PER-204: submit after the code is entered.",
+        )
+    return _action(
+        "tap_at", target_description=_SUBMIT_DESC,
+        reasoning="PER-204: submit after the code (grounded by description).",
+    )
+
+
 def _resolve_credential(
     intent: dict[str, Any],
     amap: AffordanceMap,
     test_data_keys: list[str],
+    resolved_value: str | None = None,
 ) -> list[dict[str, Any]]:
     """Map a ``provide_credential`` intent to a concrete batch using the
-    screen's affordances. This is the canvas-PIN fix, generalised."""
+    screen's affordances. This is the canvas-PIN fix, generalised.
+
+    ``resolved_value`` is the actual secret the worker substituted from
+    test_data (e.g. "8520"). It's needed ONLY for the keypad path —
+    tapping a canvas keypad is inherently value-dependent (you tap 8-5-2-0,
+    not the ten keys). It is pure code in the worker; the value never
+    enters an LLM prompt. For the text-field path the value stays a
+    value_source the dispatcher substitutes at type time.
+    """
     cred = (
         intent.get("credential")
         or intent.get("value_source", "").replace("test_data.", "")
         or "pin_code"
     )
-    value_source = f"test_data.{cred}" if cred in test_data_keys else "test_data." + cred
+    value_source = f"test_data.{cred}"
     reason = f"PER-175 resolver: provide {cred} via the screen's input mechanism."
 
-    # 1) On-screen keypad (canvas, no text field) → tap digits in order + submit.
+    # 1) On-screen keypad (canvas, no text field) → tap the secret's digits
+    #    IN SECRET ORDER, then submit.
     if amap.has_keypad:
-        digits = amap.digit_keys_in_order()
         batch: list[dict[str, Any]] = []
-        # We tap by digit description so the grounder localises each key;
-        # bbox (when present) lets ScreenSeekeR pre-narrow the region.
-        for a in digits:
-            c = a.center()
-            batch.append(_action(
-                "tap_at",
-                target_description=f"цифра {a.value} на экранной клавиатуре",
-                x=c[0] if c else None,
-                y=c[1] if c else None,
-                value_source=value_source,
-                reasoning=f"tap keypad digit {a.value}",
-            ))
-        # PER-204 as a RULE: a credential entry on a keypad always ends
-        # with the submit press. Prefer a detected submit affordance.
-        subs = amap.submit_buttons
-        if subs:
-            c = subs[0].center()
-            batch.append(_action(
-                "tap_at",
-                target_description=subs[0].label or _SUBMIT_DESC,
-                x=c[0] if c else None,
-                y=c[1] if c else None,
-                reasoning="PER-204: submit after the code is entered.",
-            ))
+        # Map detected keys by their character so we can attach a bbox
+        # (lets ScreenSeekeR pre-narrow); description drives the grounder.
+        key_by_char = {
+            (k.value or ""): k for k in amap.keypad_keys if k.value
+        }
+        digits = [ch for ch in (resolved_value or "") if ch.isdigit()]
+        if digits:
+            for ch in digits:
+                k = key_by_char.get(ch)
+                c = k.center() if k else None
+                batch.append(_action(
+                    "tap_at",
+                    target_description=f"цифра {ch} на экранной клавиатуре",
+                    x=c[0] if c else None,
+                    y=c[1] if c else None,
+                    reasoning=f"tap keypad digit {ch}",
+                ))
         else:
+            # No resolved value (shouldn't happen — worker has test_data).
+            # Don't guess digits; hand the keypad to the grounder by
+            # description so the step is at least attempted, then submit.
+            logger.info(
+                "[adapter] keypad credential with no resolved value — "
+                "description fallback"
+            )
             batch.append(_action(
-                "tap_at", target_description=_SUBMIT_DESC,
-                reasoning="PER-204: submit after the code (grounded by description).",
+                "enter_text",
+                target_description="экранная клавиатура ввода кода",
+                value_source=value_source,
+                reasoning=f"{reason} (keypad, value via dispatcher).",
             ))
-        if not digits:
-            # Keypad detected but digits not individually resolved → let the
-            # grounder type via the keypad by description, still + submit.
-            logger.info("[adapter] keypad with no resolved digit keys — description fallback")
+        batch.append(_submit_action(amap))
         return batch
 
     # 2) Editable text field present → type into it (PER-205: only editable).
@@ -164,18 +191,36 @@ def resolve_intent(
     intent: dict[str, Any],
     amap: AffordanceMap,
     test_data_keys: list[str] | None = None,
+    resolve_value: "Any" = None,
 ) -> list[dict[str, Any]]:
     """Resolve ONE planner intent into a concrete action batch.
 
     Unknown / already-concrete intents pass through unchanged (wrapped in a
     list) so the adapter is safe to run over any planner output — it only
     *adds* mechanism where an abstract intent needs it.
+
+    ``resolve_value`` (optional) is a callable ``credential_key -> value``
+    the worker provides so the keypad path can expand a secret into its
+    digit taps. Pure code; the value never enters a prompt. When omitted,
+    keypad credential entry falls back to a description + value_source the
+    dispatcher substitutes.
     """
     test_data_keys = test_data_keys or []
     name = (intent.get("intent") or intent.get("action") or "").strip().lower()
 
     if name == INTENT_PROVIDE_CREDENTIAL:
-        return _resolve_credential(intent, amap, test_data_keys)
+        cred = (
+            intent.get("credential")
+            or intent.get("value_source", "").replace("test_data.", "")
+            or "pin_code"
+        )
+        resolved = None
+        if callable(resolve_value):
+            try:
+                resolved = resolve_value(cred)
+            except Exception:  # never let value lookup break resolution
+                logger.exception("[adapter] resolve_value(%s) failed", cred)
+        return _resolve_credential(intent, amap, test_data_keys, resolved)
 
     if name in (INTENT_SUBMIT,):
         subs = amap.submit_buttons
@@ -201,14 +246,16 @@ def resolve_plan(
     intents: list[dict[str, Any]] | None,
     amap: AffordanceMap,
     test_data_keys: list[str] | None = None,
+    resolve_value: "Any" = None,
 ) -> list[dict[str, Any]]:
     """Resolve a whole plan (list of intents) into a flat concrete batch.
 
     This is what the ``actions.resolved`` bus stage publishes and the
-    synchronous path calls before grounding/dispatch.
+    synchronous path calls before grounding/dispatch. ``resolve_value`` is
+    the worker's ``credential_key -> value`` callable (see resolve_intent).
     """
     out: list[dict[str, Any]] = []
     for intent in intents or []:
         if isinstance(intent, dict):
-            out.extend(resolve_intent(intent, amap, test_data_keys))
+            out.extend(resolve_intent(intent, amap, test_data_keys, resolve_value))
     return out
