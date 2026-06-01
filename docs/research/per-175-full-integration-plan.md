@@ -209,3 +209,53 @@ Risk note: Reward Critic / Safety / Ambiguity side-stages add LLM calls per
 step → each step slower than the 4-module chain. If too slow, those three
 side-consumers can be left unassigned (they degrade to no-op) for a first
 green run, then enabled.
+
+## OOM ROOT CAUSE (smoke eeee5555) — measured, not guessed
+
+The 13-module chain ran END-TO-END (every bus stream advanced; worker
+reached ground.verified) — but the machine OOM-thrashed at 96 GB. The
+memory math we did (~21 GB of weights) was CORRECT. The blow-up was
+operational, three multipliers we missed:
+
+- **All 6 llama-servers resident at once.** Measured Holo2 SOLO = 8.17 GB
+  RSS / ~12 GB wired. ×6 models all pinned simultaneously.
+- **Metal wired memory.** `--n-gpu-layers 99` on Apple Silicon makes the
+  unified-RAM GPU buffers WIRED (non-evictable). Run showed 43 GB wired →
+  kernel can't reclaim → thrash. Weights 21 GB became ~80+ GB resident.
+- **KV cache bloat from my ctx-size.** I launched at --ctx-size 16384
+  (vision) / 32768 (qwen, embed). For these tasks 4096 is plenty; 16-32k
+  KV is GBs/model wasted.
+
+### THE FIX (confirmed: system was DESIGNED for this)
+- The backend already generates `volumes/llm-models/llama-swap.yaml` with
+  `ttl: 300` — models load on demand and auto-unload after 5 min idle, so
+  only 1-2 are resident at a time, never 6. We DROPPED this when I hand-
+  launched 6 servers. **`llama-swap` binary is NOT installed** (`which
+  llama-swap` → not found) — that's why we went manual. Install it
+  (build from ggml-org/llama-swap or brew) and route all roles through the
+  single swap port; the worker/agents already resolve per-role endpoints.
+- The generated yaml is STALE (lists gemma-4-e4b, qwen3-embedding-8b; no
+  Holo2/GUI-Owl). Trigger a regen after model-passport changes, and fix the
+  generator's baked ctx-size 16384/32768 → 4096.
+
+### Multiplex reminder (answers "11 or 6 models?")
+6 unique llama models cover 9 roles via multiplex: GUI-Owl-8B = Planner +
+Reflection + Reward Critic; perception(:8090) = Screen Parser + Dynamic
+Perceiver. + Holo2 (Context), UI-TARS (Grounder), Qwen3-4B (Ambiguity),
+Llama-Guard (Safety), Qwen3-Embedding (Memory). Grounding Verifier =
+logprobs (no model); Platform Adapter + ScreenSeeker = pure code.
+
+## NEXT-SESSION ENTRY POINT
+1. Install llama-swap binary; point start-host-services at the swap port.
+2. Fix llm_swap.py generator: ctx-size 4096 default; ensure it emits ALL
+   active passports incl. holo2-8b (passport id 55555555-... already in DB,
+   CONTEXT_IDENTIFIER assignment already repointed to it).
+3. Diagnose Holo2 "screen_type=unknown conf=0.0": with ONLY Holo2 up (fits
+   easily), POST a real PIN screenshot to :8186/v1/chat/completions and read
+   the raw reply — is it returning prose, empty, or a parse-miss? (parser
+   unit tests pass, so it's the live reply.)
+4. Backend ModuleRole enum: add PLATFORM_ADAPTER + SCREEN_SEEKER (worker has
+   them; backend 422s on GET /module-assignments/{those} — harmless now,
+   but needed for a clean inventory).
+5. Then full run via llama-swap (no OOM) → expect Holo2 confident pin_entry
+   → keypad gate fires → login completes.
