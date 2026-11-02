@@ -1,0 +1,1378 @@
+[
+ {
+  "type": "Application",
+  "AXLabel": "Testbed",
+  "AXUniqueId": null,
+  "AXValue": null,
+  "frame": {
+   "x": 0,
+   "width": 402,
+   "height": 874,
+   "y": 0
+  },
+  "enabled": true,
+  "role_description": "application",
+  "subrole": null,
+  "children": [
+   {
+    "type": "Group",
+    "AXLabel": null,
+    "AXUniqueId": null,
+    "AXValue": null,
+    "frame": {
+     "height": 874,
+     "width": 402,
+     "y": 0,
+     "x": 0
+    },
+    "enabled": true,
+    "role_description": "group",
+    "subrole": null,
+    "children": [
+     {
+      "type": "Group",
+      "AXLabel": null,
+      "AXUniqueId": null,
+      "AXValue": null,
+      "frame": {
+       "height": 874,
+       "width": 402,
+       "y": 0,
+       "x": 0
+      },
+      "enabled": true,
+      "role_description": "group",
+      "subrole": null,
+      "children": [
+       {
+        "type": "Group",
+        "AXLabel": null,
+        "AXUniqueId": null,
+        "AXValue": null,
+        "frame": {
+         "height": 874,
+         "width": 402,
+         "y": 0,
+         "x": 0
+        },
+        "enabled": true,
+        "role_description": "group",
+        "subrole": null,
+        "children": [
+         {
+          "type": "Group",
+          "AXLabel": null,
+          "AXUniqueId": null,
+          "AXValue": null,
+          "frame": {
+           "height": 874,
+           "width": 402,
+           "y": 0,
+           "x": 0
+          },
+          "enabled": true,
+          "role_description": "group",
+          "subrole": null,
+          "children": [
+           {
+            "type": "Group",
+            "AXLabel": null,
+            "AXUniqueId": null,
+            "AXValue": null,
+            "frame": {
+             "height": 874,
+             "width": 402,
+             "y": 0,
+             "x": 0
+            },
+            "enabled": true,
+            "role_description": "group",
+            "subrole": null,
+            "children": [
+             {
+              "type": "Heading",
+              "AXLabel": "Вход",
+              "AXUniqueId": "screen.login",
+              "AXValue": null,
+              "frame": {
+               "height": 26.333333333333343,
+               "width": 53.33333333333334,
+               "y": 215.66666666666669,
+               "x": 174.33333333333334
+              },
+              "enabled": true,
+              "role_description": "heading",
+              "subrole": null,
+              "children": []
+             },
+             {
+              "type": "TextField",
+              "AXLabel": null,
+              "AXUniqueId": "login.email",
+              "AXValue": "Email",
+              "frame": {
+               "height": 34,
+               "width": 354,
+               "y": 258,
+               "x": 24
+              },
+              "enabled": true,
+              "role_description": "text field",
+              "subrole": null,
+              "children": []
+             },
+             {
+              "type": "TextField",
+              "AXLabel": null,
+              "AXUniqueId": "login.password",
+              "AXValue": "Пароль",
+              "frame": {
+               "height": 34,
+               "width": 354,
+               "y": 308,
+               "x": 24
+              },
+              "enabled": true,
+              "role_description": "secure text field",
+              "subrole": "AXSecureTextField",
+              "children": []
+             },
+             {
+              "type": "Button",
+              "AXLabel": "Войти",
+              "AXUniqueId": "login.submit",
+              "AXValue": null,
+              "frame": {
+               "height": 34.333333333333314,
+               "width": 72.66666666666666,
+               "y": 358,
+               "x": 164.66666666666666
+              },
+              "enabled": true,
+              "role_description": "button",
+              "subrole": null,
+              "children": []
+             }
+            ]
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "type": "Group",
+    "AXLabel": null,
+    "AXUniqueId": null,
+    "AXValue": null,
+    "frame": {
+     "height": 874,
+     "width": 402,
+     "y": 0,
+     "x": 0
+    },
+    "enabled": true,
+    "role_description": "group",
+    "subrole": null,
+    "children": [
+     {
+      "type": "Group",
+      "AXLabel": null,
+      "AXUniqueId": null,
+      "AXValue": null,
+      "frame": {
+       "height": 874,
+       "width": 402,
+       "y": 0,
+       "x": 0
+      },
+      "enabled": true,
+      "role_description": "group",
+      "subrole": null,
+      "children": [
+       {
+        "type": "Group",
+        "AXLabel": null,
+        "AXUniqueId": null,
+        "AXValue": null,
+        "frame": {
+         "height": 874,
+         "width": 402,
+         "y": 0,
+         "x": 0
+        },
+        "enabled": true,
+        "role_description": "group",
+        "subrole": null,
+        "children": []
+       },
+       {
+        "type": "Group",
+        "AXLabel": null,
+        "AXUniqueId": null,
+        "AXValue": null,
+        "frame": {
+         "height": 328,
+         "width": 402,
+         "y": 546,
+         "x": 0
+        },
+        "enabled": true,
+        "role_description": "group",
+        "subrole": null,
+        "children": [
+         {
+          "type": "Group",
+          "AXLabel": null,
+          "AXUniqueId": "inputView",
+          "AXValue": null,
+          "frame": {
+           "height": 328,
+           "width": 402,
+           "y": 546,
+           "x": 0
+          },
+          "enabled": true,
+          "role_description": "group",
+          "subrole": null,
+          "children": []
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "type": "Group",
+    "AXLabel": null,
+    "AXUniqueId": null,
+    "AXValue": null,
+    "frame": {
+     "height": 874,
+     "width": 402,
+     "y": 0,
+     "x": 0
+    },
+    "enabled": true,
+    "role_description": "group",
+    "subrole": null,
+    "children": [
+     {
+      "type": "Group",
+      "AXLabel": null,
+      "AXUniqueId": null,
+      "AXValue": null,
+      "frame": {
+       "height": 874,
+       "width": 402,
+       "y": 0,
+       "x": 0
+      },
+      "enabled": true,
+      "role_description": "group",
+      "subrole": null,
+      "children": [
+       {
+        "type": "Group",
+        "AXLabel": null,
+        "AXUniqueId": null,
+        "AXValue": null,
+        "frame": {
+         "height": 328,
+         "width": 402,
+         "y": 546,
+         "x": 0
+        },
+        "enabled": true,
+        "role_description": "group",
+        "subrole": null,
+        "children": [
+         {
+          "type": "Group",
+          "AXLabel": null,
+          "AXUniqueId": "SystemInputAssistantView",
+          "AXValue": null,
+          "frame": {
+           "height": 44,
+           "width": 402,
+           "y": 546,
+           "x": 0
+          },
+          "enabled": true,
+          "role_description": "group",
+          "subrole": null,
+          "children": [
+           {
+            "type": "Group",
+            "AXLabel": null,
+            "AXUniqueId": null,
+            "AXValue": null,
+            "frame": {
+             "height": 44,
+             "width": 402,
+             "y": 546,
+             "x": 0
+            },
+            "enabled": true,
+            "role_description": "group",
+            "subrole": null,
+            "children": [
+             {
+              "type": "Group",
+              "AXLabel": null,
+              "AXUniqueId": "CenterPageView",
+              "AXValue": null,
+              "frame": {
+               "height": 44,
+               "width": 402,
+               "y": 546,
+               "x": 0
+              },
+              "enabled": true,
+              "role_description": "group",
+              "subrole": null,
+              "children": [
+               {
+                "type": "Group",
+                "AXLabel": null,
+                "AXUniqueId": null,
+                "AXValue": null,
+                "frame": {
+                 "height": 1244,
+                 "width": 402,
+                 "y": -54,
+                 "x": 0
+                },
+                "enabled": true,
+                "role_description": "group",
+                "subrole": null,
+                "children": [
+                 {
+                  "type": "ScrollArea",
+                  "AXLabel": null,
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "height": 44,
+                   "width": 402,
+                   "y": 546,
+                   "x": 0
+                  },
+                  "enabled": true,
+                  "role_description": "Группа",
+                  "subrole": null,
+                  "children": []
+                 }
+                ]
+               },
+               {
+                "type": "Group",
+                "AXLabel": null,
+                "AXUniqueId": null,
+                "AXValue": null,
+                "frame": {
+                 "height": 44,
+                 "width": 402,
+                 "y": 546,
+                 "x": 0
+                },
+                "enabled": true,
+                "role_description": "group",
+                "subrole": null,
+                "children": [
+                 {
+                  "type": "Group",
+                  "AXLabel": null,
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "height": 44,
+                   "width": 402,
+                   "y": 546,
+                   "x": 0
+                  },
+                  "enabled": true,
+                  "role_description": "group",
+                  "subrole": null,
+                  "children": [
+                   {
+                    "type": "Group",
+                    "AXLabel": "Варианты ввода",
+                    "AXUniqueId": null,
+                    "AXValue": null,
+                    "frame": {
+                     "height": 44,
+                     "width": 402,
+                     "y": 546,
+                     "x": 0
+                    },
+                    "enabled": true,
+                    "role_description": "group",
+                    "subrole": null,
+                    "children": [
+                     {
+                      "type": "Group",
+                      "AXLabel": null,
+                      "AXUniqueId": null,
+                      "AXValue": null,
+                      "frame": {
+                       "height": 44,
+                       "width": 402,
+                       "y": 546,
+                       "x": 0
+                      },
+                      "enabled": true,
+                      "role_description": "group",
+                      "subrole": null,
+                      "children": [
+                       {
+                        "type": "Group",
+                        "AXLabel": null,
+                        "AXUniqueId": null,
+                        "AXValue": null,
+                        "frame": {
+                         "height": 44,
+                         "width": 342,
+                         "y": 546,
+                         "x": 30
+                        },
+                        "enabled": true,
+                        "role_description": "group",
+                        "subrole": null,
+                        "children": [
+                         {
+                          "type": "Button",
+                          "AXLabel": "Passwords",
+                          "AXUniqueId": null,
+                          "AXValue": null,
+                          "frame": {
+                           "height": 44,
+                           "width": 342,
+                           "y": 546,
+                           "x": 30
+                          },
+                          "enabled": true,
+                          "role_description": "button",
+                          "subrole": null,
+                          "children": [
+                           {
+                            "type": "Image",
+                            "AXLabel": null,
+                            "AXUniqueId": "kb-autofill-key",
+                            "AXValue": null,
+                            "frame": {
+                             "height": 23,
+                             "width": 13,
+                             "y": 560,
+                             "x": 150.5
+                            },
+                            "enabled": true,
+                            "role_description": "image",
+                            "subrole": null,
+                            "children": []
+                           }
+                          ]
+                         }
+                        ]
+                       }
+                      ]
+                     }
+                    ]
+                   }
+                  ]
+                 }
+                ]
+               }
+              ]
+             }
+            ]
+           }
+          ]
+         },
+         {
+          "type": "Group",
+          "AXLabel": null,
+          "AXUniqueId": null,
+          "AXValue": null,
+          "frame": {
+           "height": 329,
+           "width": 402,
+           "y": 546,
+           "x": 0
+          },
+          "enabled": true,
+          "role_description": "group",
+          "subrole": null,
+          "children": [
+           {
+            "type": "Group",
+            "AXLabel": null,
+            "AXUniqueId": null,
+            "AXValue": null,
+            "frame": {
+             "height": 329,
+             "width": 402,
+             "y": 546,
+             "x": 0
+            },
+            "enabled": true,
+            "role_description": "group",
+            "subrole": null,
+            "children": [
+             {
+              "type": "Group",
+              "AXLabel": null,
+              "AXUniqueId": null,
+              "AXValue": null,
+              "frame": {
+               "height": 329,
+               "width": 402,
+               "y": 546,
+               "x": 0
+              },
+              "enabled": true,
+              "role_description": "group",
+              "subrole": null,
+              "children": []
+             }
+            ]
+           }
+          ]
+         },
+         {
+          "type": "Group",
+          "AXLabel": null,
+          "AXUniqueId": null,
+          "AXValue": null,
+          "frame": {
+           "width": 402,
+           "y": 590,
+           "height": 226,
+           "x": 0
+          },
+          "enabled": true,
+          "role_description": "group",
+          "subrole": null,
+          "children": [
+           {
+            "type": "Group",
+            "AXLabel": null,
+            "AXUniqueId": null,
+            "AXValue": null,
+            "frame": {
+             "width": 402,
+             "y": 590,
+             "height": 226,
+             "x": 0
+            },
+            "enabled": true,
+            "role_description": "group",
+            "subrole": null,
+            "children": [
+             {
+              "type": "Group",
+              "AXLabel": null,
+              "AXUniqueId": null,
+              "AXValue": null,
+              "frame": {
+               "width": 402,
+               "height": 226,
+               "y": 590,
+               "x": 0
+              },
+              "enabled": true,
+              "role_description": "group",
+              "subrole": null,
+              "children": [
+               {
+                "type": "Group",
+                "AXLabel": null,
+                "AXUniqueId": "UIKeyboardLayoutStar Preview",
+                "AXValue": null,
+                "frame": {
+                 "y": 590,
+                 "width": 402,
+                 "height": 226,
+                 "x": 0
+                },
+                "enabled": true,
+                "role_description": "group",
+                "subrole": null,
+                "children": [
+                 {
+                  "type": "Button",
+                  "AXLabel": "Padding-Left",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 0,
+                   "height": 0,
+                   "y": 590,
+                   "x": 0
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "q",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 39.333333333333336,
+                   "y": 597,
+                   "height": 54,
+                   "x": 4.666666666666657
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "w",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 39.66666666666666,
+                   "y": 597,
+                   "height": 54,
+                   "x": 44
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "e",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 39.33333333333334,
+                   "y": 597,
+                   "height": 54,
+                   "x": 83.66666666666666
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "r",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 39.66666666666667,
+                   "height": 54,
+                   "y": 597,
+                   "x": 122.99999999999999
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "t",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 39.33333333333334,
+                   "height": 54,
+                   "y": 597,
+                   "x": 162.66666666666666
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "y",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 39.66666666666666,
+                   "y": 597,
+                   "height": 54,
+                   "x": 202
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "u",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 39.333333333333314,
+                   "height": 54,
+                   "y": 597,
+                   "x": 241.66666666666669
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "i",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 39.666666666666686,
+                   "y": 597,
+                   "height": 54,
+                   "x": 281
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "o",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 39.333333333333314,
+                   "height": 54,
+                   "y": 597,
+                   "x": 320.66666666666663
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "p",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 39.666666666666686,
+                   "y": 597,
+                   "height": 54,
+                   "x": 360
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "Padding-Right",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 0,
+                   "height": 0,
+                   "y": 590,
+                   "x": 0
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "Padding-Left",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 0,
+                   "height": 0,
+                   "y": 590,
+                   "x": 0
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "a",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 39.33333333333334,
+                   "y": 651,
+                   "height": 54,
+                   "x": 24.333333333333318
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "s",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 39.66666666666666,
+                   "height": 54,
+                   "y": 651,
+                   "x": 63.66666666666666
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "d",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 39.33333333333334,
+                   "y": 651,
+                   "height": 54,
+                   "x": 103.33333333333331
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "f",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 39.66666666666666,
+                   "height": 54,
+                   "y": 651,
+                   "x": 142.66666666666666
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "g",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 39.33333333333334,
+                   "y": 651,
+                   "height": 54,
+                   "x": 182.33333333333334
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "h",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 39.66666666666666,
+                   "y": 651,
+                   "height": 54,
+                   "x": 221.66666666666666
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "j",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 39.333333333333314,
+                   "y": 651,
+                   "height": 54,
+                   "x": 261.33333333333326
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "k",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 39.666666666666686,
+                   "y": 651,
+                   "height": 54,
+                   "x": 300.66666666666663
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "l",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 39.333333333333314,
+                   "height": 54,
+                   "y": 651,
+                   "x": 340.33333333333326
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "Padding-Right",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 0,
+                   "height": 0,
+                   "y": 590,
+                   "x": 0
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "shift",
+                  "AXUniqueId": "shift",
+                  "AXValue": null,
+                  "frame": {
+                   "width": 51.333333333333336,
+                   "y": 705,
+                   "height": 54,
+                   "x": 4.666666666666657
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "Padding-Left",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 0,
+                   "y": 590,
+                   "height": 0,
+                   "x": 0
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "z",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 39.66666666666666,
+                   "y": 705,
+                   "height": 54,
+                   "x": 63.66666666666666
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "x",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 39.33333333333334,
+                   "height": 54,
+                   "y": 705,
+                   "x": 103.33333333333331
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "c",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 39.66666666666666,
+                   "y": 705,
+                   "height": 54,
+                   "x": 142.66666666666666
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "v",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "width": 39.33333333333334,
+                   "height": 54,
+                   "y": 705,
+                   "x": 182.33333333333334
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "b",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "x": 221.66666666666666,
+                   "width": 39.66666666666666,
+                   "height": 54,
+                   "y": 705
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "n",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "y": 705,
+                   "width": 39.333333333333314,
+                   "height": 54,
+                   "x": 261.33333333333326
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "m",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "x": 300.66666666666663,
+                   "width": 39.666666666666686,
+                   "height": 54,
+                   "y": 705
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "Padding-Right",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "x": 0,
+                   "width": 0,
+                   "height": 0,
+                   "y": 590
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "delete",
+                  "AXUniqueId": "delete",
+                  "AXValue": null,
+                  "frame": {
+                   "y": 705,
+                   "width": 51.666666666666686,
+                   "height": 54,
+                   "x": 348
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "numbers",
+                  "AXUniqueId": "more",
+                  "AXValue": null,
+                  "frame": {
+                   "x": 4.666666666666657,
+                   "width": 49.333333333333336,
+                   "height": 54,
+                   "y": 759
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "Emoji",
+                  "AXUniqueId": "emoji",
+                  "AXValue": null,
+                  "frame": {
+                   "x": 53.999999999999986,
+                   "width": 49.33333333333333,
+                   "height": 54,
+                   "y": 759
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "пробел",
+                  "AXUniqueId": "space",
+                  "AXValue": null,
+                  "frame": {
+                   "x": 103.33333333333331,
+                   "width": 98.66666666666669,
+                   "height": 54,
+                   "y": 759
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "@",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "x": 202,
+                   "width": 49.33333333333334,
+                   "height": 54,
+                   "y": 759
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": ".",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "x": 251.33333333333337,
+                   "width": 49.333333333333314,
+                   "height": 54,
+                   "y": 759
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Button",
+                  "AXLabel": "return",
+                  "AXUniqueId": "Return",
+                  "AXValue": null,
+                  "frame": {
+                   "x": 300.66666666666663,
+                   "width": 99,
+                   "height": 54,
+                   "y": 759
+                  },
+                  "enabled": true,
+                  "role_description": "button",
+                  "subrole": null,
+                  "children": []
+                 }
+                ]
+               }
+              ]
+             }
+            ]
+           }
+          ]
+         },
+         {
+          "type": "GenericElement",
+          "AXLabel": null,
+          "AXUniqueId": null,
+          "AXValue": null,
+          "frame": {
+           "y": 590,
+           "width": 402,
+           "height": 284,
+           "x": 0
+          },
+          "enabled": true,
+          "role_description": "",
+          "subrole": null,
+          "children": [
+           {
+            "type": "Button",
+            "AXLabel": "Следующая клавиатура",
+            "AXUniqueId": null,
+            "AXValue": "Русская",
+            "frame": {
+             "y": 805.6989567998571,
+             "width": 68.0852958475086,
+             "height": 68.73516393505099,
+             "x": 8.47726568115926
+            },
+            "enabled": true,
+            "role_description": "button",
+            "subrole": null,
+            "children": [
+             {
+              "type": "StaticText",
+              "AXLabel": null,
+              "AXUniqueId": null,
+              "AXValue": null,
+              "frame": {
+               "y": 805.6989567998571,
+               "width": 0,
+               "height": 0,
+               "x": 8.47726568115926
+              },
+              "enabled": true,
+              "role_description": "text",
+              "subrole": null,
+              "children": []
+             }
+            ]
+           },
+           {
+            "type": "Button",
+            "AXLabel": "Диктовать",
+            "AXUniqueId": "dictation",
+            "AXValue": null,
+            "frame": {
+             "x": 325.43743847133214,
+             "width": 68.08529584750863,
+             "height": 68.73516393505099,
+             "y": 805.3656234665239
+            },
+            "enabled": true,
+            "role_description": "button",
+            "subrole": null,
+            "children": [
+             {
+              "type": "StaticText",
+              "AXLabel": null,
+              "AXUniqueId": null,
+              "AXValue": null,
+              "frame": {
+               "y": 805.3656234665239,
+               "width": 0,
+               "height": 0,
+               "x": 325.43743847133214
+              },
+              "enabled": true,
+              "role_description": "text",
+              "subrole": null,
+              "children": []
+             }
+            ]
+           },
+           {
+            "type": "Button",
+            "AXLabel": "Диктовать",
+            "AXUniqueId": "dictation",
+            "AXValue": null,
+            "frame": {
+             "y": 805.3656234665239,
+             "width": 68.08529584750863,
+             "height": 68.73516393505099,
+             "x": 325.43743847133214
+            },
+            "enabled": true,
+            "role_description": "button",
+            "subrole": null,
+            "children": [
+             {
+              "type": "StaticText",
+              "AXLabel": null,
+              "AXUniqueId": null,
+              "AXValue": null,
+              "frame": {
+               "x": 325.43743847133214,
+               "width": 0,
+               "height": 0,
+               "y": 805.3656234665239
+              },
+              "enabled": true,
+              "role_description": "text",
+              "subrole": null,
+              "children": []
+             }
+            ]
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ }
+]

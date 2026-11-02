@@ -73,6 +73,13 @@ MAX_STUCK_COUNT = 3
 # tripping, while saving the bulk of a 200-step budget.
 MAX_NO_PROGRESS_STEPS = 25
 
+# A running app never has an empty accessibility tree, so zero elements
+# means the read failed (e.g. AXe «Timed out creating the simulator
+# remote automation session»). Testbed run baseline-1 recorded such a
+# read as a new screen and kept «navigating» back to it 21 times.
+# Retry with these delays (seconds) before giving up.
+EMPTY_CAPTURE_RETRY_DELAYS = (1.0, 2.0)
+
 # Type aliases for the optional engine callbacks.
 PriorProvider = Callable[[ScreenNode], "dict[str, float] | Awaitable[dict[str, float]]"]
 EventCallback = Callable[[dict], "None | Awaitable[None]"]
@@ -215,7 +222,7 @@ class ExplorationEngine:
                         "steps (graph=%d nodes) — aborting exploration early.",
                         step, self._no_progress_steps, cur_node_count,
                     )
-                    await self._safe_emit({
+                    await self._emit({
                         "type": "log",
                         "step_idx": step,
                         "message": (
@@ -834,6 +841,11 @@ class ExplorationEngine:
                 if ok:
                     await asyncio.sleep(0.2)
                     return
+                if element.test_id:
+                    # The controller already retried with read-back; typing
+                    # again unverified would append to whatever it left.
+                    print(f"      ! Could not set text in {element.test_id!r}", flush=True)
+                    return
 
             # Fallback: tap + type via coordinates
             center = element.get_center()
@@ -932,6 +944,14 @@ class ExplorationEngine:
 
             print(f"      [capture] Getting UI elements...", flush=True)
             elements = await self.controller.get_ui_elements()
+            for delay in EMPTY_CAPTURE_RETRY_DELAYS:
+                if elements:
+                    break
+                print(f"      [capture] Empty UI tree, retrying in {delay:.0f}s...", flush=True)
+                await asyncio.sleep(delay)
+                elements = await self.controller.get_ui_elements()
+            if not elements:
+                logger.error("UI tree still empty after %d retries", len(EMPTY_CAPTURE_RETRY_DELAYS))
             t1 = time.monotonic()
             print(f"      [capture] Found {len(elements)} elements ({t1-t0:.1f}s)", flush=True)
 

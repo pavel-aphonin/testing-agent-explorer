@@ -54,6 +54,30 @@ def _is_simulator_down(stderr: str) -> bool:
     return any(m in low for m in _SIMULATOR_DOWN_MARKERS)
 
 
+# On iOS 27, AXe reports the system keyboard as plain Group/Button nodes
+# in separate top-level windows of the Application — there is no
+# ``Keyboard`` type any more, so the analyzer's KEYBOARD_TYPES filter and
+# ``wait_for_keyboard`` silently stopped working. Testbed run baseline-1
+# tapped keys («q», «Passwords», «dictation») as app buttons, and the
+# keyboard showing/hiding forked the login screen into 5 nodes.
+# A top-level window containing one of these ids is the keyboard.
+_KEYBOARD_WINDOW_IDS = frozenset({"SystemInputAssistantView", "inputView"})
+
+# Type given to every element inside a keyboard window. It is part of
+# KEYBOARD_TYPES, so the analyzer and the screen fingerprint skip it.
+_KEYBOARD_ELEMENT_TYPE = "KeyboardKey"
+
+
+def _contains_id(node: dict, ids: frozenset[str]) -> bool:
+    if node.get("AXUniqueId") in ids:
+        return True
+    return any(
+        _contains_id(child, ids)
+        for child in node.get("children", [])
+        if isinstance(child, dict)
+    )
+
+
 # PER-111 v2: a short, alphanumeric slug used inside synthetic
 # element ids when AXUniqueId is missing. We transliterate Cyrillic
 # (Готово → gotovo) so the generated id stays purely ASCII — keeps
@@ -236,6 +260,25 @@ if AXE is None:
     )
 
 
+# PER-891: on Xcode 27, AXe 1.8.0 sends a tap before the simulator's
+# dtuhidd has activated its touch service, and the event is silently
+# dropped (cameroncooke/AXe#71). AXe waits this long before the first
+# event; 600 ms was the smallest value that made taps land 4/4 on
+# iOS 27.2 (300 ms: 0/4). Drop once AXe ships the upstream idb fix.
+_AXE_HID_STABILIZATION_MS = "600"
+
+
+# Verified text entry (see AXeExplorerClient.set_text_in_field).
+_TYPE_ATTEMPTS = 3
+# Extra wait after the keyboard is up: when moving between fields the
+# keyboard is already visible, but focus has not moved yet.
+_FOCUS_SETTLE_S = 0.8
+# USB HID usage ids for ``axe key`` / ``axe key-combo``.
+_HID_LEFT_GUI = "227"
+_HID_KEY_A = "4"
+_HID_KEY_BACKSPACE = "42"
+
+
 async def _run(args: list[str], timeout: float = 15) -> tuple[int, str, str]:
     """Run a subprocess with timeout. Returns (returncode, stdout, stderr).
 
@@ -249,10 +292,15 @@ async def _run(args: list[str], timeout: float = 15) -> tuple[int, str, str]:
             "'axe' on PATH (brew install cameroncooke/axe/axe). "
             "Worker cannot drive iOS Simulator without it."
         )
+    env = None
+    if args[0] == AXE:
+        env = dict(os.environ)
+        env.setdefault("AXE_HID_STABILIZATION_MS", _AXE_HID_STABILIZATION_MS)
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=env,
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -551,11 +599,55 @@ class AXeExplorerClient:
                 ok = await self._cdp.set_text_by_label(label, text)
                 if ok:
                     return True
-        # Fallback: tap + AXe type
-        if test_id:
+        if not test_id:
+            return await self.type_text(text)
+        if not text:
+            # An empty field reports its placeholder as the AX value, so
+            # there is nothing to verify — just clear it.
             await self.tap_by_id(test_id)
+            await self.wait_for_keyboard(5000)
+            await asyncio.sleep(_FOCUS_SETTLE_S)
+            await self._clear_focused_field()
+            return True
+        # Fallback: tap + AXe type, verified. AX trees carry no focus
+        # flag, and a fixed 0.3 s sleep lost the race in testbed run
+        # baseline-1: the password went into the still-focused email
+        # field («test@test.compassword123»). So read the field back and
+        # retry until it holds exactly ``text``.
+        for attempt in range(1, _TYPE_ATTEMPTS + 1):
+            await self.tap_by_id(test_id)
+            await self.wait_for_keyboard(5000)
+            await asyncio.sleep(_FOCUS_SETTLE_S)
+            await self._clear_focused_field()
+            await self.type_text_via_hid(text)
             await asyncio.sleep(0.3)
-        return await self.type_text(text)
+            if await self._field_holds(test_id, text):
+                return True
+            logger.warning(
+                "set_text_in_field: %r does not hold the typed text "
+                "(attempt %d/%d)", test_id, attempt, _TYPE_ATTEMPTS,
+            )
+        return False
+
+    async def _clear_focused_field(self) -> None:
+        """Select all (⌘A) and delete in the focused field."""
+        await _run([
+            AXE, "key-combo", "--modifiers", _HID_LEFT_GUI,
+            "--key", _HID_KEY_A, "--udid", self._udid,
+        ])
+        await _run([AXE, "key", _HID_KEY_BACKSPACE, "--udid", self._udid])
+
+    async def _field_holds(self, test_id: str, text: str) -> bool:
+        """True iff the field's AX value equals ``text``. Secure fields
+        expose one bullet per character, so only the length is checked."""
+        for el in await self.get_ui_elements():
+            if el.get("test_id") != test_id:
+                continue
+            value = el.get("value") or ""
+            if value and set(value) == {"•"}:
+                return len(value) == len(text)
+            return value == text
+        return False
 
     async def _device_logical_size(self, udid: str) -> tuple[int, int] | tuple[None, None]:
         """Return (width_pt, height_pt) for the device, or (None, None) if
@@ -697,13 +789,27 @@ class AXeExplorerClient:
             logger.warning(f"AXe JSON parse error: {e}")
             return []
 
-    def _flatten(self, nodes: list, result: list[dict]) -> None:
+    def _flatten(
+        self,
+        nodes: list,
+        result: list[dict],
+        in_keyboard: bool = False,
+        parent_type: str = "",
+    ) -> None:
         for node in nodes:
             if not isinstance(node, dict):
                 continue
+            # Keyboard windows are direct children of the Application.
+            node_in_keyboard = in_keyboard or (
+                parent_type == "Application"
+                and _contains_id(node, _KEYBOARD_WINDOW_IDS)
+            )
             test_id = node.get("AXUniqueId", "")
             frame = node.get("frame", {}) or {}
-            kind = node.get("type", "") or "element"
+            if node_in_keyboard:
+                kind = _KEYBOARD_ELEMENT_TYPE
+            else:
+                kind = node.get("type", "") or "element"
             label = node.get("AXLabel", "") or ""
             # PER-111 v2: every element needs a stable id so the LLM
             # can refer to it from the constrained enum and the
@@ -739,7 +845,7 @@ class AXeExplorerClient:
                 "visible": True,
             })
             for child in node.get("children", []):
-                self._flatten([child], result)
+                self._flatten([child], result, node_in_keyboard, node.get("type", ""))
 
     # ─────────────────────────────────── PER-111 v2 action dispatchers
     # The 8 reference actions seeded by migration 20260518_per111_v2

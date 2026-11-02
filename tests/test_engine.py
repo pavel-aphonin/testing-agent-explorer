@@ -327,6 +327,70 @@ async def test_engine_aborts_on_dead_end_loop(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_engine_dead_end_abort_emits_log_event(tmp_path, monkeypatch):
+    """The watchdog's abort branch must emit its log event and stop cleanly.
+
+    The test above ends by frontier exhaustion at step 2, so it never
+    reached this branch — which is how a call to the non-existent
+    ``_safe_emit`` crashed testbed run baseline-1 with AttributeError.
+    A threshold of 1 forces the branch on the first non-growing step.
+    """
+    monkeypatch.setattr("explorer.engine.MAX_NO_PROGRESS_STEPS", 1)
+    events: list[dict] = []
+    engine = ExplorationEngine(
+        controller=_DeadEndController(),
+        app_bundle_id="test.app",
+        output_dir=str(tmp_path),
+        mode=ExplorationMode.MC,
+        max_steps=200,
+        event_callback=events.append,
+    )
+
+    await engine.run()
+
+    assert any(
+        e.get("type") == "log" and "Тупик" in e.get("message", "")
+        for e in events
+    )
+
+
+@dataclass
+class _FlakyTreeController(_DeadEndController):
+    """Every other ``describe-ui`` read comes back empty, like the AXe
+    «remote automation session» timeouts seen in testbed baseline-1."""
+
+    reads: int = 0
+
+    async def get_ui_elements(self) -> list[dict]:
+        self.reads += 1
+        if self.reads % 2 == 1:
+            return []
+        return await super().get_ui_elements()
+
+
+@pytest.mark.asyncio
+async def test_engine_retries_empty_ui_tree_instead_of_new_screen(tmp_path, monkeypatch):
+    """An empty AX tree is a failed read, not a screen: the engine retries
+    and the graph keeps only the real screen."""
+    monkeypatch.setattr("explorer.engine.EMPTY_CAPTURE_RETRY_DELAYS", (0.0, 0.0))
+    controller = _FlakyTreeController()
+    engine = ExplorationEngine(
+        controller=controller,
+        app_bundle_id="test.app",
+        output_dir=str(tmp_path),
+        mode=ExplorationMode.MC,
+        max_steps=20,
+    )
+
+    await engine.run()
+
+    assert controller.reads > 2
+    assert len(engine.graph.nodes) == 1
+    (node,) = engine.graph.nodes.values()
+    assert len(node.interactive_elements) == 2
+
+
+@pytest.mark.asyncio
 async def test_engine_dead_end_does_not_fire_on_healthy_app(tmp_path):
     """PER-207 guard: the watchdog must NOT abort a normal exploration
     that keeps discovering screens. The 3-screen app finishes by frontier
