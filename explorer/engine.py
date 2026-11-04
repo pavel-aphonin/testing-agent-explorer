@@ -80,6 +80,21 @@ MAX_NO_PROGRESS_STEPS = 25
 # Retry with these delays (seconds) before giving up.
 EMPTY_CAPTURE_RETRY_DELAYS = (1.0, 2.0)
 
+# Budget for one controller.set_text_in_field call. The AXe client
+# verifies the typed value and retries up to 3 times (tap, wait for the
+# keyboard, clear, type, read back — up to ~12 s each); the old 10 s cap
+# cut the first attempt short and testbed run 2 never got past login.
+SET_TEXT_TIMEOUT_S = 60
+
+# A screen not yet in the graph is re-captured after this delay and
+# accepted once two captures agree (see _capture_settled_screen).
+NEW_SCREEN_RECHECKS = 3
+NEW_SCREEN_RECHECK_DELAY_S = 1.0
+
+# Failed navigations to one frontier screen before its remaining actions
+# are written off (see _note_unreachable).
+MAX_NAV_FAILURES = 2
+
 # Type aliases for the optional engine callbacks.
 PriorProvider = Callable[[ScreenNode], "dict[str, float] | Awaitable[dict[str, float]]"]
 EventCallback = Callable[[dict], "None | Awaitable[None]"]
@@ -144,6 +159,13 @@ class ExplorationEngine:
         # MAX_NO_PROGRESS_STEPS.
         self._last_node_count = 0
         self._no_progress_steps = 0
+        # AX root label of our own app (its display name), taken from the
+        # first in-app capture. A different non-blank root means an action
+        # took us into another app — see _capture_screen.
+        self._app_label: str | None = None
+        self._dismissing_popup = False
+        # Failed navigations per target screen; see MAX_NAV_FAILURES.
+        self._nav_failures: dict[str, int] = {}
 
         # PUCT selector and Go-Explore archive are the brains of the loop.
         # Both are stateful and live for the duration of one engine run.
@@ -260,6 +282,7 @@ class ExplorationEngine:
                         self.current_screen_id,
                         frontier.state_id,
                         self._capture_screen_id,
+                        replay_input=self._replay_form,
                     )
                     if result:
                         self.current_screen_id = result
@@ -273,6 +296,8 @@ class ExplorationEngine:
                             f"[Step {step}] Navigation to "
                             f"{frontier.state_id[:8]} failed; will retry"
                         )
+                    if result != frontier.state_id:
+                        self._note_unreachable(frontier.state_id, step)
                     continue
 
                 # Local frontier exists — pick an action via PUCT, restricted
@@ -566,9 +591,28 @@ class ExplorationEngine:
 
         print(f"    Tapping {element.label!r} at ({x}, {y})...", flush=True)
         try:
-            result = await asyncio.wait_for(
-                self.controller.tap_at(x, y), timeout=10
+            result = None
+            # Switches ignore a plain coordinate tap — not even on the knob
+            # (testbed run 5: the notification toggle never flipped). AXe's
+            # id-targeted tap hits the switch's activation point with a
+            # physical touch, which does flip it.
+            tap_switch = getattr(self.controller, "tap_switch", None) or getattr(
+                self.controller, "tap_by_id", None
             )
+            if element.kind == ElementKind.SWITCH and element.test_id and tap_switch:
+                # tap_switch verifies the flip and retries (up to ~3 × 3 s).
+                result = await asyncio.wait_for(
+                    tap_switch(element.test_id), timeout=30
+                )
+                print(
+                    f"    Switch tapped by id {element.test_id!r}"
+                    + (f"; failed: {result.error}" if result.error else ""),
+                    flush=True,
+                )
+            if result is None or result.error:
+                result = await asyncio.wait_for(
+                    self.controller.tap_at(x, y), timeout=10
+                )
             if result.error:
                 print(f"    ! Tap failed: {result.error}", flush=True)
                 self._record_self_loop(element, ActionType.TAP)
@@ -586,7 +630,7 @@ class ExplorationEngine:
         await asyncio.sleep(SETTLE_DELAY)
 
         print(f"    Capturing screen...")
-        new_node = await self._capture_screen()
+        new_node = await self._capture_settled_screen()
         is_new = self.graph.add_node(new_node)
 
         # Record edge
@@ -603,7 +647,12 @@ class ExplorationEngine:
         ))
 
         if new_node.screen_id == before_screen:
-            self._stuck_count += 1
+            # A switch flipping in place is its normal behaviour, not a
+            # sign of being stuck. Counting it (testbed run 5) tripped
+            # MAX_STUCK_COUNT on Settings and wrote off «Выйти» and
+            # «Удалить аккаунт» untried.
+            if element.kind != ElementKind.SWITCH:
+                self._stuck_count += 1
             print(f"    -> Same screen (self-loop)")
         else:
             self._stuck_count = 0
@@ -654,30 +703,14 @@ class ExplorationEngine:
                         action_type=ActionType.INPUT,
                         target_label=field.label,
                         target_test_id=field.test_id,
+                        target_frame=field.frame,
                         input_category="explored",
                     ),
                 ))
 
-    async def _fill_form_happy_path(
-        self,
-        all_fields: list[ElementSnapshot],
-        trigger_field: ElementSnapshot,
-    ) -> None:
-        """Fill all form fields with valid data, then try variations on trigger field."""
-        before_screen = self.current_screen_id
-
-        # Relaunch app to get clean empty fields
-        print("      Relaunching app for clean form...", flush=True)
-        try:
-            await self.controller.terminate_app(self.app_bundle_id)
-            await asyncio.sleep(1)
-            await self.controller.launch_app(self.app_bundle_id)
-            await asyncio.sleep(2)
-        except Exception as e:
-            print(f"      ! Relaunch failed: {e}", flush=True)
-
-        # First: fill ALL fields with valid values
-        for field in all_fields:
+    async def _fill_and_submit(self, fields: list[ElementSnapshot]) -> None:
+        """Fill every field with its valid value, then tap the submit button."""
+        for field in fields:
             valid_value = self.form_filler.get_valid_value_for(field)
             await self._type_into_field(field, valid_value)
 
@@ -690,12 +723,40 @@ class ExplorationEngine:
 
         # After filling, capture screen to find submit button
         post_fill_node = await self._capture_screen()
-        # Find a likely submit button on the post-fill screen
         submit_button = self._find_submit_button(post_fill_node)
         if submit_button:
             print(f"      Tapping submit button: {submit_button.label!r}", flush=True)
             await self._tap_element_directly(submit_button)
             await asyncio.sleep(2)  # Wait for navigation
+
+    async def _replay_form(self, action: ActionDetail) -> bool:
+        """Navigator hook for ``input`` edges: refill the whole form on the
+        current screen from test data and submit, as exploration did."""
+        node = await self._capture_screen()
+        fields = [
+            el for el in node.interactive_elements
+            if el.kind == ElementKind.TEXT_FIELD
+        ]
+        if not fields:
+            return False
+        print(f"      Replaying form ({len(fields)} fields) on {node.name!r}", flush=True)
+        await self._fill_and_submit(fields)
+        return True
+
+    async def _fill_form_happy_path(
+        self,
+        all_fields: list[ElementSnapshot],
+        trigger_field: ElementSnapshot,
+    ) -> None:
+        """Fill all form fields with valid data, then try variations on trigger field."""
+        before_screen = self.current_screen_id
+
+        # No relaunch «for clean fields» here: it threw away the session,
+        # so any form behind login (testbed run 4: profile edit) became
+        # unreachable and the fill landed on the login screen. The
+        # controller clears each field before typing instead.
+
+        await self._fill_and_submit(all_fields)
 
         # Now record the actual result state
         new_node = await self._capture_screen()
@@ -836,7 +897,7 @@ class ExplorationEngine:
                         label=element.label,
                         text=text,
                     ),
-                    timeout=10,
+                    timeout=SET_TEXT_TIMEOUT_S,
                 )
                 if ok:
                     await asyncio.sleep(0.2)
@@ -869,7 +930,7 @@ class ExplorationEngine:
     # immediately to clear the dialog and continue with the real app.
     _DISMISS_LABELS = frozenset({
         # English
-        "Not Now", "Don't Allow", "Cancel", "Dismiss", "Close",
+        "Not Now", "Don't Allow", "Don’t Allow", "Cancel", "Dismiss", "Close",
         "OK", "Later", "Skip", "No Thanks", "Deny",
         # Russian
         "Не сейчас", "Не разрешать", "Отмена", "Закрыть",
@@ -894,6 +955,29 @@ class ExplorationEngine:
         except Exception:
             return
 
+        # System alerts live in SpringBoard (blank AX root label). Inside
+        # our own app «Отмена»/«Cancel» belong to the app's sheets and
+        # alerts — testbed run 3 closed the profile-edit sheet 25 times in
+        # a row right after navigating to it.
+        root_label = next(
+            ((e.get("label") or "").strip() for e in elements if e.get("type") == "Application"),
+            "",
+        )
+        if self._app_label and root_label == self._app_label:
+            return
+        if self._app_label and root_label:
+            # Another app is in front. An app switch can land after the
+            # post-action capture (testbed run 4: «Открыть настройки iOS»
+            # looked like a self-loop, then «Выйти» was tapped inside iOS
+            # Settings), so check before acting, not only after.
+            print(f"    -> Another app in front ({root_label!r}); returning", flush=True)
+            await self.controller.launch_app(self.app_bundle_id)
+            await asyncio.sleep(SETTLE_DELAY)
+            new_node = await self._capture_screen()
+            self.current_screen_id = new_node.screen_id
+            self.graph.add_node(new_node)
+            return
+
         # Collect all labels from the raw element dicts
         all_labels: list[str] = []
         for e in elements:
@@ -916,7 +1000,7 @@ class ExplorationEngine:
         target = dismiss_candidates[0]
         for c in dismiss_candidates:
             lbl = (c.get("label") or c.get("title") or "").strip()
-            if lbl in ("Not Now", "Не сейчас", "Cancel", "Отмена", "Don't Allow", "Не разрешать"):
+            if lbl in ("Not Now", "Не сейчас", "Cancel", "Отмена", "Don't Allow", "Don’t Allow", "Не разрешать"):
                 target = c
                 break
 
@@ -929,15 +1013,79 @@ class ExplorationEngine:
             try:
                 await asyncio.wait_for(self.controller.tap_at(x, y), timeout=5)
                 await asyncio.sleep(1.0)
-                new_node = await self._capture_screen()
+                # This capture must not re-enter the handler if the alert
+                # is still up; the next step will try again.
+                outer, self._dismissing_popup = self._dismissing_popup, True
+                try:
+                    new_node = await self._capture_screen()
+                finally:
+                    self._dismissing_popup = outer
                 self.current_screen_id = new_node.screen_id
                 self.graph.add_node(new_node)
             except Exception as exc:
                 print(f"    [auto-dismiss] Failed: {exc}", flush=True)
             return
 
-    async def _capture_screen(self) -> ScreenNode:
-        """Capture the current screen state from the device."""
+    async def _capture_settled_screen(self) -> ScreenNode:
+        """Capture after an action, re-checking screens we have not seen.
+
+        A pushed screen may still be loading at SETTLE_DELAY: testbed run 7
+        captured «Счета» before its table rendered (only «Назад»), recorded
+        that as the screen, and never saw the account rows. A known screen
+        is trusted as is; a new one must look the same twice in a row.
+        """
+        node = await self._capture_screen()
+        for _ in range(NEW_SCREEN_RECHECKS):
+            if node.screen_id in self.graph.nodes:
+                return node
+            await asyncio.sleep(NEW_SCREEN_RECHECK_DELAY_S)
+            again = await self._capture_screen()
+            if again.screen_id == node.screen_id:
+                return again
+            print(f"      [capture] Screen still changing, re-capturing", flush=True)
+            node = again
+        return node
+
+    async def _capture_screen(self, return_to_app: bool = True) -> ScreenNode:
+        """Capture the current screen state from the device.
+
+        If an action took us into another app (testbed run 2: «Открыть
+        настройки iOS» → 20 steps exploring iOS Settings), bring our app
+        back to the foreground and capture that instead. ``launch_app``
+        on a running app only foregrounds it, so the session survives.
+        """
+        node = await self._capture_screen_once()
+        label = (node.app_label or "").strip()
+        if self._app_label is None:
+            self._app_label = label or None
+            return node
+        if not return_to_app or label == self._app_label:
+            return node
+        if not label:
+            # A blank root is SpringBoard: a system alert is on top. It is
+            # not a screen of the app — testbed run 9 recorded the
+            # notification prompt as one, and once answered it never came
+            # back, so the agent spent 50 min trying to navigate to it.
+            # Dismiss it, then capture the app underneath.
+            if self._dismissing_popup:
+                return node
+            print("    -> System alert on screen; dismissing before capture", flush=True)
+            self._dismissing_popup = True
+            try:
+                await self._dismiss_system_popup()
+            finally:
+                self._dismissing_popup = False
+            return await self._capture_screen(return_to_app=False)
+        print(
+            f"    -> Left the app (now in {label!r}); returning to {self._app_label!r}",
+            flush=True,
+        )
+        logger.warning("Action left the app for %r; returning", label)
+        await self.controller.launch_app(self.app_bundle_id)
+        await asyncio.sleep(SETTLE_DELAY)
+        return await self._capture_screen(return_to_app=False)
+
+    async def _capture_screen_once(self) -> ScreenNode:
         import time
         try:
             t0 = time.monotonic()
@@ -993,10 +1141,15 @@ class ExplorationEngine:
             return (self.current_screen_id or "unknown", [])
 
     def _record_self_loop(
-        self, element: ElementSnapshot, action_type: ActionType
+        self,
+        element: ElementSnapshot,
+        action_type: ActionType,
+        screen_id: str | None = None,
     ) -> None:
-        """Record a self-loop edge (action that didn't change the screen)."""
-        if not self.current_screen_id:
+        """Record a self-loop edge (action that didn't change the screen)
+        on ``screen_id``, the current screen by default."""
+        screen_id = screen_id or self.current_screen_id
+        if not screen_id:
             return
         action = ActionDetail(
             action_type=action_type,
@@ -1005,18 +1158,36 @@ class ExplorationEngine:
             target_frame=element.frame,
         )
         self.graph.add_edge(GraphEdge(
-            source_screen_id=self.current_screen_id,
-            target_screen_id=self.current_screen_id,
+            source_screen_id=screen_id,
+            target_screen_id=screen_id,
             action=action,
             success=False,
             notes="Action failed or did not change screen",
         ))
 
+    def _note_unreachable(self, screen_id: str, step: int) -> None:
+        """Give up on a frontier screen after MAX_NAV_FAILURES failed trips.
+
+        Some screens cannot be reached again: a one-shot state (a permission
+        prompt already answered) or a path that no longer replays. Each
+        failed trip costs minutes (back × 5, relaunch, re-login), and the
+        dead-end watchdog counts steps, not time.
+        """
+        failures = self._nav_failures.get(screen_id, 0) + 1
+        self._nav_failures[screen_id] = failures
+        if failures < MAX_NAV_FAILURES or screen_id not in self.graph.nodes:
+            return
+        logger.warning(
+            "[Step %d] %s unreachable after %d tries; writing off its actions",
+            step, screen_id[:8], failures,
+        )
+        self._mark_screen_fully_explored(screen_id)
+
     def _mark_screen_fully_explored(self, screen_id: str) -> None:
         """Mark all remaining elements on a screen as explored via self-loops."""
         unexplored = self.graph.get_unexplored_actions(screen_id)
         for el in unexplored:
-            self._record_self_loop(el, ActionType.TAP)
+            self._record_self_loop(el, ActionType.TAP, screen_id)
 
     def _screen_name(self) -> str:
         """Get the name of the current screen."""

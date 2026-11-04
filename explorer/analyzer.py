@@ -12,6 +12,9 @@ IOS_TYPE_MAP: dict[str, ElementKind] = {
     "TextArea": ElementKind.TEXT_FIELD,
     "Switch": ElementKind.SWITCH,
     "Toggle": ElementKind.SWITCH,
+    # iOS 27: SwiftUI Toggle / UISwitch come as CheckBox (subrole AXSwitch).
+    # Unmapped, the testbed's notification toggle was never tapped.
+    "CheckBox": ElementKind.SWITCH,
     "StaticText": ElementKind.LABEL,
     "Heading": ElementKind.LABEL,
     "Image": ElementKind.IMAGE,
@@ -90,9 +93,11 @@ def analyze_screen(
     ]
 
     all_snapshots = [classify_element(el) for el in filtered]
+    # Controls covered by a modal stay in the screen (and its fingerprint)
+    # but are not actions — see axe_client._obscured_children.
     interactive = [
-        s for s in all_snapshots
-        if s.kind in INTERACTIVE_KINDS and s.enabled
+        s for s, el in zip(all_snapshots, filtered)
+        if s.kind in INTERACTIVE_KINDS and s.enabled and not el.get("obscured")
     ]
 
     screen_id = compute_screen_id(elements)

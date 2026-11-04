@@ -78,6 +78,67 @@ def _contains_id(node: dict, ids: frozenset[str]) -> bool:
     )
 
 
+# On iOS 27, AXe reports UITableView / SwiftUI List rows as plain
+# ``Group`` children of a ``ScrollArea`` — no ``Cell`` type — and the
+# analyzer skips every Group, so testbed run 2 saw no account rows to
+# tap. A ScrollArea child Group holding text and no controls of its own
+# is a tappable row. Rows with their own buttons (NavigationLink rows,
+# rows with switches) stay as they are: those controls are the actions.
+_ROW_CONTROL_TYPES = frozenset({"Button", "TextField", "Switch", "Link", "Slider"})
+# Disclosure indicator UIKit puts inside a row; decoration, not a control.
+_ROW_ACCESSORY_LABELS = frozenset({"chevron"})
+
+
+# Modal presentation on iOS 27: the app window holds the presenting
+# screen and, as a LATER sibling container, the modal on top — a SwiftUI
+# sheet, or a ``Sheet`` element for alerts. The AX tree still lists the
+# controls underneath; testbed run 4 tapped those three times under the
+# «Удалить аккаунт?» alert, got no change, and gave up before trying
+# «Отмена»/«Удалить». Only the topmost container's controls are actions.
+_MODAL_CONTROL_TYPES = frozenset({
+    "Button", "TextField", "SecureTextField", "Switch", "CheckBox", "Link",
+})
+
+
+def _obscured_children(window: dict) -> set[int]:
+    """Indices of the window's child containers covered by a later one."""
+    children = window.get("children", [])
+    with_controls = [
+        i for i, child in enumerate(children)
+        if isinstance(child, dict) and any(
+            d.get("type") in _MODAL_CONTROL_TYPES for d in _descendants(child)
+        )
+    ]
+    return set(with_controls[:-1])
+
+
+def _descendants(node: dict):
+    for child in node.get("children", []):
+        if isinstance(child, dict):
+            yield child
+            yield from _descendants(child)
+
+
+def _is_accessory(node: dict) -> bool:
+    return node.get("type") == "Button" and node.get("AXLabel") in _ROW_ACCESSORY_LABELS
+
+
+def _row_label(node: dict) -> str | None:
+    """Label for a list row: None if ``node`` is not a tappable row,
+    else its own label or the first text inside it."""
+    if node.get("type") != "Group":
+        return None
+    texts = []
+    for d in _descendants(node):
+        if d.get("type") in _ROW_CONTROL_TYPES and not _is_accessory(d):
+            return None
+        if d.get("type") == "StaticText" and d.get("AXLabel"):
+            texts.append(d["AXLabel"])
+    if not texts:
+        return None
+    return node.get("AXLabel") or texts[0]
+
+
 # PER-111 v2: a short, alphanumeric slug used inside synthetic
 # element ids when AXUniqueId is missing. We transliterate Cyrillic
 # (Готово → gotovo) so the generated id stays purely ASCII — keeps
@@ -273,10 +334,56 @@ _TYPE_ATTEMPTS = 3
 # Extra wait after the keyboard is up: when moving between fields the
 # keyboard is already visible, but focus has not moved yet.
 _FOCUS_SETTLE_S = 0.8
+# Verified switch taps (see AXeExplorerClient.tap_switch). A permission
+# prompt can take ~1 s to replace the app in the AX tree.
+_SWITCH_ATTEMPTS = 3
+_SWITCH_SETTLE_S = 1.2
 # USB HID usage ids for ``axe key`` / ``axe key-combo``.
 _HID_LEFT_GUI = "227"
 _HID_KEY_A = "4"
 _HID_KEY_BACKSPACE = "42"
+
+
+# Simulator degradation over long runs (testbed runs 1–3): every axe
+# input command opens a fresh HID connection to the simulator's dtuhidd.
+# dtuhidd cancels each connection's virtual services but keeps notifying
+# later connections about them — the «No matching virtual service» noise
+# per connection grew linearly (27 → 717 lines in 11 min), and after
+# ~200 connections taps were dropped and describe-ui timed out until the
+# simulator was rebooted. Restarting only dtuhidd resets this (732 → 0
+# lines per tap) and keeps the app running on the same screen, so do it
+# every _DTUHIDD_RESTART_EVERY input commands.
+_HID_SUBCOMMANDS = frozenset({
+    "tap", "type", "swipe", "drag", "button", "key", "key-sequence",
+    "key-combo", "touch", "gesture", "slider", "batch",
+})
+_DTUHIDD_RESTART_EVERY = 80
+_DTUHIDD_LABEL = "system/com.apple.coredevice.dtuhidd"
+_hid_connections: dict[str, int] = {}
+
+
+async def _note_hid_connection(args: list[str]) -> None:
+    try:
+        udid = args[args.index("--udid") + 1]
+    except (ValueError, IndexError):
+        return
+    count = _hid_connections.get(udid, 0) + 1
+    _hid_connections[udid] = count
+    if count % _DTUHIDD_RESTART_EVERY:
+        return
+    logger.info("Restarting dtuhidd on %s after %d input commands", udid, count)
+    proc = await asyncio.create_subprocess_exec(
+        "xcrun", "simctl", "spawn", udid, "launchctl", "kickstart", "-k", _DTUHIDD_LABEL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=15)
+    except asyncio.TimeoutError:
+        proc.kill()
+        logger.warning("dtuhidd restart timed out on %s", udid)
+        return
+    await asyncio.sleep(2.0)
 
 
 async def _run(args: list[str], timeout: float = 15) -> tuple[int, str, str]:
@@ -296,6 +403,8 @@ async def _run(args: list[str], timeout: float = 15) -> tuple[int, str, str]:
     if args[0] == AXE:
         env = dict(os.environ)
         env.setdefault("AXE_HID_STABILIZATION_MS", _AXE_HID_STABILIZATION_MS)
+        if len(args) > 1 and args[1] in _HID_SUBCOMMANDS:
+            await _note_hid_connection(args)
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
@@ -419,6 +528,42 @@ class AXeExplorerClient:
             return TapResult(error=err.strip()[:200])
         self._last_focused_test_id = test_id
         return TapResult()
+
+    async def tap_switch(self, test_id: str) -> TapResult:
+        """Flip a switch and verify it flipped.
+
+        Switches ignore coordinate taps; ``axe tap --id`` reaches them with
+        a physical touch, but that touch is sometimes silently dropped
+        (testbed run 7: «success», toggle unchanged, no permission
+        prompt). Read the value back; the switch counts as flipped when
+        its value changed or it left the tree (a system prompt took
+        over). Retry with a post-touch delay, which landed 100% in the
+        tap-style measurements.
+        """
+        before = await self._switch_value(test_id)
+        for attempt in range(1, _SWITCH_ATTEMPTS + 1):
+            args = [AXE, "tap", "--id", test_id, "--udid", self._udid]
+            if attempt > 1:
+                args[2:2] = ["--tap-style", "physical", "--post-delay", "0.5"]
+            code, _, err = await _run(args)
+            if code != 0:
+                return TapResult(error=err.strip()[:200])
+            await asyncio.sleep(_SWITCH_SETTLE_S)
+            after = await self._switch_value(test_id)
+            if after != before:
+                return TapResult()
+            logger.warning(
+                "tap_switch: %r did not flip (attempt %d/%d)",
+                test_id, attempt, _SWITCH_ATTEMPTS,
+            )
+        return TapResult(error=f"switch {test_id!r} did not flip")
+
+    async def _switch_value(self, test_id: str) -> str | None:
+        """Current value of the switch, or None when it is not in the tree."""
+        for el in await self.get_ui_elements():
+            if el.get("test_id") == test_id:
+                return el.get("value")
+        return None
 
     async def tap_by_label(self, label: str, element_type: str | None = None) -> TapResult:
         """Tap element by accessibility label."""
@@ -795,22 +940,44 @@ class AXeExplorerClient:
         result: list[dict],
         in_keyboard: bool = False,
         parent_type: str = "",
+        in_row: bool = False,
+        obscured: bool = False,
+        in_alert: bool = False,
     ) -> None:
         for node in nodes:
             if not isinstance(node, dict):
+                continue
+            if in_row and _is_accessory(node):
+                continue
+            # iOS 27 nests an unlabeled CheckBox inside each toggle's
+            # CheckBox; it is the same control, tapped twice otherwise.
+            if parent_type == "CheckBox" and node.get("type") == "CheckBox":
                 continue
             # Keyboard windows are direct children of the Application.
             node_in_keyboard = in_keyboard or (
                 parent_type == "Application"
                 and _contains_id(node, _KEYBOARD_WINDOW_IDS)
             )
+            row_label = None
+            # An alert (``Sheet``) lays its title and message out in a
+            # ScrollArea too; that text block is not a list row.
+            if not node_in_keyboard and not in_alert and parent_type == "ScrollArea":
+                row_label = _row_label(node)
             test_id = node.get("AXUniqueId", "")
             frame = node.get("frame", {}) or {}
+            label = node.get("AXLabel", "") or ""
             if node_in_keyboard:
                 kind = _KEYBOARD_ELEMENT_TYPE
+            elif row_label is not None:
+                kind = "Cell"
+                label = row_label
             else:
                 kind = node.get("type", "") or "element"
-            label = node.get("AXLabel", "") or ""
+            value = node.get("AXValue", "")
+            if value is not None and not isinstance(value, str):
+                # Sliders report floats (iOS Settings → Fonts: 0.555…);
+                # ElementSnapshot.value is a string.
+                value = str(value)
             # PER-111 v2: every element needs a stable id so the LLM
             # can refer to it from the constrained enum and the
             # worker can resolve it back to a frame. Priority is:
@@ -838,14 +1005,24 @@ class AXeExplorerClient:
                 "type": kind,
                 "kind": kind,
                 "label": label,
-                "value": node.get("AXValue", ""),
+                "value": value,
                 "test_id": test_id,
                 "frame": frame,
                 "enabled": node.get("enabled", True),
                 "visible": True,
+                "obscured": obscured,
             })
-            for child in node.get("children", []):
-                self._flatten([child], result, node_in_keyboard, node.get("type", ""))
+            # App windows are the Application's non-keyboard children.
+            covered = set()
+            if parent_type == "Application" and not node_in_keyboard:
+                covered = _obscured_children(node)
+            for i, child in enumerate(node.get("children", [])):
+                self._flatten(
+                    [child], result, node_in_keyboard, node.get("type", ""),
+                    in_row or row_label is not None,
+                    obscured or i in covered,
+                    in_alert or node.get("type") == "Sheet",
+                )
 
     # ─────────────────────────────────── PER-111 v2 action dispatchers
     # The 8 reference actions seeded by migration 20260518_per111_v2

@@ -68,6 +68,12 @@ class ActionType(StrEnum):
     LAUNCH = "launch"
 
 
+def _frame_key(frame: dict | None) -> str:
+    if not frame:
+        return ""
+    return f"{int(frame.get('x', 0))},{int(frame.get('y', 0))}"
+
+
 class ActionDetail(BaseModel):
     """Full description of an action that causes a transition."""
 
@@ -141,16 +147,26 @@ class AppGraph(BaseModel):
         if not node:
             return []
 
-        explored_sigs = self.get_explored_action_signatures(screen_id)
+        # An element is explored once ANY action on it left this screen.
+        # Matching full signatures («tap|…» against «input|…|explored»)
+        # never matched for text fields, so a filled form stayed
+        # «unexplored» forever — testbed run 2 refilled the login form
+        # 20 steps in a row. Marker edges recorded without a frame match
+        # on label + test id.
+        explored: set[tuple[str, str, str]] = set()
+        for e in self.edges:
+            if e.source_screen_id == screen_id:
+                a = e.action
+                explored.add((a.target_label or "", a.target_test_id or "", _frame_key(a.target_frame)))
         unexplored = []
         for el in node.interactive_elements:
             # Include frame position to disambiguate elements without labels
-            frame_key = ""
-            if el.frame:
-                frame_key = f"{int(el.frame.get('x',0))},{int(el.frame.get('y',0))}"
-            action_sig = f"tap|{el.label or ''}|{el.test_id or ''}|{frame_key}"
-            if action_sig not in explored_sigs:
-                unexplored.append(el)
+            key = (el.label or "", el.test_id or "", _frame_key(el.frame))
+            if key in explored:
+                continue
+            if el.test_id and (key[0], key[1], "") in explored:
+                continue
+            unexplored.append(el)
         return unexplored
 
     def has_unexplored_screens(self) -> bool:

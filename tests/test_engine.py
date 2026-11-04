@@ -390,6 +390,313 @@ async def test_engine_retries_empty_ui_tree_instead_of_new_screen(tmp_path, monk
     assert len(node.interactive_elements) == 2
 
 
+def _app(label: str, *children: dict) -> list[dict]:
+    return [{"type": "Application", "label": label, "value": None,
+             "identifier": "", "enabled": True, "frame": {}, "children": []},
+            *children]
+
+
+def _button(label: str, y: int) -> dict:
+    return {"type": "Button", "label": label, "value": None,
+            "identifier": label, "enabled": True,
+            "frame": {"x": 100, "y": y, "width": 100, "height": 40},
+            "children": []}
+
+
+@dataclass
+class _LeavesAppController:
+    """One button opens another app (like «Открыть настройки iOS»)."""
+
+    foreground: str = "app"
+    launches: int = 0
+
+    async def get_ui_elements(self) -> list[dict]:
+        if self.foreground == "settings":
+            return _app("Settings", _button("General", 200), _button("About", 300))
+        return _app("Testbed", _button("Открыть настройки iOS", 200), _button("Обновить", 300))
+
+    async def take_screenshot(self) -> str:
+        return "<fake-png>"
+
+    async def tap_at(self, x: int, y: int) -> _Result:
+        if self.foreground == "app" and y == 220:
+            self.foreground = "settings"
+        return _Result()
+
+    async def go_back(self) -> _Result:
+        return _Result()
+
+    async def terminate_app(self, bundle_id: str) -> None:
+        pass
+
+    async def launch_app(self, bundle_id: str) -> None:
+        self.launches += 1
+        self.foreground = "app"
+
+
+@pytest.mark.asyncio
+async def test_engine_returns_to_app_instead_of_exploring_another(tmp_path, monkeypatch):
+    monkeypatch.setattr("explorer.engine.SETTLE_DELAY", 0)
+    controller = _LeavesAppController()
+    engine = ExplorationEngine(
+        controller=controller,
+        app_bundle_id="com.markov.testbed",
+        output_dir=str(tmp_path),
+        mode=ExplorationMode.MC,
+        max_steps=20,
+    )
+
+    await engine.run()
+
+    assert controller.launches >= 1
+    assert {n.app_label for n in engine.graph.nodes.values()} == {"Testbed"}
+
+
+@dataclass
+class _PopupController:
+    """Fixed screen; records every tap's y coordinate."""
+
+    tree: list[dict] = field(default_factory=list)
+    taps: list[int] = field(default_factory=list)
+
+    async def get_ui_elements(self) -> list[dict]:
+        return self.tree
+
+    async def take_screenshot(self) -> str:
+        return "<fake-png>"
+
+    async def tap_at(self, x: int, y: int) -> _Result:
+        self.taps.append(y)
+        return _Result()
+
+
+def _popup_engine(tmp_path, controller) -> ExplorationEngine:
+    engine = ExplorationEngine(
+        controller=controller,
+        app_bundle_id="com.markov.testbed",
+        output_dir=str(tmp_path),
+        mode=ExplorationMode.MC,
+    )
+    engine._app_label = "Testbed"
+    return engine
+
+
+@pytest.mark.asyncio
+async def test_auto_dismiss_leaves_the_apps_own_cancel_alone(tmp_path):
+    # Testbed run 3: the profile-edit sheet's «Отмена» was auto-tapped as
+    # if it were a system popup, 25 times in a row.
+    controller = _PopupController(tree=_app(
+        "Testbed", _button("Отмена", 100), _button("Сохранить", 100),
+    ))
+
+    await _popup_engine(tmp_path, controller)._dismiss_system_popup()
+
+    assert controller.taps == []
+
+
+@pytest.mark.asyncio
+async def test_auto_dismiss_closes_springboard_alert(tmp_path, monkeypatch):
+    monkeypatch.setattr("explorer.engine.asyncio.sleep", _no_sleep)
+    # iOS 27 notification prompt: SpringBoard root (blank label), typographic apostrophe.
+    controller = _PopupController(tree=_app(
+        " ", _button("Don’t Allow", 500), _button("Allow", 560),
+    ))
+
+    await _popup_engine(tmp_path, controller)._dismiss_system_popup()
+
+    assert controller.taps == [520]
+
+
+async def _no_sleep(_seconds):
+    return None
+
+
+@dataclass
+class _ForegroundController(_PopupController):
+    launches: int = 0
+
+    async def launch_app(self, bundle_id: str) -> None:
+        self.launches += 1
+        self.tree = _app("Testbed", _button("Выйти", 400))
+
+
+@pytest.mark.asyncio
+async def test_returns_to_app_before_acting_when_another_app_is_in_front(tmp_path, monkeypatch):
+    # Testbed run 4: the switch to iOS Settings landed after the capture,
+    # and the next action («Выйти») was tapped inside iOS Settings.
+    monkeypatch.setattr("explorer.engine.SETTLE_DELAY", 0)
+    controller = _ForegroundController(tree=_app("Settings", _button("General", 200)))
+    engine = _popup_engine(tmp_path, controller)
+
+    await engine._dismiss_system_popup()
+
+    assert controller.launches == 1
+    assert controller.taps == []
+    assert engine.graph.nodes[engine.current_screen_id].app_label == "Testbed"
+
+
+@dataclass
+class _SwitchController(_PopupController):
+    taps_by_id: list[str] = field(default_factory=list)
+
+    async def tap_by_id(self, test_id: str) -> _Result:
+        self.taps_by_id.append(test_id)
+        return _Result()
+
+
+@pytest.mark.asyncio
+async def test_switch_is_tapped_by_id_and_does_not_count_as_stuck(tmp_path, monkeypatch):
+    # Testbed run 5: coordinate taps never flipped the toggle, and its
+    # self-loops tripped MAX_STUCK_COUNT before «Выйти» was tried.
+    monkeypatch.setattr("explorer.engine.asyncio.sleep", _no_sleep)
+    toggle = {"type": "CheckBox", "label": "Уведомления", "value": "0",
+              "test_id": "settings.notifications", "enabled": True,
+              "frame": {"x": 20, "y": 242, "width": 362, "height": 52}, "children": []}
+    controller = _SwitchController(tree=_app("Testbed", toggle, _button("Выйти", 400)))
+    engine = _popup_engine(tmp_path, controller)
+    node = await engine._capture_screen()
+    engine.graph.add_node(node)
+    engine.current_screen_id = node.screen_id
+    switch, logout = sorted(node.interactive_elements, key=lambda e: e.frame["y"])
+
+    await engine._explore_tap(switch)
+    assert controller.taps_by_id == ["settings.notifications"]
+    assert controller.taps == []
+    assert engine._stuck_count == 0
+
+    await engine._explore_tap(logout)  # a button that changes nothing still counts
+    assert engine._stuck_count == 1
+
+
+@dataclass
+class _SlowPushController(_PopupController):
+    """«Счета» renders its table only after the first post-tap capture."""
+
+    reads_after_tap: int = -1
+
+    async def get_ui_elements(self) -> list[dict]:
+        if self.reads_after_tap < 0:
+            return _app("Testbed", _button("Счета", 200))
+        self.reads_after_tap += 1
+        if self.reads_after_tap == 1:
+            return _app("Testbed", _button("Назад", 60))
+        return _app("Testbed", _button("Назад", 60), _button("Текущий счёт", 300))
+
+    async def tap_at(self, x: int, y: int) -> _Result:
+        self.reads_after_tap = 0
+        return _Result()
+
+
+@pytest.mark.asyncio
+async def test_new_screen_is_recaptured_until_it_settles(tmp_path, monkeypatch):
+    # Testbed run 7 recorded «Счета» before its table rendered.
+    monkeypatch.setattr("explorer.engine.asyncio.sleep", _no_sleep)
+    controller = _SlowPushController()
+    engine = _popup_engine(tmp_path, controller)
+    home = await engine._capture_screen()
+    engine.graph.add_node(home)
+    engine.current_screen_id = home.screen_id
+
+    await engine._explore_tap(home.interactive_elements[0])
+
+    accounts = engine.graph.nodes[engine.current_screen_id]
+    assert {el.label for el in accounts.interactive_elements} == {"Назад", "Текущий счёт"}
+    assert len(engine.graph.nodes) == 2  # the half-rendered capture is not a node
+
+
+@dataclass
+class _PromptController(_PopupController):
+    """A button raises a SpringBoard permission prompt; «Don’t Allow» closes it."""
+
+    def __post_init__(self):
+        self.app_tree = _app("Testbed", _button("Включить уведомления", 200))
+        self.prompt_tree = _app(" ", _button("Don’t Allow", 500), _button("Allow", 560))
+        self.tree = self.app_tree
+
+    async def tap_at(self, x: int, y: int) -> _Result:
+        self.taps.append(y)
+        if self.tree is self.app_tree and y == 220:
+            self.tree = self.prompt_tree
+        elif self.tree is self.prompt_tree and y == 520:
+            self.tree = self.app_tree
+        return _Result()
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_after_action_is_not_a_screen(tmp_path, monkeypatch):
+    # Testbed run 9 recorded the notification prompt as a screen, then spent
+    # 50 min navigating back to it after it had been answered.
+    monkeypatch.setattr("explorer.engine.asyncio.sleep", _no_sleep)
+    controller = _PromptController()
+    engine = _popup_engine(tmp_path, controller)
+    node = await engine._capture_screen()
+    engine.graph.add_node(node)
+    engine.current_screen_id = node.screen_id
+
+    await engine._explore_tap(node.interactive_elements[0])
+
+    assert controller.taps == [220, 520]  # the action, then «Don’t Allow»
+    assert {n.app_label for n in engine.graph.nodes.values()} == {"Testbed"}
+
+
+def test_unreachable_frontier_is_written_off(tmp_path):
+    engine = _popup_engine(tmp_path, _PopupController())
+    target = ScreenNode(screen_id="prompt", interactive_elements=[
+        ElementSnapshot(kind=ElementKind.BUTTON, element_type="Button", label="Allow",
+                        frame={"x": 100, "y": 560, "width": 100, "height": 40}),
+    ])
+    engine.graph.add_node(target)
+
+    engine._note_unreachable("prompt", step=1)
+    assert engine.graph.get_unexplored_actions("prompt")
+
+    engine._note_unreachable("prompt", step=2)
+    assert engine.graph.get_unexplored_actions("prompt") == []
+
+
+@dataclass
+class _FormController(_PopupController):
+    terminations: int = 0
+    typed: dict = field(default_factory=dict)
+
+    async def terminate_app(self, bundle_id: str) -> None:
+        self.terminations += 1
+
+    async def launch_app(self, bundle_id: str) -> None:
+        pass
+
+    async def set_text_in_field(self, test_id, label, text) -> bool:
+        self.typed[test_id] = text
+        return True
+
+    async def press_enter(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_form_fill_does_not_restart_the_app(tmp_path, monkeypatch):
+    # Testbed run 4: a «clean form» relaunch logged the agent out in the
+    # middle of the profile-edit sheet.
+    monkeypatch.setattr("explorer.engine.asyncio.sleep", _no_sleep)
+    fields = [
+        {"type": "TextField", "label": "", "value": "", "identifier": f"profile_edit.{n}",
+         "test_id": f"profile_edit.{n}", "enabled": True,
+         "frame": {"x": 24, "y": y, "width": 354, "height": 34}, "children": []}
+        for n, y in (("name", 273), ("email", 325))
+    ]
+    controller = _FormController(tree=_app("Testbed", *fields, _button("Сохранить", 82)))
+    engine = _popup_engine(tmp_path, controller)
+    node = await engine._capture_screen()
+    engine.graph.add_node(node)
+    engine.current_screen_id = node.screen_id
+    text_fields = [el for el in node.interactive_elements if el.element_type == "TextField"]
+
+    await engine._fill_form_happy_path(text_fields, text_fields[0])
+
+    assert controller.terminations == 0
+    assert set(controller.typed) == {"profile_edit.name", "profile_edit.email"}
+
+
 @pytest.mark.asyncio
 async def test_engine_dead_end_does_not_fire_on_healthy_app(tmp_path):
     """PER-207 guard: the watchdog must NOT abort a normal exploration

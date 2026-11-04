@@ -1,0 +1,845 @@
+[
+ {
+  "type": "Application",
+  "AXLabel": "Testbed",
+  "AXUniqueId": null,
+  "AXValue": null,
+  "frame": {
+   "y": 0,
+   "x": 0,
+   "height": 874,
+   "width": 402
+  },
+  "enabled": true,
+  "role_description": "application",
+  "subrole": null,
+  "children": [
+   {
+    "type": "Group",
+    "AXLabel": null,
+    "AXUniqueId": null,
+    "AXValue": null,
+    "frame": {
+     "y": 0,
+     "x": 0,
+     "height": 874,
+     "width": 402
+    },
+    "enabled": true,
+    "role_description": "group",
+    "subrole": null,
+    "children": [
+     {
+      "type": "Group",
+      "AXLabel": null,
+      "AXUniqueId": null,
+      "AXValue": null,
+      "frame": {
+       "y": 0,
+       "x": 0,
+       "height": 874,
+       "width": 402
+      },
+      "enabled": true,
+      "role_description": "group",
+      "subrole": null,
+      "children": [
+       {
+        "type": "Group",
+        "AXLabel": null,
+        "AXUniqueId": null,
+        "AXValue": null,
+        "frame": {
+         "y": 0,
+         "x": 0,
+         "height": 874,
+         "width": 402
+        },
+        "enabled": true,
+        "role_description": "group",
+        "subrole": null,
+        "children": [
+         {
+          "type": "Group",
+          "AXLabel": null,
+          "AXUniqueId": null,
+          "AXValue": null,
+          "frame": {
+           "y": 0,
+           "width": 402,
+           "x": 0,
+           "height": 874
+          },
+          "enabled": true,
+          "role_description": "group",
+          "subrole": null,
+          "children": [
+           {
+            "type": "Group",
+            "AXLabel": null,
+            "AXUniqueId": null,
+            "AXValue": null,
+            "frame": {
+             "y": 0,
+             "x": 0,
+             "height": 874,
+             "width": 402
+            },
+            "enabled": true,
+            "role_description": "group",
+            "subrole": null,
+            "children": [
+             {
+              "type": "Group",
+              "AXLabel": null,
+              "AXUniqueId": null,
+              "AXValue": null,
+              "frame": {
+               "y": 0,
+               "x": 0,
+               "height": 874,
+               "width": 402
+              },
+              "enabled": true,
+              "role_description": "group",
+              "subrole": null,
+              "children": [
+               {
+                "type": "Group",
+                "AXLabel": null,
+                "AXUniqueId": "Счета",
+                "AXValue": null,
+                "frame": {
+                 "y": 62,
+                 "x": 0,
+                 "height": 54,
+                 "width": 402
+                },
+                "enabled": true,
+                "role_description": "Навигационная панель",
+                "subrole": null,
+                "children": [
+                 {
+                  "type": "Button",
+                  "AXLabel": "Testbed",
+                  "AXUniqueId": "BackButton",
+                  "AXValue": null,
+                  "frame": {
+                   "y": 62,
+                   "x": 16,
+                   "height": 44,
+                   "width": 44
+                  },
+                  "enabled": true,
+                  "role_description": "back button",
+                  "subrole": null,
+                  "children": []
+                 },
+                 {
+                  "type": "Heading",
+                  "AXLabel": "Счета",
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "y": 73.66666666666666,
+                   "x": 176.33333333333334,
+                   "height": 20.66666666666667,
+                   "width": 49
+                  },
+                  "enabled": true,
+                  "role_description": "heading",
+                  "subrole": null,
+                  "children": []
+                 }
+                ]
+               },
+               {
+                "type": "Group",
+                "AXLabel": null,
+                "AXUniqueId": null,
+                "AXValue": null,
+                "frame": {
+                 "y": 0,
+                 "width": 402,
+                 "x": 0,
+                 "height": 874
+                },
+                "enabled": true,
+                "role_description": "group",
+                "subrole": null,
+                "children": [
+                 {
+                  "type": "Group",
+                  "AXLabel": null,
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "y": 0,
+                   "width": 402,
+                   "x": 0,
+                   "height": 874
+                  },
+                  "enabled": true,
+                  "role_description": "group",
+                  "subrole": null,
+                  "children": [
+                   {
+                    "type": "Group",
+                    "AXLabel": null,
+                    "AXUniqueId": null,
+                    "AXValue": null,
+                    "frame": {
+                     "y": 0,
+                     "x": 0,
+                     "height": 874,
+                     "width": 402
+                    },
+                    "enabled": true,
+                    "role_description": "group",
+                    "subrole": null,
+                    "children": [
+                     {
+                      "type": "Group",
+                      "AXLabel": null,
+                      "AXUniqueId": null,
+                      "AXValue": null,
+                      "frame": {
+                       "y": 0,
+                       "x": 0,
+                       "height": 874,
+                       "width": 402
+                      },
+                      "enabled": true,
+                      "role_description": "group",
+                      "subrole": null,
+                      "children": [
+                       {
+                        "type": "Group",
+                        "AXLabel": null,
+                        "AXUniqueId": null,
+                        "AXValue": null,
+                        "frame": {
+                         "y": 116,
+                         "x": 0,
+                         "height": 724,
+                         "width": 402
+                        },
+                        "enabled": true,
+                        "role_description": "Группа",
+                        "subrole": null,
+                        "children": [
+                         {
+                          "type": "Heading",
+                          "AXLabel": "Счета",
+                          "AXUniqueId": "screen.accounts",
+                          "AXValue": null,
+                          "frame": {
+                           "y": 116,
+                           "x": 0,
+                           "height": 56,
+                           "width": 402
+                          },
+                          "enabled": true,
+                          "role_description": "heading",
+                          "subrole": null,
+                          "children": []
+                         },
+                         {
+                          "type": "ScrollArea",
+                          "AXLabel": null,
+                          "AXUniqueId": null,
+                          "AXValue": null,
+                          "frame": {
+                           "y": 116,
+                           "x": 16,
+                           "height": 724,
+                           "width": 370
+                          },
+                          "enabled": true,
+                          "role_description": "Группа",
+                          "subrole": null,
+                          "children": [
+                           {
+                            "type": "Group",
+                            "AXLabel": null,
+                            "AXUniqueId": "accounts.row.0",
+                            "AXValue": "",
+                            "frame": {
+                             "y": 172,
+                             "x": 16,
+                             "height": 73.33333587646484,
+                             "width": 370
+                            },
+                            "enabled": true,
+                            "role_description": "group",
+                            "subrole": null,
+                            "children": [
+                             {
+                              "type": "Group",
+                              "AXLabel": null,
+                              "AXUniqueId": null,
+                              "AXValue": null,
+                              "frame": {
+                               "y": 172,
+                               "x": 16,
+                               "height": 73.33333333333331,
+                               "width": 370
+                              },
+                              "enabled": true,
+                              "role_description": "group",
+                              "subrole": null,
+                              "children": [
+                               {
+                                "type": "Group",
+                                "AXLabel": null,
+                                "AXUniqueId": null,
+                                "AXValue": null,
+                                "frame": {
+                                 "y": 172,
+                                 "x": 16,
+                                 "height": 73.33333333333331,
+                                 "width": 370
+                                },
+                                "enabled": true,
+                                "role_description": "group",
+                                "subrole": null,
+                                "children": []
+                               }
+                              ]
+                             },
+                             {
+                              "type": "StaticText",
+                              "AXLabel": "Текущий счёт",
+                              "AXUniqueId": null,
+                              "AXValue": null,
+                              "frame": {
+                               "y": 187.66666666666669,
+                               "x": 36,
+                               "height": 20.333333333333343,
+                               "width": 109.66666666666666
+                              },
+                              "enabled": true,
+                              "role_description": "text",
+                              "subrole": null,
+                              "children": []
+                             },
+                             {
+                              "type": "StaticText",
+                              "AXLabel": "12 500,00 ₽",
+                              "AXUniqueId": null,
+                              "AXValue": null,
+                              "frame": {
+                               "y": 212,
+                               "x": 36,
+                               "height": 18,
+                               "width": 81.66666666666667
+                              },
+                              "enabled": true,
+                              "role_description": "text",
+                              "subrole": null,
+                              "children": []
+                             },
+                             {
+                              "type": "Group",
+                              "AXLabel": null,
+                              "AXUniqueId": null,
+                              "AXValue": null,
+                              "frame": {
+                               "y": 244.33333587646484,
+                               "x": 36,
+                               "height": 1,
+                               "width": 330
+                              },
+                              "enabled": true,
+                              "role_description": "group",
+                              "subrole": null,
+                              "children": []
+                             },
+                             {
+                              "type": "Button",
+                              "AXLabel": "chevron",
+                              "AXUniqueId": null,
+                              "AXValue": null,
+                              "frame": {
+                               "y": 201.66666666666669,
+                               "x": 355.6666666666667,
+                               "height": 14,
+                               "width": 10.333333333333314
+                              },
+                              "enabled": false,
+                              "role_description": "button",
+                              "subrole": null,
+                              "children": []
+                             }
+                            ]
+                           },
+                           {
+                            "type": "Group",
+                            "AXLabel": null,
+                            "AXUniqueId": "accounts.row.1",
+                            "AXValue": "",
+                            "frame": {
+                             "y": 245.33333587646484,
+                             "x": 16,
+                             "height": 73.33333587646484,
+                             "width": 370
+                            },
+                            "enabled": true,
+                            "role_description": "group",
+                            "subrole": null,
+                            "children": [
+                             {
+                              "type": "Group",
+                              "AXLabel": null,
+                              "AXUniqueId": null,
+                              "AXValue": null,
+                              "frame": {
+                               "y": 245.33333587646484,
+                               "x": 16,
+                               "height": 73.33333333333331,
+                               "width": 370
+                              },
+                              "enabled": true,
+                              "role_description": "group",
+                              "subrole": null,
+                              "children": [
+                               {
+                                "type": "Group",
+                                "AXLabel": null,
+                                "AXUniqueId": null,
+                                "AXValue": null,
+                                "frame": {
+                                 "y": 245.33333587646484,
+                                 "x": 16,
+                                 "height": 73.33333333333331,
+                                 "width": 370
+                                },
+                                "enabled": true,
+                                "role_description": "group",
+                                "subrole": null,
+                                "children": []
+                               }
+                              ]
+                             },
+                             {
+                              "type": "StaticText",
+                              "AXLabel": "Накопительный",
+                              "AXUniqueId": null,
+                              "AXValue": null,
+                              "frame": {
+                               "y": 261.0000025431315,
+                               "x": 36,
+                               "height": 20.333333333333314,
+                               "width": 125.66666666666666
+                              },
+                              "enabled": true,
+                              "role_description": "text",
+                              "subrole": null,
+                              "children": []
+                             },
+                             {
+                              "type": "StaticText",
+                              "AXLabel": "80 000,00 ₽",
+                              "AXUniqueId": null,
+                              "AXValue": null,
+                              "frame": {
+                               "y": 285.33333587646484,
+                               "x": 36,
+                               "height": 18,
+                               "width": 85
+                              },
+                              "enabled": true,
+                              "role_description": "text",
+                              "subrole": null,
+                              "children": []
+                             },
+                             {
+                              "type": "Group",
+                              "AXLabel": null,
+                              "AXUniqueId": null,
+                              "AXValue": null,
+                              "frame": {
+                               "y": 317.6666717529297,
+                               "x": 36,
+                               "height": 1,
+                               "width": 330
+                              },
+                              "enabled": true,
+                              "role_description": "group",
+                              "subrole": null,
+                              "children": []
+                             },
+                             {
+                              "type": "Button",
+                              "AXLabel": "chevron",
+                              "AXUniqueId": null,
+                              "AXValue": null,
+                              "frame": {
+                               "y": 275.00000254313153,
+                               "x": 355.6666666666667,
+                               "height": 14,
+                               "width": 10.333333333333314
+                              },
+                              "enabled": false,
+                              "role_description": "button",
+                              "subrole": null,
+                              "children": []
+                             }
+                            ]
+                           },
+                           {
+                            "type": "Group",
+                            "AXLabel": null,
+                            "AXUniqueId": "accounts.row.2",
+                            "AXValue": "",
+                            "frame": {
+                             "y": 318.6666717529297,
+                             "x": 16,
+                             "height": 73.33333587646484,
+                             "width": 370
+                            },
+                            "enabled": true,
+                            "role_description": "group",
+                            "subrole": null,
+                            "children": [
+                             {
+                              "type": "Group",
+                              "AXLabel": null,
+                              "AXUniqueId": null,
+                              "AXValue": null,
+                              "frame": {
+                               "y": 318.6666717529297,
+                               "x": 16,
+                               "height": 73.33333333333331,
+                               "width": 370
+                              },
+                              "enabled": true,
+                              "role_description": "group",
+                              "subrole": null,
+                              "children": [
+                               {
+                                "type": "Group",
+                                "AXLabel": null,
+                                "AXUniqueId": null,
+                                "AXValue": null,
+                                "frame": {
+                                 "y": 318.6666717529297,
+                                 "x": 16,
+                                 "height": 73.33333333333331,
+                                 "width": 370
+                                },
+                                "enabled": true,
+                                "role_description": "group",
+                                "subrole": null,
+                                "children": []
+                               }
+                              ]
+                             },
+                             {
+                              "type": "StaticText",
+                              "AXLabel": "Валютный",
+                              "AXUniqueId": null,
+                              "AXValue": null,
+                              "frame": {
+                               "y": 334.3333384195963,
+                               "x": 36,
+                               "height": 20.333333333333314,
+                               "width": 81.66666666666667
+                              },
+                              "enabled": true,
+                              "role_description": "text",
+                              "subrole": null,
+                              "children": []
+                             },
+                             {
+                              "type": "StaticText",
+                              "AXLabel": "1 200,00 $",
+                              "AXUniqueId": null,
+                              "AXValue": null,
+                              "frame": {
+                               "y": 358.6666717529297,
+                               "width": 72.66666666666667,
+                               "x": 36,
+                               "height": 18
+                              },
+                              "enabled": true,
+                              "role_description": "text",
+                              "subrole": null,
+                              "children": []
+                             },
+                             {
+                              "type": "Group",
+                              "AXLabel": null,
+                              "AXUniqueId": null,
+                              "AXValue": null,
+                              "frame": {
+                               "y": 391.00000762939453,
+                               "width": 370,
+                               "x": 16,
+                               "height": 1
+                              },
+                              "enabled": true,
+                              "role_description": "group",
+                              "subrole": null,
+                              "children": []
+                             },
+                             {
+                              "type": "Button",
+                              "AXLabel": "chevron",
+                              "AXUniqueId": null,
+                              "AXValue": null,
+                              "frame": {
+                               "y": 348.3333384195964,
+                               "x": 355.6666666666667,
+                               "width": 10.333333333333314,
+                               "height": 14
+                              },
+                              "enabled": false,
+                              "role_description": "button",
+                              "subrole": null,
+                              "children": []
+                             }
+                            ]
+                           }
+                          ]
+                         },
+                         {
+                          "type": "Slider",
+                          "AXLabel": "Вертикальная полоса прокрутки, 1 страница",
+                          "AXUniqueId": null,
+                          "AXValue": "0 %",
+                          "frame": {
+                           "y": 116,
+                           "width": 30,
+                           "x": 369,
+                           "height": 696
+                          },
+                          "enabled": true,
+                          "role_description": "slider",
+                          "subrole": null,
+                          "children": [
+                           {
+                            "type": "Group",
+                            "AXLabel": null,
+                            "AXUniqueId": null,
+                            "AXValue": null,
+                            "frame": {
+                             "y": 529.6666666666667,
+                             "x": 396,
+                             "width": 3,
+                             "height": 279.33333333333326
+                            },
+                            "enabled": true,
+                            "role_description": "group",
+                            "subrole": null,
+                            "children": []
+                           }
+                          ]
+                         },
+                         {
+                          "type": "Slider",
+                          "AXLabel": "Горизонтальная полоса прокрутки, 1 страница",
+                          "AXUniqueId": null,
+                          "AXValue": "0 %",
+                          "frame": {
+                           "y": 807,
+                           "width": 346,
+                           "x": 28,
+                           "height": 30
+                          },
+                          "enabled": true,
+                          "role_description": "slider",
+                          "subrole": null,
+                          "children": [
+                           {
+                            "type": "Group",
+                            "AXLabel": null,
+                            "AXUniqueId": null,
+                            "AXValue": null,
+                            "frame": {
+                             "y": 834,
+                             "x": 31,
+                             "width": 340,
+                             "height": 3
+                            },
+                            "enabled": true,
+                            "role_description": "group",
+                            "subrole": null,
+                            "children": []
+                           }
+                          ]
+                         },
+                         {
+                          "type": "Slider",
+                          "AXLabel": "Вертикальная полоса прокрутки, 1 страница",
+                          "AXUniqueId": null,
+                          "AXValue": "0 %",
+                          "frame": {
+                           "y": 116,
+                           "x": 369,
+                           "width": 30,
+                           "height": 696
+                          },
+                          "enabled": true,
+                          "role_description": "slider",
+                          "subrole": null,
+                          "children": [
+                           {
+                            "type": "Group",
+                            "AXLabel": null,
+                            "AXUniqueId": null,
+                            "AXValue": null,
+                            "frame": {
+                             "y": 529.6666666666667,
+                             "x": 396,
+                             "width": 3,
+                             "height": 279.33333333333326
+                            },
+                            "enabled": true,
+                            "role_description": "group",
+                            "subrole": null,
+                            "children": []
+                           }
+                          ]
+                         },
+                         {
+                          "type": "Slider",
+                          "AXLabel": "Горизонтальная полоса прокрутки, 1 страница",
+                          "AXUniqueId": null,
+                          "AXValue": "0 %",
+                          "frame": {
+                           "y": 807,
+                           "x": 28,
+                           "width": 346,
+                           "height": 30
+                          },
+                          "enabled": true,
+                          "role_description": "slider",
+                          "subrole": null,
+                          "children": [
+                           {
+                            "type": "Group",
+                            "AXLabel": null,
+                            "AXUniqueId": null,
+                            "AXValue": null,
+                            "frame": {
+                             "y": 834,
+                             "width": 340,
+                             "x": 31,
+                             "height": 3
+                            },
+                            "enabled": true,
+                            "role_description": "group",
+                            "subrole": null,
+                            "children": []
+                           }
+                          ]
+                         }
+                        ]
+                       }
+                      ]
+                     }
+                    ]
+                   }
+                  ]
+                 }
+                ]
+               },
+               {
+                "type": "Group",
+                "AXLabel": "Панель инструментов",
+                "AXUniqueId": "Toolbar",
+                "AXValue": null,
+                "frame": {
+                 "y": 0,
+                 "x": 0,
+                 "width": 402,
+                 "height": 874
+                },
+                "enabled": true,
+                "role_description": "group",
+                "subrole": null,
+                "children": [
+                 {
+                  "type": "Group",
+                  "AXLabel": null,
+                  "AXUniqueId": null,
+                  "AXValue": null,
+                  "frame": {
+                   "y": 0,
+                   "x": 0,
+                   "width": 402,
+                   "height": 874
+                  },
+                  "enabled": true,
+                  "role_description": "group",
+                  "subrole": null,
+                  "children": []
+                 }
+                ]
+               }
+              ]
+             }
+            ]
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "type": "Group",
+    "AXLabel": null,
+    "AXUniqueId": null,
+    "AXValue": null,
+    "frame": {
+     "y": 0,
+     "x": 0,
+     "width": 402,
+     "height": 874
+    },
+    "enabled": true,
+    "role_description": "group",
+    "subrole": null,
+    "children": [
+     {
+      "type": "Group",
+      "AXLabel": null,
+      "AXUniqueId": null,
+      "AXValue": null,
+      "frame": {
+       "y": 0,
+       "x": 0,
+       "width": 402,
+       "height": 874
+      },
+      "enabled": true,
+      "role_description": "group",
+      "subrole": null,
+      "children": [
+       {
+        "type": "Group",
+        "AXLabel": null,
+        "AXUniqueId": null,
+        "AXValue": null,
+        "frame": {
+         "y": 0,
+         "width": 402,
+         "x": 0,
+         "height": 874
+        },
+        "enabled": true,
+        "role_description": "group",
+        "subrole": null,
+        "children": []
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ }
+]

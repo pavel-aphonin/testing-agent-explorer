@@ -26,12 +26,18 @@ import re
 
 # Element types that represent STRUCTURE (included in hash)
 STRUCTURAL_TYPES = {
-    "Button", "TextField", "SecureTextField", "Switch", "Slider",
+    "Button", "TextField", "SecureTextField", "Switch", "CheckBox", "Slider",
     "Tab", "TabBar", "SegmentedControl",
     "NavigationBar", "Toolbar",
     "Cell", "Link",
     "GenericElement",  # React Native renders buttons as GenericElement
 }
+
+# Structural types hashed WITHOUT their label. List rows take their label
+# from the row's text, which is content, not structure: a «Курсы» row
+# showing the clock would otherwise fork the screen every second. The
+# number of rows still counts.
+LABEL_FREE_TYPES = {"Cell"}
 
 # Element types to ALWAYS skip (dynamic/decorative)
 # Backward compat: analyzer.py imports this name
@@ -132,6 +138,10 @@ def compute_screen_id(elements: list[dict]) -> str:
         if el_type not in STRUCTURAL_TYPES:
             # Unknown type — include it to be safe but without label
             # (so dynamic labels don't change the hash)
+            fingerprint_parts.append((el_type, ""))
+            continue
+
+        if el_type in LABEL_FREE_TYPES:
             fingerprint_parts.append((el_type, ""))
             continue
 

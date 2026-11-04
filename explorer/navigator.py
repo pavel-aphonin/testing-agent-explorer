@@ -24,6 +24,7 @@ async def go_back_to_screen(
     current_screen_id: str,
     target_screen_id: str,
     capture_fn,
+    replay_input=None,
 ) -> str | None:
     """
     Navigate from current screen to target screen.
@@ -34,6 +35,7 @@ async def go_back_to_screen(
 
     Returns the screen_id we ended up on, or None on failure.
     capture_fn: async () -> (screen_id, elements) - captures current screen state.
+    replay_input: optional async (ActionDetail) -> bool, see replay_path.
     """
     if current_screen_id == target_screen_id:
         return current_screen_id
@@ -62,14 +64,14 @@ async def go_back_to_screen(
                     f"Found path from {new_screen_id[:8]} to {target_screen_id[:8]} "
                     f"({len(path)} steps)"
                 )
-                result = await replay_path(controller, path, capture_fn)
+                result = await replay_path(controller, path, capture_fn, replay_input)
                 if result == target_screen_id:
                     return result
 
     # Strategy 2: Relaunch app + replay
     logger.info("Back button failed, relaunching app")
     return await relaunch_and_navigate(
-        controller, graph, target_screen_id, capture_fn
+        controller, graph, target_screen_id, capture_fn, replay_input
     )
 
 
@@ -78,6 +80,7 @@ async def relaunch_and_navigate(
     graph: AppGraph,
     target_screen_id: str,
     capture_fn,
+    replay_input=None,
 ) -> str | None:
     """Kill app, relaunch, navigate to target via known path."""
     try:
@@ -101,17 +104,28 @@ async def relaunch_and_navigate(
         )
         return start_screen_id  # Return where we are, caller decides
 
-    return await replay_path(controller, path, capture_fn)
+    return await replay_path(controller, path, capture_fn, replay_input)
 
 
 async def replay_path(
     controller,
     path: list[GraphEdge],
     capture_fn,
+    replay_input=None,
 ) -> str | None:
-    """Replay a sequence of actions to navigate along a known path."""
+    """Replay a sequence of actions to navigate along a known path.
+
+    ``replay_input`` replaces the replay of ``input`` edges. One such edge
+    stands for a whole submitted form (login: email + password + submit)
+    and stores only the trigger field's text — redacted for passwords —
+    so typing it back can never get past a login screen. The engine
+    passes a callback that refills the form from test data and submits.
+    """
     for edge in path:
-        success = await replay_action(controller, edge.action)
+        if edge.action.action_type == "input" and replay_input is not None:
+            success = await replay_input(edge.action)
+        else:
+            success = await replay_action(controller, edge.action)
         if not success:
             logger.warning(f"Failed to replay action: {edge.action}")
             current_id, _ = await capture_fn()
