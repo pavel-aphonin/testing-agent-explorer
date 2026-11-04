@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -55,7 +56,7 @@ from explorer.navigator import (
     find_nearest_unexplored,
     go_back_to_screen,
 )
-from explorer.screen_id import compute_screen_id
+from explorer.screen_id import compute_screen_id, normalize_label
 
 logger = logging.getLogger("explorer.engine")
 
@@ -90,14 +91,88 @@ SET_TEXT_TIMEOUT_S = 60
 # accepted once two captures agree (see _capture_settled_screen).
 NEW_SCREEN_RECHECKS = 3
 NEW_SCREEN_RECHECK_DELAY_S = 1.0
+SPARSE_SCREEN_RECHECK_DELAY_S = 2.5
+
+# PIN keypads: digits are never explored one by one — a few random codes
+# can lock a test account. The PIN from test data («pin») is entered as a
+# whole; after this many rejected entries in a row the agent stops trying.
+MAX_PIN_FAILURES = 2
+PIN_DIGIT_DELAY_S = 0.3
+KEYPAD_DIGITS = frozenset("0123456789")
+
+# SpringBoard alerts cleared on launch before the first capture.
+MAX_LAUNCH_ALERTS = 3
 
 # Failed navigations to one frontier screen before its remaining actions
 # are written off (see _note_unreachable).
 MAX_NAV_FAILURES = 2
 
+# Action-set overlap above which two nodes count as one screen for
+# navigation (see _same_screen).
+SAME_SCREEN_JACCARD = 0.85
+
 # Type aliases for the optional engine callbacks.
 PriorProvider = Callable[[ScreenNode], "dict[str, float] | Awaitable[dict[str, float]]"]
 EventCallback = Callable[[dict], "None | Awaitable[None]"]
+
+
+# Actions that open system UI running in its own process — photo picker,
+# camera, share sheet, document picker. It is drawn over the app but is
+# missing from the app's AX tree, so the agent keeps «seeing» the screen
+# underneath and taps blindly into the system UI (aweassist run 3: after
+# «Выбрать из галереи» the taps meant for «Справки и выписки», «Договоры»…
+# landed in the Photos picker).
+_SYSTEM_UI_TRIGGER_RE = re.compile(
+    r"галере|сделать фото|снять фото|\bкамер|выбрать (фото|файл|документ)|поделиться"
+    r"|photo library|choose (photo|from library|file)|take (a )?photo|\bcamera\b|\bshare\b",
+    re.IGNORECASE,
+)
+
+
+# Without priors PUCT breaks ties in AX-tree order — top to bottom — so the
+# tab bar, last in the tree, came last: aweassist run 2 reached «Платежи» at
+# step 50 and «Чаты» at 166, behind a hundred cards on the main screen.
+# Tabs open whole sections; trying them first maps the app breadth-first.
+#
+# A tab leads to the same section from every screen, though, so once it has
+# been tapped it drops below ordinary actions everywhere (TAB_VISITED_WEIGHT):
+# with the boost kept, every screen inside a section re-tried all five tabs
+# first (aweassist run 3, steps 63–69: nothing but tab hops).
+TAB_BAR_TYPES = frozenset({"RadioButton", "Tab"})
+TAB_BAR_PRIOR_WEIGHT = 10.0
+TAB_VISITED_WEIGHT = 0.1
+
+
+def structural_priors(
+    node: ScreenNode, visited_tabs: frozenset[str] | set[str] = frozenset()
+) -> dict[str, float] | None:
+    """Priors from the screen's structure alone (no LLM): tab bar items
+    weigh TAB_BAR_PRIOR_WEIGHT until tapped, then TAB_VISITED_WEIGHT;
+    everything else 1. None when there is nothing to prefer, which keeps
+    PUCT's uniform default."""
+
+    def weight(el: ElementSnapshot) -> float:
+        if el.element_type not in TAB_BAR_TYPES:
+            return 1.0
+        return TAB_VISITED_WEIGHT if el.label in visited_tabs else TAB_BAR_PRIOR_WEIGHT
+
+    weights = {action_id_for(el): weight(el) for el in node.interactive_elements}
+    if all(w == 1.0 for w in weights.values()):
+        return None
+    return weights
+
+
+def opens_system_ui(label: str | None) -> bool:
+    return bool(label) and bool(_SYSTEM_UI_TRIGGER_RE.search(label))
+
+
+def _root_label(elements: list[dict]) -> str | None:
+    """Label of the AX tree's Application root: «» for SpringBoard (system
+    alerts, home screen), None when the tree has no Application element."""
+    for e in elements:
+        if e.get("type") == "Application":
+            return (e.get("label") or "").strip()
+    return None
 
 
 def action_id_for(element: ElementSnapshot) -> str:
@@ -135,8 +210,13 @@ class ExplorationEngine:
         prior_provider: PriorProvider | None = None,
         event_callback: EventCallback | None = None,
         test_data: dict[str, str] | None = None,
+        forbidden: list[str] | None = None,
+        system_ui_guard: bool = True,
     ):
         self.controller = controller
+        # Skip actions that open system UI living outside the app's AX tree
+        # (see opens_system_ui).
+        self.system_ui_guard = system_ui_guard
         self.app_bundle_id = app_bundle_id
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -150,6 +230,10 @@ class ExplorationEngine:
         # priority source for happy-path values — see PER-20. Empty
         # dict keeps the legacy "use BUILTIN_VARIANTS" behaviour.
         self.form_filler = FormFiller(test_data=test_data)
+        # Labels / accessibility ids the agent must never act on — e.g. an
+        # app's debug environment switcher, where exploring would select
+        # «Production» and log in to a live backend (aweassist).
+        self.forbidden: frozenset[str] = frozenset(forbidden or ())
         self.current_screen_id: str | None = None
         self._stuck_count = 0
         self.step_idx = 0
@@ -158,12 +242,24 @@ class ExplorationEngine:
         # counts consecutive steps since then. Abort when it crosses
         # MAX_NO_PROGRESS_STEPS.
         self._last_node_count = 0
+        self._last_edge_count = 0
         self._no_progress_steps = 0
+        # Screen to leave on the next step (see MAX_STUCK_COUNT).
+        self._leave_screen: str | None = None
         # AX root label of our own app (its display name), taken from the
         # first in-app capture. A different non-blank root means an action
         # took us into another app — see _capture_screen.
         self._app_label: str | None = None
         self._dismissing_popup = False
+        # PIN keypad screens (all ten digit buttons) and their digit frames.
+        self._keypad_screens: set[str] = set()
+        self._keypad_frames: dict[str, dict] = {}
+        self._pin_failures = 0
+        # Screens the agent has scrolled: their captured frames may be stale
+        # (apps often keep the scroll offset when you come back).
+        self._scrolled_screens: set[str] = set()
+        # Tab bar items already tapped somewhere (see TAB_VISITED_WEIGHT).
+        self._visited_tabs: set[str] = set()
         # Failed navigations per target screen; see MAX_NAV_FAILURES.
         self._nav_failures: dict[str, int] = {}
 
@@ -202,6 +298,8 @@ class ExplorationEngine:
         print(">>> Waiting for app to settle (2s)...")
         await asyncio.sleep(2.0)
 
+        await self._clear_system_ui_at_start()
+
         print(">>> Capturing initial screen...")
         initial_node = await self._capture_screen()
         is_new = self.graph.add_node(initial_node)
@@ -232,9 +330,13 @@ class ExplorationEngine:
                 # MAX_NO_PROGRESS_STEPS consecutive steps we're circling
                 # — stop with a clear reason instead of burning the rest
                 # of max_steps.
+                # Progress = a new screen or a newly explored action. Only
+                # circling between exhausted screens adds neither.
                 cur_node_count = len(self.graph.nodes)
-                if cur_node_count > self._last_node_count:
+                cur_edge_count = len(self.graph.edges)
+                if cur_node_count > self._last_node_count or cur_edge_count > self._last_edge_count:
                     self._last_node_count = cur_node_count
+                    self._last_edge_count = cur_edge_count
                     self._no_progress_steps = 0
                 else:
                     self._no_progress_steps += 1
@@ -260,16 +362,25 @@ class ExplorationEngine:
                 # self-loops and inflate stuck count.
                 await self._dismiss_system_popup()
 
-                unexplored = self.graph.get_unexplored_actions(self.current_screen_id)
+                if self.current_screen_id in self._keypad_screens:
+                    if await self._enter_pin_here(step):
+                        continue
 
-                if not unexplored:
-                    # No local frontier — ask Go-Explore for the global best.
+                unexplored = self.graph.get_unexplored_actions(self.current_screen_id)
+                leaving = self._leave_screen == self.current_screen_id
+                self._leave_screen = None
+
+                frontier = None
+                if not unexplored or leaving:
+                    # No local frontier (or this screen keeps going nowhere)
+                    # — ask Go-Explore for the global best elsewhere.
                     frontier = self.archive.best_frontier(
                         exclude_current=self.current_screen_id
                     )
-                    if frontier is None:
+                    if frontier is None and not unexplored:
                         logger.info("No frontier remaining anywhere. Done.")
                         break
+                if frontier is not None:
                     logger.info(
                         f"[Step {step}] Local frontier exhausted; "
                         f"navigating to {frontier.state_id[:8]} "
@@ -296,7 +407,17 @@ class ExplorationEngine:
                             f"[Step {step}] Navigation to "
                             f"{frontier.state_id[:8]} failed; will retry"
                         )
-                    if result != frontier.state_id:
+                    if result and result != frontier.state_id and self._same_screen(
+                        result, frontier.state_id
+                    ):
+                        # Arrived at a variant of the target (e.g. the same
+                        # screen with a «reload» banner): work on the target.
+                        logger.info(
+                            "[Step %d] %s is a variant of %s; treating as reached",
+                            step, result[:8], frontier.state_id[:8],
+                        )
+                        self.current_screen_id = frontier.state_id
+                    elif result != frontier.state_id:
                         self._note_unreachable(frontier.state_id, step)
                     continue
 
@@ -378,13 +499,16 @@ class ExplorationEngine:
                 if step % 5 == 0 or is_new_screen:
                     await self._emit_stats(step=step)
 
-                # Stuck detection
+                # Stuck detection: this screen's recent actions lead nowhere.
+                # Explore elsewhere first and come back to the rest later —
+                # writing them off (the old behaviour) dropped 99 of 111
+                # actions on aweassist «Счета», most of them below the fold.
                 if self._stuck_count >= MAX_STUCK_COUNT:
-                    logger.warning(
+                    logger.info(
                         f"Stuck on screen {self.current_screen_id[:8]} "
-                        f"for {MAX_STUCK_COUNT} steps. Marking remaining as explored."
+                        f"for {MAX_STUCK_COUNT} steps; exploring elsewhere first."
                     )
-                    self._mark_screen_fully_explored(self.current_screen_id)
+                    self._leave_screen = self.current_screen_id
                     self._stuck_count = 0
 
                 self._save_checkpoint()
@@ -450,7 +574,9 @@ class ExplorationEngine:
             except Exception:
                 logger.exception("prior_provider failed; falling back to uniform")
 
-        self.puct.register_state(node.screen_id, action_ids, priors=priors)
+        self.puct.register_state(
+            node.screen_id, action_ids, priors=priors or structural_priors(node, self._visited_tabs)
+        )
         self._rebuild_action_map(node)
 
     def _rebuild_action_map(self, node: ScreenNode) -> None:
@@ -491,7 +617,9 @@ class ExplorationEngine:
 
         if node.screen_id not in self.puct.known_states():
             action_ids = [action_id_for(el) for el in node.interactive_elements]
-            self.puct.register_state(node.screen_id, action_ids, priors=priors)
+            self.puct.register_state(
+                node.screen_id, action_ids, priors=priors or structural_priors(node, self._visited_tabs)
+            )
 
         self._rebuild_action_map(node)
         self._update_archive_for(node.screen_id)
@@ -589,6 +717,24 @@ class ExplorationEngine:
         x, y = center
         before_screen = self.current_screen_id
 
+        # Off-screen elements (and every element once this screen has been
+        # scrolled, since the captured frames are then stale) are looked
+        # up live and scrolled into view first.
+        scroll = getattr(self.controller, "scroll_into_view", None)
+        needs_scroll = getattr(self.controller, "needs_scroll", None)
+        if scroll and needs_scroll and (
+            before_screen in self._scrolled_screens
+            or needs_scroll(element.element_type, element.frame)
+        ):
+            frame = await scroll(element.element_type, element.label, element.test_id, element.frame or {})
+            self._scrolled_screens.add(before_screen)
+            if frame is None:
+                print(f"    ! Could not bring {element.label!r} on screen, skipping", flush=True)
+                self._record_self_loop(element, ActionType.TAP)
+                return
+            x = int(frame.get("x", 0) + frame.get("width", 0) / 2)
+            y = int(frame.get("y", 0) + frame.get("height", 0) / 2)
+
         print(f"    Tapping {element.label!r} at ({x}, {y})...", flush=True)
         try:
             result = None
@@ -626,11 +772,19 @@ class ExplorationEngine:
             self._record_self_loop(element, ActionType.TAP)
             return
 
+        if element.element_type in TAB_BAR_TYPES and element.label not in self._visited_tabs:
+            self._visited_tabs.add(element.label)
+            prefix = f"tap|{element.label}|"
+            self.puct.scale_priors(
+                lambda aid: aid.startswith(prefix),
+                TAB_VISITED_WEIGHT / TAB_BAR_PRIOR_WEIGHT,
+            )
+
         print(f"    Waiting {SETTLE_DELAY}s for UI to settle...")
         await asyncio.sleep(SETTLE_DELAY)
 
         print(f"    Capturing screen...")
-        new_node = await self._capture_settled_screen()
+        new_node = await self._capture_settled_screen(before=before_screen)
         is_new = self.graph.add_node(new_node)
 
         # Record edge
@@ -733,6 +887,8 @@ class ExplorationEngine:
         """Navigator hook for ``input`` edges: refill the whole form on the
         current screen from test data and submit, as exploration did."""
         node = await self._capture_screen()
+        if node.screen_id in self._keypad_screens:
+            return await self._type_pin()
         fields = [
             el for el in node.interactive_elements
             if el.kind == ElementKind.TEXT_FIELD
@@ -741,6 +897,65 @@ class ExplorationEngine:
             return False
         print(f"      Replaying form ({len(fields)} fields) on {node.name!r}", flush=True)
         await self._fill_and_submit(fields)
+        return True
+
+    # ------------------------------------------------------------------ PIN
+
+    def _pin(self) -> str | None:
+        return self.form_filler.test_data.get("pin")
+
+    async def _type_pin(self) -> bool:
+        """Tap the PIN digits from test data on the current keypad screen."""
+        pin = self._pin()
+        if not pin or self._pin_failures >= MAX_PIN_FAILURES:
+            return False
+        for digit in pin:
+            if hasattr(self.controller, "tap_by_id"):
+                result = await self.controller.tap_by_id(digit)
+                if result.error is None:
+                    await asyncio.sleep(PIN_DIGIT_DELAY_S)
+                    continue
+            frame = self._keypad_frames.get(digit)
+            if not frame:
+                return False
+            await self.controller.tap_at(
+                int(frame["x"] + frame["width"] / 2), int(frame["y"] + frame["height"] / 2)
+            )
+            await asyncio.sleep(PIN_DIGIT_DELAY_S)
+        await asyncio.sleep(SETTLE_DELAY)
+        return True
+
+    async def _enter_pin_here(self, step: int) -> bool:
+        """Enter the PIN on the current keypad screen and record the
+        transition as one input action. Returns False when no PIN is known
+        or the failure budget is spent — the digits are never explored one
+        by one (random codes would lock the test account)."""
+        before = self.current_screen_id
+        print(f"    PIN keypad on {self._screen_name()!r}; entering PIN from test data", flush=True)
+        if not await self._type_pin():
+            return False
+        new_node = await self._capture_settled_screen(before=before)
+        is_new = self.graph.add_node(new_node)
+        self.graph.add_edge(GraphEdge(
+            source_screen_id=before,
+            target_screen_id=new_node.screen_id,
+            action=ActionDetail(
+                action_type=ActionType.INPUT,
+                target_label="PIN",
+                input_text="***",
+                input_category="valid",
+            ),
+        ))
+        self.current_screen_id = new_node.screen_id
+        if new_node.screen_id == before:
+            self._pin_failures += 1
+            logger.warning(
+                "[Step %d] PIN not accepted (%d/%d)",
+                step, self._pin_failures, MAX_PIN_FAILURES,
+            )
+            return self._pin_failures < MAX_PIN_FAILURES
+        self._pin_failures = 0
+        await self._on_screen_landed(new_node, is_new=is_new, step=step)
         return True
 
     async def _fill_form_happy_path(
@@ -945,6 +1160,67 @@ class ExplorationEngine:
         "Would Like to Use Your Current Location",
     })
 
+    async def _clear_system_ui_at_start(self) -> None:
+        """Clear SpringBoard alerts shown on launch, before the first capture.
+
+        aweassist opens with two: the notification permission prompt and
+        an icon-change notice that is missing from the AX tree. Otherwise
+        the first «screen» is an alert and the app's own name (used to
+        tell our app from others) is never learned.
+        """
+        for _ in range(MAX_LAUNCH_ALERTS):
+            elements = await self.controller.get_ui_elements()
+            if not elements:
+                return
+            root = _root_label(elements)
+            if root is None or root:
+                return
+            buttons = [
+                e for e in elements
+                if (e.get("label") or "").strip() in self._DISMISS_LABELS and e.get("frame")
+            ]
+            if buttons:
+                frame = buttons[0]["frame"]
+                print(f"    [launch] Dismissing system alert: {buttons[0].get('label')!r}", flush=True)
+                await self.controller.tap_at(
+                    int(frame.get("x", 0) + frame.get("width", 0) / 2),
+                    int(frame.get("y", 0) + frame.get("height", 0) / 2),
+                )
+            elif hasattr(self.controller, "press_return"):
+                print("    [launch] System alert without elements; pressing Return", flush=True)
+                await self.controller.press_return()
+            else:
+                return
+            await asyncio.sleep(1.5)
+
+    async def _recover_from_springboard(self) -> None:
+        """SpringBoard is in front but shows nothing we can tap.
+
+        Either an alert missing from the AX tree (aweassist: «You have
+        changed the icon for “Деньги”» has no elements; Return confirms
+        it), or our app is gone — crashed or sent to the home screen — in
+        which case relaunch it.
+        """
+        if hasattr(self.controller, "press_return"):
+            print("    [auto-dismiss] SpringBoard with nothing to tap; pressing Return", flush=True)
+            await self.controller.press_return()
+            await asyncio.sleep(1.0)
+            elements = await self.controller.get_ui_elements()
+            root = _root_label(elements)
+        else:
+            root = ""
+        if root != self._app_label:
+            print("    -> App not in front; relaunching it", flush=True)
+            await self.controller.launch_app(self.app_bundle_id)
+            await asyncio.sleep(SETTLE_DELAY)
+        outer, self._dismissing_popup = self._dismissing_popup, True
+        try:
+            node = await self._capture_screen()
+        finally:
+            self._dismissing_popup = outer
+        self.current_screen_id = node.screen_id
+        self.graph.add_node(node)
+
     async def _dismiss_system_popup(self) -> None:
         """If a system alert (Save Password, Allow Notifications, etc.) is
         on screen, tap the dismiss button and re-capture."""
@@ -959,10 +1235,7 @@ class ExplorationEngine:
         # our own app «Отмена»/«Cancel» belong to the app's sheets and
         # alerts — testbed run 3 closed the profile-edit sheet 25 times in
         # a row right after navigating to it.
-        root_label = next(
-            ((e.get("label") or "").strip() for e in elements if e.get("type") == "Application"),
-            "",
-        )
+        root_label = _root_label(elements)
         if self._app_label and root_label == self._app_label:
             return
         if self._app_label and root_label:
@@ -994,6 +1267,11 @@ class ExplorationEngine:
                 dismiss_candidates.append(e)
 
         if not dismiss_candidates:
+            # Only a blank root is SpringBoard; no root at all means the
+            # controller does not report one — nothing to recover from.
+            if root_label is None or root_label:
+                return
+            await self._recover_from_springboard()
             return
 
         # Prefer "Not Now" / "Не сейчас" / "Cancel" over other options
@@ -1026,19 +1304,24 @@ class ExplorationEngine:
                 print(f"    [auto-dismiss] Failed: {exc}", flush=True)
             return
 
-    async def _capture_settled_screen(self) -> ScreenNode:
-        """Capture after an action, re-checking screens we have not seen.
+    async def _capture_settled_screen(self, before: str | None = None) -> ScreenNode:
+        """Capture after an action, re-checking results that may be early.
 
-        A pushed screen may still be loading at SETTLE_DELAY: testbed run 7
-        captured «Счета» before its table rendered (only «Назад»), recorded
-        that as the screen, and never saw the account rows. A known screen
-        is trusted as is; a new one must look the same twice in a row.
+        The app often answers later than SETTLE_DELAY. A known *other*
+        screen is trusted as is. Re-checked until two captures agree:
+        - a new screen — may still be loading (testbed run 7: «Счета»
+          captured before its table rendered, account rows never seen);
+        - no change (``before``) — the transition may not have started yet
+          (run 12: a back tap and the switch to iOS Settings both landed
+          after the capture; «Выйти» was then tapped inside iOS Settings).
+        A new screen offering only one action is given longer to load.
         """
         node = await self._capture_screen()
         for _ in range(NEW_SCREEN_RECHECKS):
-            if node.screen_id in self.graph.nodes:
+            if node.screen_id in self.graph.nodes and node.screen_id != before:
                 return node
-            await asyncio.sleep(NEW_SCREEN_RECHECK_DELAY_S)
+            sparse = node.screen_id not in self.graph.nodes and len(node.interactive_elements) <= 1
+            await asyncio.sleep(SPARSE_SCREEN_RECHECK_DELAY_S if sparse else NEW_SCREEN_RECHECK_DELAY_S)
             again = await self._capture_screen()
             if again.screen_id == node.screen_id:
                 return again
@@ -1120,6 +1403,29 @@ class ExplorationEngine:
                 elements=elements,
                 screenshot_b64=screenshot,
             )
+            if self.forbidden:
+                # Dropped here, at the source, so nothing downstream — PUCT,
+                # frontier navigation, form filling — can ever pick them.
+                node.interactive_elements = [
+                    el for el in node.interactive_elements
+                    if el.label not in self.forbidden and el.test_id not in self.forbidden
+                ]
+            if self.system_ui_guard:
+                node.interactive_elements = [
+                    el for el in node.interactive_elements
+                    if not opens_system_ui(el.label)
+                ]
+            digits = {
+                el.label: el for el in node.interactive_elements
+                if el.element_type == "Button" and el.label in KEYPAD_DIGITS
+            }
+            if set(digits) == KEYPAD_DIGITS:
+                self._keypad_screens.add(node.screen_id)
+                self._keypad_frames = {d: el.frame for d, el in digits.items() if el.frame}
+                node.interactive_elements = [
+                    el for el in node.interactive_elements
+                    if not (el.element_type == "Button" and el.label in KEYPAD_DIGITS)
+                ]
             print(f"      [capture] Analyzed: {node.name!r}, {len(node.interactive_elements)} interactive ({t2-t0:.1f}s total)", flush=True)
             return node
         except Exception as e:
@@ -1165,6 +1471,31 @@ class ExplorationEngine:
             notes="Action failed or did not change screen",
         ))
 
+    def _same_screen(self, a: str, b: str) -> bool:
+        """Two graph nodes that are variants of one screen: their actions
+        (type + label with numbers normalized) overlap by SAME_SCREEN_JACCARD.
+
+        A fingerprint must change when the structure changes, so transient
+        UI — an error banner with a «reload» button, one more card — gives
+        a new node. Navigation should still accept it as the target, or the
+        target looks unreachable (aweassist run 2: «Счета», 116 of 117
+        actions written off).
+        """
+        na, nb = self.graph.nodes.get(a), self.graph.nodes.get(b)
+        if not na or not nb:
+            return False
+
+        def keys(node: ScreenNode) -> set[tuple[str, str]]:
+            return {
+                (el.element_type, normalize_label(el.label or ""))
+                for el in node.interactive_elements
+            }
+
+        ka, kb = keys(na), keys(nb)
+        if not ka or not kb:
+            return False
+        return len(ka & kb) / len(ka | kb) >= SAME_SCREEN_JACCARD
+
     def _note_unreachable(self, screen_id: str, step: int) -> None:
         """Give up on a frontier screen after MAX_NAV_FAILURES failed trips.
 
@@ -1182,6 +1513,10 @@ class ExplorationEngine:
             step, screen_id[:8], failures,
         )
         self._mark_screen_fully_explored(screen_id)
+        # The archive only refreshes on landing, which never happens for an
+        # unreachable screen; without this it stays the best frontier
+        # (aweassist run 2: four more 1–2 min trips after the write-off).
+        self._update_archive_for(screen_id)
 
     def _mark_screen_fully_explored(self, screen_id: str) -> None:
         """Mark all remaining elements on a screen as explored via self-loops."""

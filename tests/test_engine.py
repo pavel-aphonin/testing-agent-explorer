@@ -333,9 +333,10 @@ async def test_engine_dead_end_abort_emits_log_event(tmp_path, monkeypatch):
     The test above ends by frontier exhaustion at step 2, so it never
     reached this branch — which is how a call to the non-existent
     ``_safe_emit`` crashed testbed run baseline-1 with AttributeError.
-    A threshold of 1 forces the branch on the first non-growing step.
+    A threshold of 0 forces the branch on the very first step (explored
+    actions count as progress, so no real step here stalls).
     """
-    monkeypatch.setattr("explorer.engine.MAX_NO_PROGRESS_STEPS", 1)
+    monkeypatch.setattr("explorer.engine.MAX_NO_PROGRESS_STEPS", 0)
     events: list[dict] = []
     engine = ExplorationEngine(
         controller=_DeadEndController(),
@@ -652,6 +653,186 @@ def test_unreachable_frontier_is_written_off(tmp_path):
 
     engine._note_unreachable("prompt", step=2)
     assert engine.graph.get_unexplored_actions("prompt") == []
+
+
+@pytest.mark.asyncio
+async def test_forbidden_elements_are_never_actions(tmp_path):
+    # aweassist: «Switch to test» opens the environment switcher, where
+    # exploring would select «Production».
+    controller = _PopupController(tree=_app(
+        "Деньги", _button("Switch to test", 78), _button("Зайти", 500),
+    ))
+    engine = ExplorationEngine(
+        controller=controller, app_bundle_id="com.aweassist.app",
+        output_dir=str(tmp_path), mode=ExplorationMode.MC,
+        forbidden=["Switch to test"],
+    )
+
+    node = await engine._capture_screen()
+
+    assert [el.label for el in node.interactive_elements] == ["Зайти"]
+
+
+@dataclass
+class _LaunchAlertsController(_PopupController):
+    """aweassist on first launch: permission prompt, then an icon-change
+    alert with no AX elements (Return confirms it), then the app."""
+
+    returns: int = 0
+    launches: int = 0
+
+    def __post_init__(self):
+        self.tree = _app(" ", _button("Don’t Allow", 500), _button("Allow", 560))
+
+    async def tap_at(self, x: int, y: int) -> _Result:
+        self.taps.append(y)
+        if y == 520:
+            self.tree = _app(" ")
+        return _Result()
+
+    async def press_return(self) -> bool:
+        self.returns += 1
+        self.tree = _app("Деньги", _button("Зайти", 500))
+        return True
+
+    async def launch_app(self, bundle_id: str) -> None:
+        self.launches += 1
+
+
+@pytest.mark.asyncio
+async def test_launch_alerts_are_cleared_before_first_capture(tmp_path, monkeypatch):
+    monkeypatch.setattr("explorer.engine.asyncio.sleep", _no_sleep)
+    controller = _LaunchAlertsController()
+    engine = ExplorationEngine(
+        controller=controller, app_bundle_id="com.aweassist.app",
+        output_dir=str(tmp_path), mode=ExplorationMode.MC,
+    )
+
+    await engine._clear_system_ui_at_start()
+    first = await engine._capture_screen()
+
+    assert controller.taps == [520] and controller.returns == 1
+    assert engine._app_label == "Деньги"
+    assert first.app_label == "Деньги"
+
+
+@pytest.mark.asyncio
+async def test_springboard_without_alert_relaunches_the_app(tmp_path, monkeypatch):
+    # Return did not bring the app back (it crashed / went home): relaunch.
+    monkeypatch.setattr("explorer.engine.asyncio.sleep", _no_sleep)
+    controller = _LaunchAlertsController()
+    controller.tree = _app(" ")
+
+    async def press_return_noop():
+        controller.returns += 1
+        return True
+
+    controller.press_return = press_return_noop
+    engine = _popup_engine(tmp_path, controller)
+
+    await engine._dismiss_system_popup()
+
+    assert controller.returns == 1
+    assert controller.launches == 1
+
+
+@pytest.mark.asyncio
+async def test_tree_without_application_root_is_not_springboard(tmp_path, monkeypatch):
+    # A tree with no Application element says nothing about SpringBoard;
+    # treating it as one relaunched the app on every step.
+    monkeypatch.setattr("explorer.engine.asyncio.sleep", _no_sleep)
+    controller = _LaunchAlertsController()
+    controller.tree = [_button("Зайти", 500)]
+    engine = _popup_engine(tmp_path, controller)
+
+    await engine._dismiss_system_popup()
+
+    assert controller.returns == 0 and controller.launches == 0
+
+
+def _keypad_tree(label: str = "Деньги") -> list[dict]:
+    """aweassist's PIN screen: ten digit buttons with ids 0–9, no submit."""
+    digits = [
+        {"type": "Button", "label": d, "value": None, "identifier": d, "test_id": d,
+         "enabled": True, "frame": {"x": 45 + 114 * ((int(d) - 1) % 3 if d != "0" else 1),
+                                    "y": 334 + 100 * ((int(d) - 1) // 3 if d != "0" else 3),
+                                    "width": 85, "height": 85}, "children": []}
+        for d in "0123456789"
+    ]
+    return _app(label, *digits, _button("Забыли код?", 650))
+
+
+@dataclass
+class _KeypadController(_SwitchController):
+    """Accepts the PIN after the 4th digit; any other code is rejected."""
+
+    pin: str = "1234"
+    typed: str = ""
+
+    def __post_init__(self):
+        self.tree = _keypad_tree()
+
+    async def tap_by_id(self, test_id: str) -> _Result:
+        self.taps_by_id.append(test_id)
+        self.typed += test_id
+        if len(self.typed) == 4:
+            if self.typed == self.pin:
+                self.tree = _app("Деньги", _button("Главная", 200))
+            self.typed = ""
+        return _Result()
+
+
+def _keypad_engine(tmp_path, controller, test_data) -> ExplorationEngine:
+    engine = ExplorationEngine(
+        controller=controller, app_bundle_id="com.aweassist.app",
+        output_dir=str(tmp_path), mode=ExplorationMode.MC,
+        test_data=test_data, forbidden=["Забыли код?"],
+    )
+    engine._app_label = "Деньги"
+    return engine
+
+
+@pytest.mark.asyncio
+async def test_keypad_digits_are_never_explored_one_by_one(tmp_path):
+    engine = _keypad_engine(tmp_path, _KeypadController(), test_data={})
+
+    node = await engine._capture_screen()
+
+    assert node.screen_id in engine._keypad_screens
+    assert node.interactive_elements == []  # digits hidden, «Забыли код?» forbidden
+
+
+@pytest.mark.asyncio
+async def test_pin_from_test_data_is_entered_as_one_action(tmp_path, monkeypatch):
+    monkeypatch.setattr("explorer.engine.asyncio.sleep", _no_sleep)
+    controller = _KeypadController()
+    engine = _keypad_engine(tmp_path, controller, test_data={"pin": "1234"})
+    node = await engine._capture_screen()
+    engine.graph.add_node(node)
+    engine.current_screen_id = node.screen_id
+
+    assert await engine._enter_pin_here(step=1)
+
+    assert controller.taps_by_id == list("1234")
+    landed = engine.graph.nodes[engine.current_screen_id]
+    assert [el.label for el in landed.interactive_elements] == ["Главная"]
+    (edge,) = [e for e in engine.graph.edges if e.source_screen_id == node.screen_id]
+    assert edge.action.target_label == "PIN" and edge.action.input_text == "***"
+
+
+@pytest.mark.asyncio
+async def test_wrong_pin_stops_after_failure_budget(tmp_path, monkeypatch):
+    monkeypatch.setattr("explorer.engine.asyncio.sleep", _no_sleep)
+    controller = _KeypadController()
+    engine = _keypad_engine(tmp_path, controller, test_data={"pin": "9999"})
+    node = await engine._capture_screen()
+    engine.graph.add_node(node)
+    engine.current_screen_id = node.screen_id
+
+    assert await engine._enter_pin_here(step=1)       # 1st rejection: may retry
+    assert not await engine._enter_pin_here(step=2)   # 2nd: budget spent
+    assert not await engine._enter_pin_here(step=3)   # never types again
+    assert len(controller.taps_by_id) == 8
 
 
 @dataclass

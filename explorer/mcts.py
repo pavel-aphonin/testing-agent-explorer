@@ -109,6 +109,24 @@ class PUCTSelector:
 
         self._states[state_id] = ss
 
+    def scale_priors(self, matches, factor: float) -> None:
+        """Multiply the prior of every action ``matches(action_id)`` accepts,
+        in every known state, by ``factor``; renormalize each touched state.
+
+        For priors that depend on global knowledge learned mid-run — e.g. a
+        tab bar item stops being interesting everywhere once it was tapped.
+        """
+        for ss in self._states.values():
+            hit = [a for aid, a in ss.actions.items() if matches(aid)]
+            if not hit:
+                continue
+            for a in hit:
+                a.prior *= factor
+            total = sum(a.prior for a in ss.actions.values())
+            if total > 0:
+                for a in ss.actions.values():
+                    a.prior /= total
+
     def add_action_if_missing(self, state_id: str, action_id: str) -> None:
         """Late-arriving action discovery (e.g., element appeared after a tap).
 

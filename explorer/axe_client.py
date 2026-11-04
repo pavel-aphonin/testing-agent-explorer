@@ -334,6 +334,26 @@ _TYPE_ATTEMPTS = 3
 # Extra wait after the keyboard is up: when moving between fields the
 # keyboard is already visible, but focus has not moved yet.
 _FOCUS_SETTLE_S = 0.8
+# Scrolling elements into view (see AXeExplorerClient.scroll_into_view).
+# Margins keep taps off the navigation bar and the tab bar; a slow swipe
+# avoids flinging the content past the target.
+_SCROLL_TOP_MARGIN = 120
+_SCROLL_BOTTOM_MARGIN = 110
+_SCROLL_BOTTOM_MARGIN_NO_TAB_BAR = 40
+_MAX_SCROLL_SWIPES = 8
+_SCROLL_SWIPE_DURATION_S = "0.6"
+_SCROLL_SETTLE_S = 0.8
+_MIN_SCROLL_SWIPE_PT = 60
+# A swipe that moves the element less than this hit the end of the content.
+_SCROLL_NO_MOVE_PT = 4
+_TAB_BAR_TYPES = frozenset({"RadioButton", "Tab"})
+
+# Navigation-bar back buttons (see AXeExplorerClient.go_back): UIKit and
+# SwiftUI use the BackButton id with the previous screen's title as label.
+_BACK_IDS = frozenset({"BackButton", "backButton"})
+_BACK_LABELS = frozenset({"Назад", "Back"})
+_BACK_BUTTON_MAX_Y = 200
+
 # Verified switch taps (see AXeExplorerClient.tap_switch). A permission
 # prompt can take ~1 s to replace the app in the AX tree.
 _SWITCH_ATTEMPTS = 3
@@ -342,6 +362,7 @@ _SWITCH_SETTLE_S = 1.2
 _HID_LEFT_GUI = "227"
 _HID_KEY_A = "4"
 _HID_KEY_BACKSPACE = "42"
+_HID_KEY_RETURN = "40"
 
 
 # Simulator degradation over long runs (testbed runs 1–3): every axe
@@ -437,6 +458,9 @@ class AXeExplorerClient:
         # Map element_uid -> test_id, used to translate clicks to CDP text input
         self._last_focused_test_id: str | None = None
         self._last_focused_label: str | None = None
+        # Whether the last tree read showed an unobscured tab bar (see
+        # _bottom_margin). Assume one until the first read.
+        self._tab_bar_visible = True
 
     async def connect(self, udid: str) -> None:
         self._udid = udid
@@ -929,6 +953,11 @@ class AXeExplorerClient:
             raw = json.loads(stdout)
             elements = []
             self._flatten(raw if isinstance(raw, list) else [raw], elements)
+            self._tab_bar_visible = any(
+                el["type"] in _TAB_BAR_TYPES and not el.get("obscured")
+                and self.is_on_screen(el.get("frame"))
+                for el in elements
+            )
             return elements
         except json.JSONDecodeError as e:
             logger.warning(f"AXe JSON parse error: {e}")
@@ -1118,14 +1147,152 @@ class AXeExplorerClient:
         ])
         return True  # OK even if not running
 
+    def is_on_screen(self, frame: dict | None) -> bool:
+        """Center of ``frame`` inside the screen. Navigation-bar and tab-bar
+        items sit in the margins and are on screen (testbed run 11: treating
+        the margins as off screen skipped every «Назад», «Отмена» and
+        «Сохранить»)."""
+        if not frame or not self._height:
+            return True
+        cx = frame.get("x", 0) + frame.get("width", 0) / 2
+        cy = frame.get("y", 0) + frame.get("height", 0) / 2
+        return 0 <= cx <= self._width and 0 <= cy <= self._height
+
+    def needs_scroll(self, element_type: str | None, frame: dict | None) -> bool:
+        """True when tapping ``frame`` as captured would miss: off screen,
+        or content under the tab bar."""
+        if not frame or not self._height:
+            return False
+        if not self.is_on_screen(frame):
+            return True
+        cy = frame.get("y", 0) + frame.get("height", 0) / 2
+        return cy > self._height - self._bottom_margin() and element_type not in _TAB_BAR_TYPES
+
+    def _bottom_margin(self) -> int:
+        """Room to keep free at the bottom: the tab bar when one is visible
+        (as of the last tree read), else just the home indicator. Without a
+        tab bar — a sheet or alert covering it — bottom items are fine
+        (aweassist run 2 skipped «Сделать фото» and profile rows)."""
+        return _SCROLL_BOTTOM_MARGIN if self._tab_bar_visible else _SCROLL_BOTTOM_MARGIN_NO_TAB_BAR
+
+    def _in_scroll_band(self, frame: dict) -> bool:
+        """Where a scrolled element must land: clear of the navigation bar
+        and the tab bar, which would take the tap otherwise."""
+        cy = frame.get("y", 0) + frame.get("height", 0) / 2
+        return _SCROLL_TOP_MARGIN <= cy <= self._height - self._bottom_margin()
+
+    async def scroll_into_view(
+        self, element_type: str | None, label: str | None, test_id: str | None, frame: dict,
+    ) -> dict | None:
+        """Scroll until the element is on screen; return its new frame.
+
+        The AX tree lists a whole long screen, including what lies below the
+        fold (aweassist run 1: 480 of 978 actions off screen). Tapping those
+        coordinates hits nothing or the tab bar. Elements are re-found after
+        every swipe by type/label/id and their ordinal among identical ones
+        (cards repeat labels like «Кэшбэк 10%»). None when the element
+        cannot be brought on screen (e.g. it sits off to the side in a
+        horizontal carousel).
+        """
+        if frame.get("x", 0) + frame.get("width", 0) / 2 > self._width:
+            return None
+
+        def same(el: dict) -> bool:
+            return (
+                (element_type is None or el.get("type") == element_type)
+                and (el.get("label") or None) == (label or None)
+                # ElementSnapshot falls back to the label when there is no
+                # accessibility id (analyzer.classify_element).
+                and (el.get("test_id") or el.get("label") or None) == (test_id or None)
+                and not el.get("obscured")
+            )
+
+        elements = [el for el in await self.get_ui_elements() if same(el)]
+        if not elements:
+            return None
+        elements.sort(key=lambda el: (el.get("frame") or {}).get("y", 0))
+        ordinal = min(
+            range(len(elements)),
+            key=lambda i: abs((elements[i].get("frame") or {}).get("y", 0) - frame.get("y", 0)),
+        )
+        x = self._width // 2
+        top, bottom = _SCROLL_TOP_MARGIN, self._height - self._bottom_margin()
+        for attempt in range(_MAX_SCROLL_SWIPES):
+            current = (elements[ordinal].get("frame") or {}) if ordinal < len(elements) else None
+            if current is None:
+                return None
+            if self._in_scroll_band(current):
+                return current
+            # Bar items live in the margins and are tapped where they are:
+            # the navigation bar at the top, the tab bar's own items at the
+            # bottom. Content near the bottom edge is under the tab bar, so
+            # it gets scrolled into the band like anything off screen.
+            cy = current.get("y", 0) + current.get("height", 0) / 2
+            if attempt == 0 and self.is_on_screen(current) and (
+                cy < top or element_type in _TAB_BAR_TYPES
+            ):
+                return current
+            # Swipe just far enough to bring the element to the middle of the
+            # band. A fixed swipe of more than half a screen overshot short
+            # distances and bounced the content up and down (aweassist run 3,
+            # profile rows). Positive ``needed``: move content up.
+            needed = cy - (top + bottom) / 2
+            dist = min(max(abs(needed), _MIN_SCROLL_SWIPE_PT), bottom - top - 80)
+            start = bottom - 40 if needed > 0 else top + 40
+            end = start - dist if needed > 0 else start + dist
+            await _run([
+                AXE, "swipe", "--start-x", str(x), "--start-y", str(int(start)),
+                "--end-x", str(x), "--end-y", str(int(end)),
+                "--duration", _SCROLL_SWIPE_DURATION_S, "--udid", self._udid,
+            ])
+            await asyncio.sleep(_SCROLL_SETTLE_S)
+            elements = sorted(
+                (el for el in await self.get_ui_elements() if same(el)),
+                key=lambda el: (el.get("frame") or {}).get("y", 0),
+            )
+            moved = (elements[ordinal].get("frame") or {}) if ordinal < len(elements) else None
+            if moved is None:
+                return None
+            if abs(moved.get("y", 0) - current.get("y", 0)) < _SCROLL_NO_MOVE_PT:
+                # The content cannot scroll any further this way: tap the
+                # element where it is if it is on screen at all, instead of
+                # spending the remaining swipes on nothing.
+                return moved if self.is_on_screen(moved) else None
+        return None
+
     async def go_back(self) -> bool:
-        """iOS back: swipe from left edge."""
+        """iOS back: tap the visible back button, else swipe from the left edge.
+
+        Many real screens disable the edge-swipe gesture (aweassist run 1:
+        11 screens where five swipes did nothing and the app was relaunched),
+        but nearly all show a back button in the navigation bar.
+        """
+        for el in await self.get_ui_elements():
+            frame = el.get("frame") or {}
+            if (
+                el.get("type") == "Button"
+                and not el.get("obscured")
+                and (el.get("test_id") in _BACK_IDS or (el.get("label") or "").strip() in _BACK_LABELS)
+                and 0 <= frame.get("y", -1) < _BACK_BUTTON_MAX_Y
+            ):
+                await self.tap_at(
+                    int(frame.get("x", 0) + frame.get("width", 0) / 2),
+                    int(frame.get("y", 0) + frame.get("height", 0) / 2),
+                )
+                return True
         code, _, _ = await _run([
             AXE, "swipe",
             "--start-x", "0", "--start-y", str(self._height // 2),
             "--end-x", str(self._width // 2), "--end-y", str(self._height // 2),
             "--udid", self._udid,
         ])
+        return code == 0
+
+    async def press_return(self) -> bool:
+        """Hardware Return key. Confirms the default button of SpringBoard
+        alerts that are missing from the AX tree (aweassist's «You have
+        changed the icon» alert has no elements at all)."""
+        code, _, _ = await _run([AXE, "key", _HID_KEY_RETURN, "--udid", self._udid])
         return code == 0
 
     async def press_enter(self) -> bool:

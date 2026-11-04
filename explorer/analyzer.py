@@ -21,6 +21,9 @@ IOS_TYPE_MAP: dict[str, ElementKind] = {
     "Link": ElementKind.LINK,
     "Cell": ElementKind.BUTTON,  # table/collection cells are tappable
     "Tab": ElementKind.BUTTON,
+    # iOS 27 tab bar items (aweassist: «Главный / Платежи / Выгода /
+    # История / Чаты»). Unmapped, the whole bottom menu was invisible.
+    "RadioButton": ElementKind.BUTTON,
     "GenericElement": ElementKind.BUTTON,  # RN TouchableOpacity without accessibilityRole
 }
 

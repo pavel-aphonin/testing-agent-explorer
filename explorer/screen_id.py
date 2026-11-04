@@ -27,7 +27,7 @@ import re
 # Element types that represent STRUCTURE (included in hash)
 STRUCTURAL_TYPES = {
     "Button", "TextField", "SecureTextField", "Switch", "CheckBox", "Slider",
-    "Tab", "TabBar", "SegmentedControl",
+    "Tab", "TabBar", "SegmentedControl", "RadioButton",
     "NavigationBar", "Toolbar",
     "Cell", "Link",
     "GenericElement",  # React Native renders buttons as GenericElement
@@ -95,7 +95,15 @@ def _is_in_status_bar(element: dict) -> bool:
     return y + h <= _STATUS_BAR_HEIGHT
 
 
-def _normalize_label(label: str) -> str:
+# A run of digits, with the group/decimal separators used in amounts.
+_NUMBER_RE = re.compile(r"\d(?:[\d\s   .,]*\d)?")
+
+# Scroll indicators: their label carries the content length («Vertical
+# scroll bar, 2 pages»), which changes as lists load or grow.
+_SCROLL_BAR_RE = re.compile(r"scroll bar|полоса прокрутки", re.IGNORECASE)
+
+
+def normalize_label(label: str) -> str:
     """If ``label`` matches one of the dynamic patterns, replace it
     with a placeholder that's stable across ticks. Otherwise return
     as-is. This keeps the *identity* of a "clock" or "battery" button
@@ -105,7 +113,11 @@ def _normalize_label(label: str) -> str:
     for pat in _DYNAMIC_LABEL_PATTERNS:
         if pat.match(label):
             return "<dynamic>"
-    return label
+    # Numbers inside labels are content, not structure: balances
+    # («Общий баланс, 787 ₽»), rates («14,51 %»), counters («Остались 24
+    # поездки»), dates. Left in, every refresh of the data forks the screen
+    # (aweassist run 2: «Счета» seen as three different screens).
+    return _NUMBER_RE.sub("#", label)
 
 
 def compute_screen_id(elements: list[dict]) -> str:
@@ -135,6 +147,8 @@ def compute_screen_id(elements: list[dict]) -> str:
         # Only include structural elements
         if el_type in SKIP_TYPES:
             continue
+        if el_type == "Slider" and _SCROLL_BAR_RE.search(el.get("label", "") or ""):
+            continue
         if el_type not in STRUCTURAL_TYPES:
             # Unknown type — include it to be safe but without label
             # (so dynamic labels don't change the hash)
@@ -147,7 +161,7 @@ def compute_screen_id(elements: list[dict]) -> str:
 
         # For structural elements: use type + (normalised) label.
         el_label = el.get("label", "") or ""
-        fingerprint_parts.append((el_type, _normalize_label(el_label)))
+        fingerprint_parts.append((el_type, normalize_label(el_label)))
 
     fingerprint_parts.sort()
     canonical = json.dumps(fingerprint_parts, sort_keys=True, separators=(",", ":"))

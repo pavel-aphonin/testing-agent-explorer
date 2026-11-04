@@ -35,6 +35,9 @@ def explore(
     mode: str = typer.Option("axe", "--mode", help="Client mode: axe (default, best for RN), native (Appium, native apps only), vision (LLM, universal)"),
     model: str = typer.Option("qwen3-vl-32b-instruct-mlx", "--model", "-m", help="Vision model (for --mode vision)"),
     test_data: str | None = typer.Option(None, "--test-data", help="JSON file of form values, e.g. {\"email\": ..., \"password\": ...}"),
+    max_steps: int = typer.Option(200, "--max-steps", help="Step budget for the exploration"),
+    allow_system_ui: bool = typer.Option(False, "--allow-system-ui", help="Also tap actions that open system UI outside the app (photo picker, camera, share sheet)"),
+    forbid: list[str] = typer.Option([], "--forbid", help="Label or accessibility id the agent must never act on (repeatable), e.g. an app's debug environment switcher"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose logging"),
 ):
     """Explore an app and build its state machine graph."""
@@ -42,11 +45,11 @@ def explore(
     data = _load_test_data(test_data)
 
     if mode == "axe":
-        asyncio.run(_explore_axe(bundle_id, device_id, output, resume, data))
+        asyncio.run(_explore_axe(bundle_id, device_id, output, resume, data, forbid, max_steps, not allow_system_ui))
     elif mode == "native":
-        asyncio.run(_explore_native(bundle_id, device_id, output, resume, data))
+        asyncio.run(_explore_native(bundle_id, device_id, output, resume, data, forbid, max_steps, not allow_system_ui))
     elif mode == "vision":
-        asyncio.run(_explore_vision(bundle_id, device_id, output, resume, model, data))
+        asyncio.run(_explore_vision(bundle_id, device_id, output, resume, model, data, forbid, max_steps, not allow_system_ui))
     else:
         print(f"Unknown mode: {mode}. Use: axe, native, vision")
         raise typer.Exit(1)
@@ -66,7 +69,7 @@ def _load_test_data(path: str | None) -> dict[str, str]:
     return {str(k): str(v) for k, v in data.items()}
 
 
-async def _explore_axe(bundle_id, device_id, output, resume, test_data):
+async def _explore_axe(bundle_id, device_id, output, resume, test_data, forbidden, max_steps, system_ui_guard):
     """Explore using AXe CLI + idb. Works with RN and native apps."""
     from explorer.axe_client import AXeExplorerClient
     from explorer.engine import ExplorationEngine
@@ -81,6 +84,7 @@ async def _explore_axe(bundle_id, device_id, output, resume, test_data):
         engine = ExplorationEngine(
             controller=client, app_bundle_id=bundle_id,
             output_dir=output, resume_from=resume, test_data=test_data,
+            forbidden=forbidden, max_steps=max_steps, system_ui_guard=system_ui_guard,
         )
         graph = await engine.run()
 
@@ -90,7 +94,7 @@ async def _explore_axe(bundle_id, device_id, output, resume, test_data):
         await client.disconnect()
 
 
-async def _explore_native(bundle_id, device_id, output, resume, test_data):
+async def _explore_native(bundle_id, device_id, output, resume, test_data, forbidden, max_steps, system_ui_guard):
     """Explore using Appium + XCUITest. Native apps only."""
     from explorer.appium_client import AppiumExplorerClient
     from explorer.engine import ExplorationEngine
@@ -105,6 +109,7 @@ async def _explore_native(bundle_id, device_id, output, resume, test_data):
         engine = ExplorationEngine(
             controller=client, app_bundle_id=bundle_id,
             output_dir=output, resume_from=resume, test_data=test_data,
+            forbidden=forbidden, max_steps=max_steps, system_ui_guard=system_ui_guard,
         )
         graph = await engine.run()
 
@@ -114,7 +119,7 @@ async def _explore_native(bundle_id, device_id, output, resume, test_data):
         await client.stop_session()
 
 
-async def _explore_vision(bundle_id, device_id, output, resume, model, test_data):
+async def _explore_vision(bundle_id, device_id, output, resume, model, test_data, forbidden, max_steps, system_ui_guard):
     """Explore using idb + vision LLM. Universal fallback."""
     from explorer.engine import ExplorationEngine
     from explorer.vision_client import VisionExplorerClient
@@ -129,6 +134,7 @@ async def _explore_vision(bundle_id, device_id, output, resume, model, test_data
         engine = ExplorationEngine(
             controller=client, app_bundle_id=bundle_id,
             output_dir=output, resume_from=resume, test_data=test_data,
+            forbidden=forbidden, max_steps=max_steps, system_ui_guard=system_ui_guard,
         )
         graph = await engine.run()
 

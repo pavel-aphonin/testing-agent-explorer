@@ -16,6 +16,9 @@ SETTLE_DELAY = 1.5
 LAUNCH_DELAY = 3.0
 BACK_DELAY = 1.0
 MAX_BACK_ATTEMPTS = 5
+# Consecutive back presses that leave the screen unchanged before giving
+# up on back navigation for this trip.
+MAX_BACK_STALLS = 2
 
 
 async def go_back_to_screen(
@@ -41,6 +44,8 @@ async def go_back_to_screen(
         return current_screen_id
 
     # Strategy 1: Try back button
+    here = current_screen_id
+    stalled = 0
     for attempt in range(MAX_BACK_ATTEMPTS):
         logger.info(f"Back attempt {attempt + 1}/{MAX_BACK_ATTEMPTS}")
         try:
@@ -51,6 +56,16 @@ async def go_back_to_screen(
         await asyncio.sleep(BACK_DELAY)
 
         new_screen_id, _ = await capture_fn()
+        # Back that does not move us will not start working on the next
+        # try (aweassist run 1: five ~10 s attempts before every relaunch).
+        if new_screen_id == here:
+            stalled += 1
+            if stalled >= MAX_BACK_STALLS:
+                logger.info("Back does not leave this screen; relaunching")
+                break
+        else:
+            stalled = 0
+        here = new_screen_id
         if new_screen_id == target_screen_id:
             logger.info(f"Reached target screen via back button")
             return new_screen_id
@@ -67,6 +82,8 @@ async def go_back_to_screen(
                 result = await replay_path(controller, path, capture_fn, replay_input)
                 if result == target_screen_id:
                     return result
+                if result:
+                    here = result
 
     # Strategy 2: Relaunch app + replay
     logger.info("Back button failed, relaunching app")
@@ -141,6 +158,20 @@ async def replay_action(controller, action: ActionDetail) -> bool:
     try:
         match action.action_type:
             case "tap":
+                scroll = getattr(controller, "scroll_into_view", None)
+                if action.target_frame and scroll:
+                    # The recorded frame may be below the fold or stale
+                    # (the screen was scrolled when it was recorded).
+                    frame = await scroll(
+                        None, action.target_label, action.target_test_id, action.target_frame,
+                    )
+                    if frame is None:
+                        return False
+                    result = await controller.tap_at(
+                        int(frame.get("x", 0) + frame.get("width", 0) / 2),
+                        int(frame.get("y", 0) + frame.get("height", 0) / 2),
+                    )
+                    return result.error is None
                 if action.target_frame:
                     x = int(
                         action.target_frame.get("x", 0)
