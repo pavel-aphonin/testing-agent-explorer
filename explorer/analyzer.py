@@ -1,7 +1,7 @@
 """Element classification: convert raw accessibility elements to typed snapshots."""
 
 from explorer.models import ElementKind, ElementSnapshot, ScreenNode
-from explorer.screen_id import KEYBOARD_TYPES, SKIP_TYPES, compute_screen_id
+from explorer.screen_id import KEYBOARD_TYPES, SKIP_TYPES, compute_screen_id, normalize_label
 
 # Mapping from iOS accessibility types to ElementKind
 IOS_TYPE_MAP: dict[str, ElementKind] = {
@@ -79,6 +79,96 @@ def classify_element(raw: dict) -> ElementSnapshot:
     )
 
 
+# Tab bar items; RadioButton is how iOS 27 reports them.
+TAB_BAR_TYPES = frozenset({"RadioButton", "Tab"})
+
+# Pushed screens show a back button; see _name_from_content.
+_BACK_IDS = {"BackButton", "backButton"}
+_BACK_LABELS = {"Назад", "Back"}
+_TITLE_TOP_Y, _TITLE_BOTTOM_Y = 50, 320
+_TITLE_MAX_LEN = 40
+
+
+# Action overlap above which two nodes can be one screen (see is_variant).
+VARIANT_JACCARD = 0.85
+# Below this many actions a card more or less is a different screen.
+MIN_VARIANT_ACTIONS = 5
+
+
+def _has_back(node: ScreenNode) -> bool:
+    return any(
+        s.test_id in _BACK_IDS or (s.label or "").strip() in _BACK_LABELS
+        for s in node.interactive_elements
+    )
+
+
+def _title(node: ScreenNode) -> str | None:
+    return next((s.label for s in node.elements if s.element_type == "Heading" and s.label), None)
+
+
+def action_key(element: ElementSnapshot) -> tuple[str, str]:
+    return element.element_type, normalize_label(element.label or "")
+
+
+def _content_actions(node: ScreenNode) -> set[tuple[str, str]]:
+    """The screen's own labelled actions; the tab bar is on every screen."""
+    return {
+        action_key(s) for s in node.interactive_elements
+        if s.element_type not in TAB_BAR_TYPES and (s.label or "").strip()
+    }
+
+
+def is_variant(a: ScreenNode, b: ScreenNode) -> bool:
+    """Two fingerprints of one screen: a card more, a banner, a title that
+    collapsed on scroll, an error with a «reload» button.
+
+    Overlap alone is not enough. The expanded panel on aweassist's main
+    screen shares 97 of 101 actions with it, because what it covers stays
+    in the tree; its back button is what gives it away. Two sheets can
+    offer the same buttons under different titles.
+    """
+    ka, kb = _content_actions(a), _content_actions(b)
+    if min(len(ka), len(kb)) < MIN_VARIANT_ACTIONS or _has_back(a) != _has_back(b):
+        return False
+    ta, tb = _title(a), _title(b)
+    if ta and tb and ta != tb:
+        return False
+    return len(ka & kb) / len(ka | kb) >= VARIANT_JACCARD
+
+
+def _name_from_content(snapshots: list[ElementSnapshot]) -> str | None:
+    """A readable name for a screen with no Heading.
+
+    Without one, aweassist named 24 of 66 screens after the app («Деньги»).
+    A pushed screen (it has a back button) is named by the first text below
+    the navigation bar, skipping amounts, dates and button captions. A root
+    screen is named by its selected tab, the topmost one when a segmented
+    control sits above the tab bar.
+    """
+    has_back = any(
+        s.test_id in _BACK_IDS or (s.label or "").strip() in _BACK_LABELS for s in snapshots
+    )
+    if has_back:
+        controls = {s.label for s in snapshots if s.element_type == "Button"}
+        texts = [
+            s for s in snapshots
+            if s.element_type in ("StaticText", "GenericElement") and s.label and s.frame
+            and _TITLE_TOP_Y <= s.frame.get("y", 0) <= _TITLE_BOTTOM_Y
+            and s.label not in controls
+            and len(s.label) <= _TITLE_MAX_LEN
+            and not any(ch.isdigit() for ch in s.label)
+        ]
+        if texts:
+            return min(texts, key=lambda s: s.frame.get("y", 0)).label
+    selected = [
+        s for s in snapshots
+        if s.element_type == "RadioButton" and s.value == "1" and s.label and s.frame
+    ]
+    if selected:
+        return min(selected, key=lambda s: s.frame.get("y", 0)).label
+    return None
+
+
 def analyze_screen(
     elements: list[dict],
     screenshot_b64: str | None = None,
@@ -127,6 +217,8 @@ def analyze_screen(
                     name = next_el["label"]
                     break
     if not name:
+        name = _name_from_content(all_snapshots) or ""
+    if not name:
         # Fallback chain: app label → bundle-id-derived → generic.
         # We never want a raw hex hash to leak into the UI as the screen
         # name (Pavel's feedback: "Обнаружил «4f53cda1»" is unreadable).
@@ -162,4 +254,5 @@ def analyze_screen(
         interactive_elements=interactive,
         screenshot_b64=screenshot_b64,
         app_label=app_label,
+        is_modal=any(el.get("obscured") for el in elements),
     )

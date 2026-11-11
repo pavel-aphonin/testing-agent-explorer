@@ -58,6 +58,7 @@ class ScreenNode(BaseModel):
     first_seen: datetime = Field(default_factory=datetime.now)
     visit_count: int = 0
     app_label: str | None = None  # Application element's label
+    is_modal: bool = False  # a sheet or alert covers the rest of the screen
 
 
 class ActionType(StrEnum):
@@ -97,6 +98,12 @@ class ActionDetail(BaseModel):
         return "|".join(parts)
 
 
+# Note on the edges that close a written-off screen's actions: bookkeeping
+# for "nothing left here", not taps.
+WRITTEN_OFF_NOTE = "Written off untried"
+UNREACHABLE_NOTE = "Below the end of scrolling"
+
+
 class GraphEdge(BaseModel):
     """A directed transition between two screen states."""
 
@@ -130,6 +137,19 @@ class AppGraph(BaseModel):
     def add_edge(self, edge: GraphEdge) -> None:
         self.edges.append(edge)
         self.total_actions += 1
+
+    @property
+    def written_off_count(self) -> int:
+        return sum(e.notes == WRITTEN_OFF_NOTE for e in self.edges)
+
+    @property
+    def unreachable_count(self) -> int:
+        return sum(e.notes == UNREACHABLE_NOTE for e in self.edges)
+
+    @property
+    def transition_count(self) -> int:
+        """Edges that stand for an action actually performed."""
+        return len(self.edges) - self.written_off_count
 
     def get_explored_action_signatures(self, screen_id: str) -> set[str]:
         """Return set of action signatures already explored from this screen."""
@@ -192,6 +212,15 @@ class AppGraph(BaseModel):
                 adj[e.source_screen_id] = []
             adj[e.source_screen_id].append((e, e.target_screen_id))
 
+        # Closing a modal returns to whatever opened it, and one modal can
+        # open from several screens: «sheet → history» is no way to get
+        # from «benefits» to «history». Only a modal we are on can be left.
+        opened = {(e.source_screen_id, e.target_screen_id) for e in self.edges}
+
+        def closes_modal(source: str, target: str) -> bool:
+            node = self.nodes.get(source)
+            return source != from_id and node is not None and node.is_modal and (target, source) in opened
+
         visited = {from_id}
         queue: deque[tuple[str, list[GraphEdge]]] = deque()
         queue.append((from_id, []))
@@ -199,7 +228,7 @@ class AppGraph(BaseModel):
         while queue:
             current, path = queue.popleft()
             for edge, target in adj.get(current, []):
-                if target in visited:
+                if target in visited or closes_modal(current, target):
                     continue
                 new_path = path + [edge]
                 if target == to_id:

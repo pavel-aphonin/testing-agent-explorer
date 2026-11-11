@@ -39,6 +39,9 @@ STRUCTURAL_TYPES = {
 # number of rows still counts.
 LABEL_FREE_TYPES = {"Cell"}
 
+# Text that tells one modal from another (see compute_screen_id).
+MODAL_TEXT_TYPES = {"StaticText", "Heading"}
+
 # Element types to ALWAYS skip (dynamic/decorative)
 # Backward compat: analyzer.py imports this name
 KEYBOARD_TYPES = {"Key", "Keyboard", "KeyboardKey"}
@@ -133,15 +136,26 @@ def compute_screen_id(elements: list[dict]) -> str:
     - status-bar elements (clock, battery, signal — PER-24)
     - labels that look like clocks or percentages (PER-24)
 
+    Under a modal only the modal counts: one sheet above five tabs is one
+    screen (aweassist run 4: «Голосовой ввод недоступен» was 11 nodes). Its
+    text counts too, or every «Отмена / Да» alert would be the same screen.
+
     Returns a 16-char hex string.
     """
     fingerprint_parts: list[tuple[str, str]] = []
+    modal = any(el.get("obscured") for el in elements)
     for el in elements:
         el_type = el.get("type", "")
 
         # Status-bar zone is dynamic by construction — clocks tick,
         # battery drains, notification badges flip on and off.
         if _is_in_status_bar(el):
+            continue
+
+        if el.get("obscured"):
+            continue
+        if modal and el_type in MODAL_TEXT_TYPES:
+            fingerprint_parts.append((el_type, normalize_label(el.get("label", "") or "")))
             continue
 
         # Only include structural elements

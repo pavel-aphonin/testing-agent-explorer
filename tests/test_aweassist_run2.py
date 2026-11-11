@@ -14,6 +14,7 @@ import json
 import pytest
 
 from explorer import axe_client
+from explorer.analyzer import analyze_screen
 from explorer.axe_client import AXeExplorerClient
 from explorer.engine import ExplorationEngine
 from explorer.models import ElementKind, ElementSnapshot, ScreenNode
@@ -249,3 +250,47 @@ async def test_tab_bar_visibility_is_read_from_the_tree(monkeypatch, covered):
     await client.get_ui_elements()
 
     assert client._tab_bar_visible is (not covered)
+
+
+def _raw(type_, label, y, value=None, test_id=""):
+    return {"type": type_, "label": label, "value": value, "test_id": test_id,
+            "enabled": True, "frame": {"x": 0, "y": y, "width": 402, "height": 40}}
+
+
+TAB_BAR = [_raw("RadioButton", "Главный", 800, value="1"), _raw("RadioButton", "Платежи", 800, value="0")]
+
+
+def test_root_screen_is_named_after_the_selected_tab():
+    node = analyze_screen([_raw("Application", "Деньги", 0), _raw("Button", "Поиск", 280), *TAB_BAR])
+
+    assert node.name == "Главный"
+
+
+def test_segmented_control_wins_over_the_tab_bar():
+    node = analyze_screen([
+        _raw("Application", "Деньги", 0), _raw("RadioButton", "Данные", 150, value="1"), *TAB_BAR,
+    ])
+
+    assert node.name == "Данные"
+
+
+def test_pushed_screen_is_named_by_its_first_meaningful_text():
+    node = analyze_screen([
+        _raw("Application", "Деньги", 0),
+        _raw("Button", "Назад", 62, test_id="backButton"),
+        _raw("Button", "Пополнить", 100),
+        _raw("StaticText", "Пополнить", 110),      # a button's caption
+        _raw("StaticText", "+1 437 ₽", 212),        # an amount
+        _raw("StaticText", "Пополнение", 257),
+        *TAB_BAR,
+    ])
+
+    assert node.name == "Пополнение"
+
+
+def test_heading_still_comes_first():
+    node = analyze_screen([
+        _raw("Application", "Деньги", 0), _raw("Heading", "Счета", 74), *TAB_BAR,
+    ])
+
+    assert node.name == "Счета"

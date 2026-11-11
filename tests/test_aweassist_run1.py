@@ -150,7 +150,7 @@ async def test_end_of_content_gives_up_on_off_screen_element(monkeypatch):
                                           {"x": 0, "y": 1500, "width": 402, "height": 60})
 
     assert frame is None
-    assert sum("swipe" in c for c in calls) == 1
+    assert sum("swipe" in c for c in calls) == 2  # one more, for a dropped swipe
 
 
 @pytest.mark.asyncio
@@ -164,17 +164,6 @@ async def test_scroll_into_view_keeps_the_ordinal_among_identical_labels(monkeyp
                                           {"x": 0, "y": 1400, "width": 402, "height": 60})
 
     assert frame["y"] == 500
-
-
-@pytest.mark.asyncio
-async def test_scroll_into_view_gives_up_on_horizontal_carousel_items(monkeypatch):
-    client, calls, _ = _client(monkeypatch, [[_el("GenericElement", "Ж/д", 300, x=900, width=120)]])
-
-    frame = await client.scroll_into_view("GenericElement", "Ж/д", "Ж/д",
-                                          {"x": 900, "y": 300, "width": 120, "height": 60})
-
-    assert frame is None
-    assert calls == []
 
 
 def test_bar_items_need_no_scroll_but_content_under_the_tab_bar_does(monkeypatch):

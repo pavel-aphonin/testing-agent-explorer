@@ -37,7 +37,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from explorer.analyzer import analyze_screen
+from explorer.analyzer import TAB_BAR_TYPES, action_key, analyze_screen, is_variant
 from explorer.form_filler import FormFiller
 from explorer.go_explore import GoExploreArchive
 from explorer.mcts import PUCTSelector
@@ -49,6 +49,8 @@ from explorer.models import (
     ElementSnapshot,
     GraphEdge,
     ScreenNode,
+    UNREACHABLE_NOTE,
+    WRITTEN_OFF_NOTE,
 )
 from explorer.modes import ExplorationMode, ModeConfig, get_mode_config
 from explorer.navigator import (
@@ -56,7 +58,7 @@ from explorer.navigator import (
     find_nearest_unexplored,
     go_back_to_screen,
 )
-from explorer.screen_id import compute_screen_id, normalize_label
+from explorer.screen_id import compute_screen_id
 
 logger = logging.getLogger("explorer.engine")
 
@@ -107,10 +109,6 @@ MAX_LAUNCH_ALERTS = 3
 # are written off (see _note_unreachable).
 MAX_NAV_FAILURES = 2
 
-# Action-set overlap above which two nodes count as one screen for
-# navigation (see _same_screen).
-SAME_SCREEN_JACCARD = 0.85
-
 # Type aliases for the optional engine callbacks.
 PriorProvider = Callable[[ScreenNode], "dict[str, float] | Awaitable[dict[str, float]]"]
 EventCallback = Callable[[dict], "None | Awaitable[None]"]
@@ -138,7 +136,6 @@ _SYSTEM_UI_TRIGGER_RE = re.compile(
 # been tapped it drops below ordinary actions everywhere (TAB_VISITED_WEIGHT):
 # with the boost kept, every screen inside a section re-tried all five tabs
 # first (aweassist run 3, steps 63–69: nothing but tab hops).
-TAB_BAR_TYPES = frozenset({"RadioButton", "Tab"})
 TAB_BAR_PRIOR_WEIGHT = 10.0
 TAB_VISITED_WEIGHT = 0.1
 
@@ -728,9 +725,13 @@ class ExplorationEngine:
         ):
             frame = await scroll(element.element_type, element.label, element.test_id, element.frame or {})
             self._scrolled_screens.add(before_screen)
+            stuck = getattr(self.controller, "scroll_stuck", False)
             if frame is None:
                 print(f"    ! Could not bring {element.label!r} on screen, skipping", flush=True)
                 self._record_self_loop(element, ActionType.TAP)
+            if stuck:
+                self._write_off_below(element, before_screen)
+            if frame is None:
                 return
             x = int(frame.get("x", 0) + frame.get("width", 0) / 2)
             y = int(frame.get("y", 0) + frame.get("height", 0) / 2)
@@ -1427,7 +1428,7 @@ class ExplorationEngine:
                     if not (el.element_type == "Button" and el.label in KEYPAD_DIGITS)
                 ]
             print(f"      [capture] Analyzed: {node.name!r}, {len(node.interactive_elements)} interactive ({t2-t0:.1f}s total)", flush=True)
-            return node
+            return self._merge_into_known_variant(node)
         except Exception as e:
             import traceback
             print(f"      [capture] ERROR: {e}", flush=True)
@@ -1451,6 +1452,7 @@ class ExplorationEngine:
         element: ElementSnapshot,
         action_type: ActionType,
         screen_id: str | None = None,
+        notes: str = "Action failed or did not change screen",
     ) -> None:
         """Record a self-loop edge (action that didn't change the screen)
         on ``screen_id``, the current screen by default."""
@@ -1468,33 +1470,36 @@ class ExplorationEngine:
             target_screen_id=screen_id,
             action=action,
             success=False,
-            notes="Action failed or did not change screen",
+            notes=notes,
         ))
 
     def _same_screen(self, a: str, b: str) -> bool:
-        """Two graph nodes that are variants of one screen: their actions
-        (type + label with numbers normalized) overlap by SAME_SCREEN_JACCARD.
-
-        A fingerprint must change when the structure changes, so transient
-        UI — an error banner with a «reload» button, one more card — gives
-        a new node. Navigation should still accept it as the target, or the
-        target looks unreachable (aweassist run 2: «Счета», 116 of 117
-        actions written off).
-        """
+        """Navigation accepts a variant of the target as the target."""
         na, nb = self.graph.nodes.get(a), self.graph.nodes.get(b)
-        if not na or not nb:
-            return False
+        return bool(na and nb and is_variant(na, nb))
 
-        def keys(node: ScreenNode) -> set[tuple[str, str]]:
-            return {
-                (el.element_type, normalize_label(el.label or ""))
-                for el in node.interactive_elements
-            }
+    def _merge_into_known_variant(self, node: ScreenNode) -> ScreenNode:
+        """A variant of a known screen is that screen, plus any new actions.
 
-        ka, kb = keys(na), keys(nb)
-        if not ka or not kb:
-            return False
-        return len(ka & kb) / len(ka | kb) >= SAME_SCREEN_JACCARD
+        A fingerprint must change when the structure does, so a card that
+        loaded late gives a new one. Left alone, each variant is explored
+        from scratch (aweassist run 4: «Поиск» tapped 12 times, 49 of 118
+        screens) and can be written off as unreachable.
+        """
+        if node.screen_id in self.graph.nodes:
+            return node
+        known = next((n for n in self.graph.nodes.values() if is_variant(node, n)), None)
+        if known is None:
+            return node
+        print(f"      [capture] Variant of {known.name!r} ({known.screen_id[:8]})", flush=True)
+        keys = {action_key(el) for el in known.interactive_elements}
+        for el in node.interactive_elements:
+            if action_key(el) not in keys:
+                known.interactive_elements.append(el)
+                self.puct.add_action_if_missing(known.screen_id, action_id_for(el))
+        # Stored frames are from another layout; look elements up live.
+        self._scrolled_screens.add(known.screen_id)
+        return known
 
     def _note_unreachable(self, screen_id: str, step: int) -> None:
         """Give up on a frontier screen after MAX_NAV_FAILURES failed trips.
@@ -1518,11 +1523,31 @@ class ExplorationEngine:
         # (aweassist run 2: four more 1–2 min trips after the write-off).
         self._update_archive_for(screen_id)
 
+    def _write_off_below(self, element: ElementSnapshot, screen_id: str) -> None:
+        """Scrolling ended above ``element``: what lies below it is out of
+        reach too, so one failed attempt settles them all. Actions with a
+        visible text of the same name stay: they are tapped by that text."""
+        node = self.graph.nodes[screen_id]
+        y = (element.frame or {}).get("y", 0)
+        visible = {
+            s.label for s in node.elements
+            if s.element_type == "StaticText" and self.controller.is_on_screen(s.frame)
+        }
+        below = [
+            el for el in self.graph.get_unexplored_actions(screen_id)
+            if (el.frame or {}).get("y", 0) >= y
+            and el.element_type not in TAB_BAR_TYPES
+            and el.label not in visible
+        ]
+        for el in below:
+            self._record_self_loop(el, ActionType.TAP, screen_id, notes=UNREACHABLE_NOTE)
+        print(f"    ! Scrolling ends above {element.label!r}: {len(below)} actions out of reach", flush=True)
+
     def _mark_screen_fully_explored(self, screen_id: str) -> None:
         """Mark all remaining elements on a screen as explored via self-loops."""
         unexplored = self.graph.get_unexplored_actions(screen_id)
         for el in unexplored:
-            self._record_self_loop(el, ActionType.TAP, screen_id)
+            self._record_self_loop(el, ActionType.TAP, screen_id, notes=WRITTEN_OFF_NOTE)
 
     def _screen_name(self) -> str:
         """Get the name of the current screen."""

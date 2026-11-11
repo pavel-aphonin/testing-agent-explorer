@@ -60,8 +60,9 @@ def generate_stats_report(graph: AppGraph) -> str:
         "=== App Explorer Report ===",
         f"App: {graph.app_bundle_id}",
         f"Screens discovered: {len(graph.nodes)}",
-        f"Transitions recorded: {len(graph.edges)}",
-        f"Total actions: {graph.total_actions}",
+        f"Transitions recorded: {graph.transition_count}",
+        f"Written off untried: {graph.written_off_count}",
+        f"Out of scroll reach: {graph.unreachable_count}",
         "",
         "--- Screens ---",
     ]
@@ -96,7 +97,7 @@ def export_all(graph: AppGraph, output_dir: str | Path) -> None:
 
     # JSON graph
     graph.save(out / "graph.json")
-    print(f"  graph.json saved ({len(graph.nodes)} screens, {len(graph.edges)} edges)")
+    print(f"  graph.json saved ({len(graph.nodes)} screens, {graph.transition_count} edges)")
 
     # Mermaid diagram
     mermaid = generate_mermaid(graph)

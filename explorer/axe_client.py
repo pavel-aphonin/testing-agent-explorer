@@ -112,6 +112,11 @@ def _obscured_children(window: dict) -> set[int]:
     return set(with_controls[:-1])
 
 
+def _reading_order(element: dict) -> tuple[float, float]:
+    frame = element.get("frame") or {}
+    return frame.get("y", 0), frame.get("x", 0)
+
+
 def _descendants(node: dict):
     for child in node.get("children", []):
         if isinstance(child, dict):
@@ -121,6 +126,10 @@ def _descendants(node: dict):
 
 def _is_accessory(node: dict) -> bool:
     return node.get("type") == "Button" and node.get("AXLabel") in _ROW_ACCESSORY_LABELS
+
+
+def _has_one_accessory(node: dict) -> bool:
+    return sum(_is_accessory(d) for d in _descendants(node)) == 1
 
 
 def _row_label(node: dict) -> str | None:
@@ -340,7 +349,13 @@ _FOCUS_SETTLE_S = 0.8
 _SCROLL_TOP_MARGIN = 120
 _SCROLL_BOTTOM_MARGIN = 110
 _SCROLL_BOTTOM_MARGIN_NO_TAB_BAR = 40
-_MAX_SCROLL_SWIPES = 8
+_MAX_SCROLL_SWIPES = 14
+# Horizontal swipes keep this far from the edges: an edge swipe means «back».
+_CAROUSEL_EDGE_PT = 40
+# Sideways swipes are slow: at 0.6 s a carousel flings on, 250 pt for a
+# 100 pt swipe (testbed), and the card bounced past the screen both ways.
+# At 2 s the content moves as far as the finger.
+_CAROUSEL_SWIPE_DURATION_S = "2.0"
 _SCROLL_SWIPE_DURATION_S = "0.6"
 _SCROLL_SETTLE_S = 0.8
 _MIN_SCROLL_SWIPE_PT = 60
@@ -461,6 +476,8 @@ class AXeExplorerClient:
         # Whether the last tree read showed an unobscured tab bar (see
         # _bottom_margin). Assume one until the first read.
         self._tab_bar_visible = True
+        # The last scroll_into_view hit the end of the content going down.
+        self.scroll_stuck = False
 
     async def connect(self, udid: str) -> None:
         self._udid = udid
@@ -990,7 +1007,12 @@ class AXeExplorerClient:
             row_label = None
             # An alert (``Sheet``) lays its title and message out in a
             # ScrollArea too; that text block is not a list row.
-            if not node_in_keyboard and not in_alert and parent_type == "ScrollArea":
+            # A disclosure chevron marks a row wherever it sits: the same
+            # table sometimes comes without its ScrollArea (testbed run 15:
+            # three accounts seen as plain text, the screen a dead end).
+            if not node_in_keyboard and not in_alert and (
+                parent_type == "ScrollArea" or (not in_row and _has_one_accessory(node))
+            ):
                 row_label = _row_label(node)
             test_id = node.get("AXUniqueId", "")
             frame = node.get("frame", {}) or {}
@@ -1191,11 +1213,17 @@ class AXeExplorerClient:
         coordinates hits nothing or the tab bar. Elements are re-found after
         every swipe by type/label/id and their ordinal among identical ones
         (cards repeat labels like «Кэшбэк 10%»). None when the element
-        cannot be brought on screen (e.g. it sits off to the side in a
-        horizontal carousel).
+        cannot be brought on screen. A card off to the side in a carousel
+        is reached by swiping its row sideways, once the row is in view.
+
+        When the content stops moving with the element still below the
+        screen, ``scroll_stuck`` is set: nothing further down is reachable.
+        An expanded panel locks scrolling while the page it covers stays in
+        the tree (aweassist «Счета»: 93 of 101 actions). A visible text with
+        the element's label is then tapped instead: the panel's «Настройки»
+        is only a text, the button of that name is far below.
         """
-        if frame.get("x", 0) + frame.get("width", 0) / 2 > self._width:
-            return None
+        self.scroll_stuck = False
 
         def same(el: dict) -> bool:
             return (
@@ -1210,19 +1238,44 @@ class AXeExplorerClient:
         elements = [el for el in await self.get_ui_elements() if same(el)]
         if not elements:
             return None
-        elements.sort(key=lambda el: (el.get("frame") or {}).get("y", 0))
+        elements.sort(key=_reading_order)
         ordinal = min(
             range(len(elements)),
-            key=lambda i: abs((elements[i].get("frame") or {}).get("y", 0) - frame.get("y", 0)),
+            key=lambda i: (
+                abs((elements[i].get("frame") or {}).get("y", 0) - frame.get("y", 0)),
+                abs((elements[i].get("frame") or {}).get("x", 0) - frame.get("x", 0)),
+            ),
         )
         x = self._width // 2
         top, bottom = _SCROLL_TOP_MARGIN, self._height - self._bottom_margin()
+        no_move_seen = False
+        row_in_view = False
+        row_scale, last_side = 1.0, 0
         for attempt in range(_MAX_SCROLL_SWIPES):
             current = (elements[ordinal].get("frame") or {}) if ordinal < len(elements) else None
             if current is None:
                 return None
-            if self._in_scroll_band(current):
-                return current
+            if self._in_scroll_band(current) or row_in_view:
+                if self._in_width(current):
+                    return current
+                side = 1 if current.get("x", 0) + current.get("width", 0) / 2 > self._width else -1
+                if last_side and side != last_side:
+                    row_scale /= 2  # overshot: come back in shorter steps
+                last_side = side
+                await self._swipe_row(current, row_scale)
+                tree = await self.get_ui_elements()
+                elements = sorted((el for el in tree if same(el)), key=_reading_order)
+                moved = (elements[ordinal].get("frame") or {}) if ordinal < len(elements) else None
+                if moved is None:
+                    return None
+                if abs(moved.get("x", 0) - current.get("x", 0)) < _SCROLL_NO_MOVE_PT:
+                    # The end of this carousel; says nothing about the page.
+                    if no_move_seen:
+                        return None
+                    no_move_seen = True
+                else:
+                    no_move_seen = False
+                continue
             # Bar items live in the margins and are tapped where they are:
             # the navigation bar at the top, the tab bar's own items at the
             # bottom. Content near the bottom edge is under the tab bar, so
@@ -1246,18 +1299,60 @@ class AXeExplorerClient:
                 "--duration", _SCROLL_SWIPE_DURATION_S, "--udid", self._udid,
             ])
             await asyncio.sleep(_SCROLL_SETTLE_S)
-            elements = sorted(
-                (el for el in await self.get_ui_elements() if same(el)),
-                key=lambda el: (el.get("frame") or {}).get("y", 0),
-            )
+            tree = await self.get_ui_elements()
+            elements = sorted((el for el in tree if same(el)), key=_reading_order)
             moved = (elements[ordinal].get("frame") or {}) if ordinal < len(elements) else None
             if moved is None:
                 return None
             if abs(moved.get("y", 0) - current.get("y", 0)) < _SCROLL_NO_MOVE_PT:
                 # The content cannot scroll any further this way: tap the
                 # element where it is if it is on screen at all, instead of
-                # spending the remaining swipes on nothing.
-                return moved if self.is_on_screen(moved) else None
+                # spending the remaining swipes on nothing. Off screen, a
+                # second try first: AXe drops input, and a dropped swipe
+                # looks just like the end of the content.
+                if self.is_on_screen(moved):
+                    return moved
+                if self._in_height(moved):
+                    row_in_view = True
+                    no_move_seen = False
+                    continue
+                if not no_move_seen:
+                    no_move_seen = True
+                    continue
+                self.scroll_stuck = needed > 0
+                return self._visible_text(tree, label)
+            no_move_seen = False
+        return None
+
+    def _in_width(self, frame: dict) -> bool:
+        return 0 <= frame.get("x", 0) + frame.get("width", 0) / 2 <= self._width
+
+    def _in_height(self, frame: dict) -> bool:
+        return 0 <= frame.get("y", 0) + frame.get("height", 0) / 2 <= self._height
+
+    async def _swipe_row(self, frame: dict, scale: float = 1.0) -> None:
+        """Swipe the row at ``frame`` far enough to centre it horizontally."""
+        needed = (frame.get("x", 0) + frame.get("width", 0) / 2 - self._width / 2) * scale
+        dist = min(max(abs(needed), _MIN_SCROLL_SWIPE_PT), self._width - 2 * _CAROUSEL_EDGE_PT)
+        start = self._width - _CAROUSEL_EDGE_PT if needed > 0 else _CAROUSEL_EDGE_PT
+        end = start - dist if needed > 0 else start + dist
+        y = str(int(frame.get("y", 0) + frame.get("height", 0) / 2))
+        await _run([
+            AXE, "swipe", "--start-x", str(int(start)), "--start-y", y,
+            "--end-x", str(int(end)), "--end-y", y,
+            "--duration", _CAROUSEL_SWIPE_DURATION_S, "--udid", self._udid,
+        ])
+        await asyncio.sleep(_SCROLL_SETTLE_S)
+
+    def _visible_text(self, tree: list[dict], label: str | None) -> dict | None:
+        """Frame of an uncovered on-screen text reading ``label``."""
+        for el in tree:
+            frame = el.get("frame") or {}
+            if (
+                label and el.get("type") == "StaticText" and el.get("label") == label
+                and not el.get("obscured") and self._in_scroll_band(frame)
+            ):
+                return frame
         return None
 
     async def go_back(self) -> bool:
