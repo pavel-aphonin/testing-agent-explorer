@@ -109,6 +109,17 @@ MAX_LAUNCH_ALERTS = 3
 # are written off (see _note_unreachable).
 MAX_NAV_FAILURES = 2
 
+# Failed navigations in a row, with no action reaching another screen in
+# between, that mean the environment is down rather than one screen being
+# out of reach. aweassist run 8: the test backend answered «no healthy
+# upstream» at 01:53, the PIN was «not accepted» twice, and 25 screens (42
+# actions) were written off in 23 minutes. Run 4's genuine failures came
+# two at a time, with working actions in between.
+OUTAGE_NAV_FAILURES = 3
+# Waits before retrying while the environment is down; then the run stops.
+OUTAGE_WAITS_S = (60.0, 120.0, 240.0)
+ENVIRONMENT_DOWN_REASON = "Environment unavailable"
+
 # Type aliases for the optional engine callbacks.
 PriorProvider = Callable[[ScreenNode], "dict[str, float] | Awaitable[dict[str, float]]"]
 EventCallback = Callable[[dict], "None | Awaitable[None]"]
@@ -230,7 +241,13 @@ class ExplorationEngine:
         # Labels / accessibility ids the agent must never act on — e.g. an
         # app's debug environment switcher, where exploring would select
         # «Production» and log in to a live backend (aweassist).
-        self.forbidden: frozenset[str] = frozenset(forbidden or ())
+        # Exact labels or ids, and «~part» for any label or id containing
+        # «part» (any case): Wikipedia's write actions are many buttons
+        # («Edit section», «Publish changes», «Add topic»…) on a live site.
+        self.forbidden: frozenset[str] = frozenset(f for f in forbidden or () if not f.startswith("~"))
+        self.forbidden_parts: tuple[str, ...] = tuple(
+            f[1:].casefold() for f in forbidden or () if f.startswith("~") and len(f) > 1
+        )
         self.current_screen_id: str | None = None
         self._stuck_count = 0
         self.step_idx = 0
@@ -259,6 +276,11 @@ class ExplorationEngine:
         self._visited_tabs: set[str] = set()
         # Failed navigations per target screen; see MAX_NAV_FAILURES.
         self._nav_failures: dict[str, int] = {}
+        # Failed navigations since the app last got anywhere, and the
+        # screens they gave up on (see _navigation_failed).
+        self._failed_navs = 0
+        self._streak_screens: list[str] = []
+        self._outage_waits = 0
 
         # PUCT selector and Go-Explore archive are the brains of the loop.
         # Both are stateful and live for the duration of one engine run.
@@ -415,7 +437,10 @@ class ExplorationEngine:
                         )
                         self.current_screen_id = frontier.state_id
                     elif result != frontier.state_id:
-                        self._note_unreachable(frontier.state_id, step)
+                        if not await self._navigation_failed(frontier.state_id, step):
+                            break
+                        continue
+                    self._app_responds()
                     continue
 
                 # Local frontier exists — pick an action via PUCT, restricted
@@ -458,6 +483,8 @@ class ExplorationEngine:
                     await self._explore_tap(element)
 
                 after_screen = self.current_screen_id
+                if after_screen != before_screen:
+                    self._app_responds()
                 is_new_screen = (
                     after_screen != before_screen and after_screen not in known_before
                 )
@@ -1404,12 +1431,11 @@ class ExplorationEngine:
                 elements=elements,
                 screenshot_b64=screenshot,
             )
-            if self.forbidden:
+            if self.forbidden or self.forbidden_parts:
                 # Dropped here, at the source, so nothing downstream — PUCT,
                 # frontier navigation, form filling — can ever pick them.
                 node.interactive_elements = [
-                    el for el in node.interactive_elements
-                    if el.label not in self.forbidden and el.test_id not in self.forbidden
+                    el for el in node.interactive_elements if not self._is_forbidden(el)
                 ]
             if self.system_ui_guard:
                 node.interactive_elements = [
@@ -1500,6 +1526,70 @@ class ExplorationEngine:
         # Stored frames are from another layout; look elements up live.
         self._scrolled_screens.add(known.screen_id)
         return known
+
+    def _is_forbidden(self, element: ElementSnapshot) -> bool:
+        names = [n for n in (element.label, element.test_id) if n]
+        return any(n in self.forbidden for n in names) or any(
+            part in n.casefold() for n in names for part in self.forbidden_parts
+        )
+
+    def _app_responds(self) -> None:
+        """The app reached another screen: whatever failed before was not
+        an outage."""
+        self._failed_navs = 0
+        self._streak_screens.clear()
+        self._outage_waits = 0
+
+    async def _navigation_failed(self, screen_id: str, step: int) -> bool:
+        """Record a failed trip to ``screen_id``. False: stop exploring.
+
+        One screen out of reach is written off (_note_unreachable). Several
+        trips failing in a row with nothing else working mean the app or its
+        backend is down: those write-offs are undone, the agent waits and
+        tries again, and stops if the environment does not come back.
+        """
+        self._failed_navs += 1
+        if self._failed_navs < OUTAGE_NAV_FAILURES:
+            self._note_unreachable(screen_id, step)
+            self._streak_screens.append(screen_id)
+            return True
+        self._undo_streak_write_offs()
+        if self._outage_waits >= len(OUTAGE_WAITS_S) or self._pin_failures >= MAX_PIN_FAILURES:
+            # Without the PIN nothing can be reached again, and trying it
+            # more often risks locking the test account.
+            self.graph.stop_reason = ENVIRONMENT_DOWN_REASON
+            logger.warning(
+                "[Step %d] Environment unavailable: %d navigations failed in a row; stopping",
+                step, self._failed_navs,
+            )
+            await self._emit({
+                "type": "log", "step_idx": step,
+                "message": "Среда недоступна: приложение никуда не переходит. Останавливаю исследование.",
+            })
+            return False
+        wait = OUTAGE_WAITS_S[self._outage_waits]
+        self._outage_waits += 1
+        logger.warning(
+            "[Step %d] %d navigations failed in a row; environment may be down, waiting %.0f s",
+            step, self._failed_navs, wait,
+        )
+        await asyncio.sleep(wait)
+        return True
+
+    def _undo_streak_write_offs(self) -> None:
+        """Give back the actions written off during a run of failures that
+        turned out to be an outage."""
+        undone = set(self._streak_screens)
+        self._streak_screens.clear()
+        if not undone:
+            return
+        self.graph.edges = [
+            e for e in self.graph.edges
+            if not (e.notes == WRITTEN_OFF_NOTE and e.source_screen_id in undone)
+        ]
+        for screen_id in undone:
+            self._nav_failures.pop(screen_id, None)
+            self._update_archive_for(screen_id)
 
     def _note_unreachable(self, screen_id: str, step: int) -> None:
         """Give up on a frontier screen after MAX_NAV_FAILURES failed trips.

@@ -63,6 +63,7 @@ def generate_stats_report(graph: AppGraph) -> str:
         f"Transitions recorded: {graph.transition_count}",
         f"Written off untried: {graph.written_off_count}",
         f"Out of scroll reach: {graph.unreachable_count}",
+        f"Stopped early: {graph.stop_reason or 'no'}",
         "",
         "--- Screens ---",
     ]

@@ -125,6 +125,8 @@ class AppGraph(BaseModel):
     exploration_start: datetime = Field(default_factory=datetime.now)
     exploration_end: datetime | None = None
     total_actions: int = 0
+    # Why exploration ended before the step budget, if it did.
+    stop_reason: str | None = None
 
     def add_node(self, node: ScreenNode) -> bool:
         """Add a node. Returns True if this is a NEW screen."""

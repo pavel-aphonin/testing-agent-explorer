@@ -37,7 +37,7 @@ def explore(
     test_data: str | None = typer.Option(None, "--test-data", help="JSON file of form values, e.g. {\"email\": ..., \"password\": ...}"),
     max_steps: int = typer.Option(200, "--max-steps", help="Step budget for the exploration"),
     allow_system_ui: bool = typer.Option(False, "--allow-system-ui", help="Also tap actions that open system UI outside the app (photo picker, camera, share sheet)"),
-    forbid: list[str] = typer.Option([], "--forbid", help="Label or accessibility id the agent must never act on (repeatable), e.g. an app's debug environment switcher"),
+    forbid: list[str] = typer.Option([], "--forbid", help="Label or accessibility id the agent must never act on (repeatable), e.g. an app's debug environment switcher; «~text» forbids every label or id containing «text», any case"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose logging"),
 ):
     """Explore an app and build its state machine graph."""
