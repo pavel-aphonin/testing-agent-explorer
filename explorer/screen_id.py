@@ -53,6 +53,9 @@ SKIP_TYPES = {
     "ActivityIndicator", "ProgressIndicator", # loading
     "Window", "Application",                  # container
     "ScrollView", "Table", "CollectionView",  # layout containers
+    # iOS 27 name for a scroll view; it comes and goes for the same table
+    # (testbed runs 15 and 23: «Счета» twice, with and without it).
+    "ScrollArea",
     "Group", "Other",                         # generic
 }
 

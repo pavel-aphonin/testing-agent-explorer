@@ -19,6 +19,8 @@ import shutil
 import unicodedata
 from dataclasses import dataclass
 
+from explorer import web_content
+
 logger = logging.getLogger("explorer.axe_client")
 
 
@@ -478,6 +480,8 @@ class AXeExplorerClient:
         self._tab_bar_visible = True
         # The last scroll_into_view hit the end of the content going down.
         self.scroll_stuck = False
+        # Probe empty scroll views for web content (see web_content).
+        self.scan_web_content = True
 
     async def connect(self, udid: str) -> None:
         self._udid = udid
@@ -968,8 +972,13 @@ class AXeExplorerClient:
 
         try:
             raw = json.loads(stdout)
+            roots = raw if isinstance(raw, list) else [raw]
+            if self.scan_web_content and self._width:
+                added = await web_content.fill_hollow_areas(roots, self._probe_point, self._width, self._height)
+                if added:
+                    logger.info("Web content: %d elements found by point queries", added)
             elements = []
-            self._flatten(raw if isinstance(raw, list) else [raw], elements)
+            self._flatten(roots, elements)
             self._tab_bar_visible = any(
                 el["type"] in _TAB_BAR_TYPES and not el.get("obscured")
                 and self.is_on_screen(el.get("frame"))
@@ -979,6 +988,20 @@ class AXeExplorerClient:
         except json.JSONDecodeError as e:
             logger.warning(f"AXe JSON parse error: {e}")
             return []
+
+    async def _probe_point(self, x: int, y: int) -> dict | None:
+        """The element at a point; reaches into web pages, which the full
+        tree leaves out."""
+        code, stdout, _ = await _run([AXE, "describe-ui", "--point", f"{x},{y}", "--udid", self._udid])
+        if code != 0:
+            return None
+        try:
+            hit = json.loads(stdout)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(hit, list):
+            hit = hit[0] if hit else None
+        return hit if isinstance(hit, dict) else None
 
     def _flatten(
         self,

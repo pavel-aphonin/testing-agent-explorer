@@ -1446,7 +1446,12 @@ class ExplorationEngine:
                 el.label: el for el in node.interactive_elements
                 if el.element_type == "Button" and el.label in KEYPAD_DIGITS
             }
-            if set(digits) == KEYPAD_DIGITS:
+            # Digits next to a text field are the field's keyboard, not a
+            # PIN pad (aweassist run 9: the number pad under «Имя или
+            # телефон» got the PIN twice, the PIN budget was spent, and after
+            # the next relaunch 14 screens, 482 actions, were written off).
+            serves_field = any(el.kind == ElementKind.TEXT_FIELD for el in node.interactive_elements)
+            if set(digits) == KEYPAD_DIGITS and not serves_field:
                 self._keypad_screens.add(node.screen_id)
                 self._keypad_frames = {d: el.frame for d, el in digits.items() if el.frame}
                 node.interactive_elements = [

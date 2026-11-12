@@ -162,3 +162,21 @@ async def test_a_successful_trip_resets_the_count(tmp_path, waits, monkeypatch):
     await engine.run()
 
     assert engine._failed_navs == 0
+
+
+async def test_a_number_pad_under_a_text_field_is_not_a_pin_pad(tmp_path):
+    # aweassist run 9, «Выберите контакт»: the number pad of the field «Имя
+    # или телефон» got the PIN twice; with the PIN budget spent nothing
+    # could be reached after the next relaunch.
+    from tests.test_engine import _keypad_tree
+
+    tree = _keypad_tree("Деньги")
+    tree.append({"type": "TextField", "label": "", "value": "Имя или телефон",
+                                "test_id": "", "enabled": True,
+                                "frame": {"x": 20, "y": 148, "width": 362, "height": 46}, "children": []})
+    engine = _engine(tmp_path)
+    engine.controller.tree = tree
+
+    node = await engine._capture_screen()
+
+    assert node.screen_id not in engine._keypad_screens
