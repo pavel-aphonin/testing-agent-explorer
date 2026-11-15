@@ -48,7 +48,7 @@ def _client(monkeypatch, trees: list[list[dict]]):
         calls.append(args)
         return 0, "", ""
 
-    async def get_ui_elements(self):
+    async def get_ui_elements(self, reuse=False):
         last["tree"] = next(reads, last["tree"])
         return last["tree"]
 

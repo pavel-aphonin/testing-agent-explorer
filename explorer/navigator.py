@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING
+
+from explorer.screen_id import native_fingerprint
 
 if TYPE_CHECKING:
     from explorer.models import ActionDetail, AppGraph, GraphEdge
@@ -17,6 +20,12 @@ SETTLE_DELAY = 1.5
 MAX_REROUTES = 2
 LAUNCH_DELAY = 3.0
 BACK_DELAY = 1.0
+# Instead of BACK_DELAY and SETTLE_DELAY the screen is polled until it has
+# changed and holds (see _await_change). Fixed waits on replayed steps and
+# back presses cost 386 of 3298 s on Wikipedia run 2.
+CHANGE_POLL_S = 0.3
+BACK_MAX_S = 1.5
+STEP_MAX_S = 3.5
 MAX_BACK_ATTEMPTS = 5
 # Consecutive back presses that leave the screen unchanged before giving
 # up on back navigation for this trip.
@@ -50,12 +59,13 @@ async def go_back_to_screen(
     stalled = 0
     for attempt in range(MAX_BACK_ATTEMPTS):
         logger.info(f"Back attempt {attempt + 1}/{MAX_BACK_ATTEMPTS}")
+        before = await _fingerprint(controller, fresh=False)
         try:
             await controller.go_back()
         except Exception as e:
             logger.warning(f"go_back failed: {e}")
             break
-        await asyncio.sleep(BACK_DELAY)
+        await _await_change(controller, before, BACK_MAX_S, BACK_DELAY)
 
         new_screen_id, _ = await capture_fn()
         # Back that does not move us will not start working on the next
@@ -117,6 +127,17 @@ async def relaunch_and_navigate(
 
     path = graph.find_path(start_screen_id, target_screen_id)
     if not path:
+        # A live feed opens on a new variant after each launch (Wikipedia:
+        # «Community» with other cards), with no recorded paths from it yet.
+        # It is the same place as an earlier launch screen: try their paths.
+        for earlier in reversed(graph.launch_screens):
+            path = graph.find_path(earlier, target_screen_id) if earlier != start_screen_id else None
+            if path:
+                logger.info(f"Starting from launch screen {earlier[:8]} as {start_screen_id[:8]}")
+                break
+    if start_screen_id not in graph.launch_screens:
+        graph.launch_screens.append(start_screen_id)
+    if not path:
         logger.warning(
             f"No known path from start {start_screen_id[:8]} "
             f"to target {target_screen_id[:8]}"
@@ -146,6 +167,7 @@ async def replay_path(
     remaining = list(path)
     while remaining:
         edge = remaining.pop(0)
+        before = await _fingerprint(controller, fresh=False)
         if edge.action.action_type == "input" and replay_input is not None:
             success = await replay_input(edge.action)
         else:
@@ -164,10 +186,39 @@ async def replay_path(
             logger.info(f"Rerouting from {current_id[:8]} to {target[:8]} ({len(detour)} steps)")
             remaining = list(detour)
             continue
-        await asyncio.sleep(SETTLE_DELAY)
+        await _await_change(controller, before, STEP_MAX_S, SETTLE_DELAY)
 
     current_id, _ = await capture_fn()
     return current_id
+
+
+async def _fingerprint(controller, fresh: bool = True) -> str | None:
+    """Native fingerprint of the screen, or None for a controller that
+    cannot read it (then fixed waits are used)."""
+    read = getattr(controller, "get_ui_elements", None)
+    if read is None:
+        return None
+    if getattr(controller, "scan_web_content", None) is not None:
+        return native_fingerprint(await read(reuse=not fresh, web=False))
+    return native_fingerprint(await read())
+
+
+async def _await_change(controller, before: str | None, max_s: float, fallback_s: float) -> None:
+    """Return once the screen differs from ``before`` and two polls agree,
+    or after ``max_s``."""
+    if before is None:
+        await asyncio.sleep(fallback_s)
+        return
+    deadline = time.monotonic() + max_s
+    reads_left = round(max_s / CHANGE_POLL_S)
+    previous = before
+    while reads_left > 0 and time.monotonic() < deadline:
+        await asyncio.sleep(CHANGE_POLL_S)
+        current = await _fingerprint(controller)
+        reads_left -= 1
+        if current != before and current == previous:
+            return
+        previous = current
 
 
 async def replay_action(controller, action: ActionDetail) -> bool:

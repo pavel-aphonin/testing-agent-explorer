@@ -59,7 +59,7 @@ from explorer.navigator import (
     find_nearest_unexplored,
     go_back_to_screen,
 )
-from explorer.screen_id import compute_screen_id
+from explorer.screen_id import compute_screen_id, native_fingerprint
 
 logger = logging.getLogger("explorer.engine")
 
@@ -347,6 +347,8 @@ class ExplorationEngine:
         print(">>> Capturing initial screen...")
         initial_node = await self._capture_screen()
         is_new = self.graph.add_node(initial_node)
+        if initial_node.screen_id not in self.graph.launch_screens:
+            self.graph.launch_screens.append(initial_node.screen_id)
         self.current_screen_id = initial_node.screen_id
         await self._on_screen_landed(initial_node, is_new=is_new, step=0)
         self._save_checkpoint()
@@ -789,6 +791,8 @@ class ExplorationEngine:
             x = int(frame.get("x", 0) + frame.get("width", 0) / 2)
             y = int(frame.get("y", 0) + frame.get("height", 0) / 2)
 
+        # The screen as it is just before the tap, to tell its outcome by.
+        before_fp = native_fingerprint(await self._peek(fresh=False))
         print(f"    Tapping {element.label!r} at ({x}, {y})...", flush=True)
         try:
             result = None
@@ -841,7 +845,7 @@ class ExplorationEngine:
             )
 
         print(f"    Watching for the outcome...")
-        new_node = await self._await_outcome(before_screen)
+        new_node = await self._await_outcome(before_screen, before_fp)
         is_new = self.graph.add_node(new_node)
 
         # Record edge
@@ -1300,9 +1304,7 @@ class ExplorationEngine:
         """If a system alert (Save Password, Allow Notifications, etc.) is
         on screen, tap the dismiss button and re-capture."""
         try:
-            elements = await asyncio.wait_for(
-                self.controller.get_ui_elements(), timeout=5
-            )
+            elements = await asyncio.wait_for(self._peek(fresh=False), timeout=5)
         except Exception:
             return
 
@@ -1382,7 +1384,15 @@ class ExplorationEngine:
     def _differs(self, node: ScreenNode, before: str | None) -> bool:
         return node.screen_id != before and not (before and self._same_screen(node.screen_id, before))
 
-    async def _await_outcome(self, before: str | None) -> ScreenNode:
+    async def _peek(self, fresh: bool = True) -> list[dict]:
+        """The tree without probing web pages: enough to see whether the
+        screen changed or whose screen it is. A web scan on every poll cost
+        878 point queries in 120 Wikipedia steps (run 3)."""
+        if getattr(self.controller, "scan_web_content", None) is not None:
+            return await self.controller.get_ui_elements(reuse=not fresh, web=False)
+        return await self.controller.get_ui_elements()
+
+    async def _await_outcome(self, before: str | None, before_fp: str | None = None) -> ScreenNode:
         """The screen a tap led to, as soon as it is there.
 
         Polls every OUTCOME_POLL_S. A changed screen is accepted once two
@@ -1390,7 +1400,13 @@ class ExplorationEngine:
         a screen that does not change for OUTCOME_MAX_S is a self-loop. A
         new screen offering only one action is given longer to load, as in
         _capture_settled_screen.
+
+        With ``before_fp`` (the native fingerprint before the tap) the polls
+        are cheap native reads and the screen is captured in full once, at
+        the end; otherwise every poll is a full capture.
         """
+        if before_fp is not None:
+            return await self._await_outcome_native(before, before_fp)
         deadline = _clock() + OUTCOME_MAX_S
         reads_left = round(OUTCOME_MAX_S / OUTCOME_POLL_S)  # and a bound on reads
 
@@ -1415,6 +1431,38 @@ class ExplorationEngine:
                 return node
             await asyncio.sleep(OUTCOME_POLL_S)
             node = await self._capture_screen()
+
+    async def _await_outcome_native(self, before: str | None, before_fp: str) -> ScreenNode:
+        deadline = _clock() + OUTCOME_MAX_S
+        reads_left = round(OUTCOME_MAX_S / OUTCOME_POLL_S)
+
+        def over() -> bool:
+            return _clock() >= deadline or reads_left <= 0
+
+        await asyncio.sleep(OUTCOME_POLL_S)
+        fp = native_fingerprint(await self._peek())
+        while True:
+            reads_left -= 1
+            if fp != before_fp:
+                await asyncio.sleep(OUTCOME_POLL_S)
+                again = native_fingerprint(await self._peek())
+                reads_left -= 1
+                if again == fp or over():
+                    break
+                fp = again
+                continue
+            if over():
+                break
+            await asyncio.sleep(OUTCOME_POLL_S)
+            fp = native_fingerprint(await self._peek())
+        node = await self._capture_screen()
+        if (
+            self._differs(node, before) and node.screen_id not in self.graph.nodes
+            and len(node.interactive_elements) <= 1
+        ):
+            await asyncio.sleep(SPARSE_SCREEN_RECHECK_DELAY_S)
+            node = await self._capture_screen()
+        return node
 
     async def _capture_settled_screen(self, before: str | None = None) -> ScreenNode:
         """Capture after an action, re-checking results that may be early.

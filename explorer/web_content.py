@@ -163,6 +163,7 @@ def _as_node(hit: dict) -> dict:
         "frame": _frame(hit),
         "enabled": hit.get("enabled", True),
         "children": [],
+        "web": True,  # found by a point query, not in the full tree
     }
 
 

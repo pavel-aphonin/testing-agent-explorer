@@ -130,6 +130,8 @@ class AppGraph(BaseModel):
     total_actions: int = 0
     # Why exploration ended before the step budget, if it did.
     stop_reason: str | None = None
+    # Screens the app opened on after a (re)launch, oldest first.
+    launch_screens: list[str] = Field(default_factory=list)
 
     def add_node(self, node: ScreenNode) -> bool:
         """Add a node. Returns True if this is a NEW screen."""

@@ -409,6 +409,14 @@ def _changes_screen(args: list[str]) -> bool:
     return len(args) > 2 and args[1] == "simctl" and args[2] in _SIMCTL_SCREEN_CHANGES
 
 
+# Counts inputs and relaunches; a tree read in the same epoch, a moment ago,
+# is still the screen (see get_ui_elements).
+_screen_epoch = 0
+# How long such a read stays usable. The screen can still change on its own
+# (loading, animations), so only operations that start right after a read
+# reuse it: back, scrolling to an element, reading a switch.
+TREE_REUSE_S = 3.0
+
 _DTUHIDD_RESTART_EVERY = 80
 _DTUHIDD_LABEL = "system/com.apple.coredevice.dtuhidd"
 _hid_connections: dict[str, int] = {}
@@ -458,6 +466,8 @@ async def _run(args: list[str], timeout: float = 15) -> tuple[int, str, str]:
         if len(args) > 1 and args[1] in _HID_SUBCOMMANDS:
             await _note_hid_connection(args)
     if _changes_screen(args):
+        global _screen_epoch
+        _screen_epoch += 1
         web_content.forget()  # input or a relaunch may change any page
     started = time.monotonic()
     proc = await asyncio.create_subprocess_exec(
@@ -501,6 +511,8 @@ class AXeExplorerClient:
         self.scroll_stuck = False
         # Probe empty scroll views for web content (see web_content).
         self.scan_web_content = True
+        # (epoch, time, elements) of the last tree read; see get_ui_elements.
+        self._last_read: tuple | None = None
 
     async def connect(self, udid: str) -> None:
         self._udid = udid
@@ -624,7 +636,7 @@ class AXeExplorerClient:
 
     async def _switch_value(self, test_id: str) -> str | None:
         """Current value of the switch, or None when it is not in the tree."""
-        for el in await self.get_ui_elements():
+        for el in await self.get_ui_elements(reuse=True):
             if el.get("test_id") == test_id:
                 return el.get("value")
         return None
@@ -967,7 +979,7 @@ class AXeExplorerClient:
             except OSError:
                 pass
 
-    async def get_ui_elements(self) -> list[dict]:
+    async def get_ui_elements(self, reuse: bool = False, web: bool = True) -> list[dict]:
         """Get accessibility tree via AXe CLI.
 
         PER-107: a dead simulator (manual shutdown, OS sleep, memory
@@ -977,7 +989,15 @@ class AXeExplorerClient:
         Now we surface ``SimulatorDownError`` so the worker can fail
         the run quickly instead of looping for 18 minutes.
         """
+        last = self._last_read
+        if (
+            reuse and last and last[0] == _screen_epoch and time.monotonic() - last[1] < TREE_REUSE_S
+            and (last[3] or not web)
+        ):
+            timing.record_caller("reused by", sys._getframe(1))
+            return list(last[2])
         timing.record_caller("read by", sys._getframe(1))
+        epoch = _screen_epoch
         code, stdout, stderr = await _run([
             AXE, "describe-ui", "--udid", self._udid
         ])
@@ -993,12 +1013,13 @@ class AXeExplorerClient:
         try:
             raw = json.loads(stdout)
             roots = raw if isinstance(raw, list) else [raw]
-            if self.scan_web_content and self._width:
+            if web and self.scan_web_content and self._width:
                 added = await web_content.fill_hollow_areas(roots, self._probe_point, self._width, self._height)
                 if added:
                     logger.info("Web content: %d elements found by point queries", added)
             elements = []
             self._flatten(roots, elements)
+            self._last_read = (epoch, time.monotonic(), elements, web and self.scan_web_content)
             self._tab_bar_visible = any(
                 el["type"] in _TAB_BAR_TYPES and not el.get("obscured")
                 and self.is_on_screen(el.get("frame"))
@@ -1105,6 +1126,7 @@ class AXeExplorerClient:
                 "enabled": node.get("enabled", True),
                 "visible": True,
                 "obscured": obscured,
+                "web": bool(node.get("web")),
             })
             # App windows are the Application's non-keyboard children.
             covered = set()
@@ -1278,7 +1300,7 @@ class AXeExplorerClient:
                 and not el.get("obscured")
             )
 
-        elements = [el for el in await self.get_ui_elements() if same(el)]
+        elements = [el for el in await self.get_ui_elements(reuse=True) if same(el)]
         if not elements:
             return None
         elements.sort(key=_reading_order)
@@ -1405,7 +1427,7 @@ class AXeExplorerClient:
         11 screens where five swipes did nothing and the app was relaunched),
         but nearly all show a back button in the navigation bar.
         """
-        for el in await self.get_ui_elements():
+        for el in await self.get_ui_elements(reuse=True):
             frame = el.get("frame") or {}
             if (
                 el.get("type") == "Button"

@@ -188,3 +188,9 @@ def compute_screen_id(elements: list[dict]) -> str:
 def screens_are_same(elements_a: list[dict], elements_b: list[dict]) -> bool:
     """Check if two element lists represent the same screen."""
     return compute_screen_id(elements_a) == compute_screen_id(elements_b)
+
+
+def native_fingerprint(elements: list[dict]) -> str:
+    """Fingerprint of what the full tree lists, leaving out what point
+    queries added inside web pages: cheap reads skip those."""
+    return compute_screen_id([e for e in elements if not e.get("web")])

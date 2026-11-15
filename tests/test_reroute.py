@@ -107,3 +107,153 @@ async def test_no_detour_means_stopping_where_we_are(monkeypatch):
     assert await _replay(monkeypatch, graph, screen, [prompt]) == "home"
     assert prompt.stale
     assert screen.lookups == 1  # the same gone step is not retried as a «detour»
+
+
+class _Polled:
+    """A screen read in order: ``screens[i]`` on the i-th read."""
+
+    def __init__(self, screens):
+        self.screens, self.reads = screens, 0
+
+    async def get_ui_elements(self):
+        screen = self.screens[min(self.reads, len(self.screens) - 1)]
+        self.reads += 1
+        return screen
+
+
+def _tree(*labels):
+    return [{"type": "Button", "label": l, "frame": {"x": 0, "y": 100 + 50 * i, "width": 100, "height": 40}}
+            for i, l in enumerate(labels)]
+
+
+async def _wait(monkeypatch, screens, max_s=3.5):
+    from explorer import navigator
+    from explorer.screen_id import native_fingerprint
+
+    slept = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(navigator.asyncio, "sleep", sleep)
+    controller = _Polled(screens)
+    await navigator._await_change(controller, native_fingerprint(_tree("Назад", "Карта")), max_s, 1.5)
+    return controller.reads, slept
+
+
+async def test_navigation_moves_on_once_the_new_screen_holds(monkeypatch):
+    reads, _ = await _wait(monkeypatch, [_tree("Меню"), _tree("Меню")])
+    assert reads == 2
+
+
+async def test_navigation_waits_while_the_screen_still_changes(monkeypatch):
+    reads, _ = await _wait(monkeypatch, [_tree("Меню"), _tree("Меню", "Поиск"), _tree("Меню", "Поиск")])
+    assert reads == 3
+
+
+async def test_navigation_gives_a_still_screen_the_full_window(monkeypatch):
+    from explorer import navigator
+
+    reads, _ = await _wait(monkeypatch, [_tree("Назад", "Карта")], max_s=1.5)
+    assert reads == round(1.5 / navigator.CHANGE_POLL_S)
+
+
+async def test_a_controller_that_cannot_read_gets_the_fixed_wait(monkeypatch):
+    from explorer import navigator
+
+    slept = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(navigator.asyncio, "sleep", sleep)
+    await navigator._await_change(object(), None, 3.5, 1.5)
+    assert slept == [1.5]
+
+
+async def test_replayed_steps_wait_for_the_screen_not_a_fixed_delay(monkeypatch):
+    from explorer import navigator
+
+    class _Readable(_Screen):
+        async def get_ui_elements(self):
+            return _tree(self.here)
+
+    slept = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    graph = _graph(*VIA_MENU)
+    screen = _Readable({("home", "Menu"): "menu", ("menu", "Map"): "map"})
+    original = screen.scroll_into_view
+
+    async def scroll(element_type, label, test_id, frame):
+        found = await original(element_type, label, test_id, frame)
+        if found is not None:
+            await screen.tap_label(label)
+        return found
+
+    screen.scroll_into_view = scroll
+    monkeypatch.setattr(navigator.asyncio, "sleep", sleep)
+
+    async def capture():
+        return screen.here, []
+
+    assert await replay_path(screen, list(VIA_MENU), capture, graph=graph) == "map"
+    assert navigator.SETTLE_DELAY not in slept
+
+
+class _Launching(_Screen):
+    """Relaunch opens ``start`` (a new variant of the feed)."""
+
+    def __init__(self, links, start):
+        super().__init__(links, start="?")
+        self.start, self.launches = start, 0
+
+    async def terminate_app(self, bundle_id):
+        pass
+
+    async def launch_app(self, bundle_id):
+        self.launches += 1
+        self.here = self.start
+
+
+async def _relaunch(monkeypatch, graph, screen, target):
+    from explorer import navigator
+
+    async def no_sleep(*_):
+        pass
+
+    monkeypatch.setattr(navigator.asyncio, "sleep", no_sleep)
+    original = screen.scroll_into_view
+
+    async def scroll(element_type, label, test_id, frame):
+        found = await original(element_type, label, test_id, frame)
+        if found is not None:
+            await screen.tap_label(label)
+        return found
+
+    screen.scroll_into_view = scroll
+
+    async def capture():
+        return screen.here, []
+
+    return await navigator.relaunch_and_navigate(screen, graph, target, capture)
+
+
+async def test_a_new_launch_variant_uses_the_paths_of_an_earlier_one(monkeypatch):
+    graph = _graph(_edge("feed-old", "map", "Map"))
+    graph.launch_screens.append("feed-old")
+    graph.add_node(ScreenNode(screen_id="feed-new"))
+    screen = _Launching({("feed-new", "Map"): "map"}, start="feed-new")
+
+    assert await _relaunch(monkeypatch, graph, screen, "map") == "map"
+    assert graph.launch_screens == ["feed-old", "feed-new"]
+
+
+async def test_without_earlier_launch_screens_there_is_no_path(monkeypatch):
+    graph = _graph(_edge("feed-old", "map", "Map"))
+    graph.add_node(ScreenNode(screen_id="feed-new"))
+    screen = _Launching({("feed-new", "Map"): "map"}, start="feed-new")
+
+    assert await _relaunch(monkeypatch, graph, screen, "map") == "feed-new"

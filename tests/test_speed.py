@@ -251,3 +251,196 @@ async def test_a_keypad_that_comes_back_changed_is_still_a_rejection(tmp_path, m
 
     assert engine.current_screen_id != node.screen_id
     assert engine._pin_failures == 1
+
+
+def _reading_client(monkeypatch):
+    import json as _json
+
+    from explorer import axe_client
+    from explorer.axe_client import AXeExplorerClient
+
+    reads = []
+    tree = _json.dumps([{"type": "Application", "AXLabel": "Testbed", "frame": {}, "children": []}]).encode()
+
+    class _Proc:
+        def __init__(self, out):
+            self.returncode, self.out = 0, out
+
+        async def communicate(self):
+            return self.out, b""
+
+    async def fake_exec(*args, **kwargs):
+        if args[1] == "describe-ui":
+            reads.append(1)
+            return _Proc(tree)
+        return _Proc(b"")
+
+    async def no_hid(args):
+        pass
+
+    monkeypatch.setattr(axe_client.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(axe_client, "_note_hid_connection", no_hid)
+    client = AXeExplorerClient()
+    client._udid, client._width, client._height = "SIM", 402, 874
+    return client, reads
+
+
+async def test_a_tree_just_read_is_reused_until_the_next_input(monkeypatch):
+    from explorer import axe_client
+
+    client, reads = _reading_client(monkeypatch)
+    await client.get_ui_elements()
+    await client.get_ui_elements(reuse=True)
+    assert len(reads) == 1
+
+    await axe_client._run([axe_client.AXE, "tap", "-x", "1", "-y", "1", "--udid", "SIM"])
+    await client.get_ui_elements(reuse=True)
+    assert len(reads) == 2
+
+
+async def test_polls_always_read_afresh(monkeypatch):
+    client, reads = _reading_client(monkeypatch)
+    await client.get_ui_elements()
+    await client.get_ui_elements()
+    assert len(reads) == 2
+
+
+async def test_an_old_read_is_not_reused(monkeypatch):
+    from explorer import axe_client
+
+    client, reads = _reading_client(monkeypatch)
+    await client.get_ui_elements()
+    real = axe_client.time.monotonic
+    monkeypatch.setattr(axe_client.time, "monotonic", lambda: real() + axe_client.TREE_REUSE_S + 1)
+    await client.get_ui_elements(reuse=True)
+    assert len(reads) == 2
+
+
+def test_web_elements_do_not_count_in_the_native_fingerprint():
+    from explorer.engine import native_fingerprint
+
+    native = HOME
+    with_web = HOME + [{"type": "Link", "label": "Открыть деталь", "web": True,
+                        "frame": {"x": 16, "y": 227, "width": 146, "height": 26}}]
+    assert native_fingerprint(native) == native_fingerprint(with_web)
+
+
+@dataclass
+class _AxeLike(_CountingShots):
+    """Records which reads probe web pages; shows ``screens`` in order."""
+
+    screens: list = None
+    reads: list = None
+    scan_web_content: bool = True
+
+    async def get_ui_elements(self, reuse=False, web=True):
+        self.reads = (self.reads or []) + [web]
+        index = min(len(self.reads) - 1, len(self.screens) - 1)
+        return self.screens[index]
+
+
+async def test_polls_skip_web_pages_and_the_screen_is_read_in_full_once(tmp_path, monkeypatch):
+    from explorer.engine import native_fingerprint
+
+    _clocked(monkeypatch)
+    controller = _AxeLike(tree=HOME, screens=[PROFILE])
+    engine = _engine(tmp_path, controller)
+    engine.graph.add_node(await engine._capture_screen())
+    controller.reads = []
+
+    node = await engine._await_outcome("home-id", native_fingerprint(HOME))
+
+    assert {el.label for el in node.interactive_elements} == {"Назад", "Редактировать"}
+    assert controller.reads.count(True) == 1          # the final capture
+    assert controller.reads[:-1] and not any(controller.reads[:-1])  # polls: native only
+
+
+async def test_a_native_poll_still_waits_out_a_tap_without_effect(tmp_path, monkeypatch):
+    from explorer.engine import OUTCOME_MAX_S, native_fingerprint
+
+    clock = _clocked(monkeypatch)
+    controller = _AxeLike(tree=HOME, screens=[HOME])
+    engine = _engine(tmp_path, controller)
+    home = await engine._capture_screen()
+    engine.graph.add_node(home)
+
+    node = await engine._await_outcome(home.screen_id, native_fingerprint(HOME))
+
+    assert node.screen_id == home.screen_id
+    assert clock["t"] >= OUTCOME_MAX_S
+
+
+async def test_a_native_poll_waits_for_a_changed_screen_to_hold(tmp_path, monkeypatch):
+    from explorer.engine import native_fingerprint
+
+    _clocked(monkeypatch)
+    more = _app("Testbed", _button("Назад", 60), _button("Редактировать", 300), _button("Удалить", 360))
+    most = _app("Testbed", _button("Назад", 60), _button("Редактировать", 300), _button("Удалить", 360),
+                _button("Избранное", 420))
+    controller = _AxeLike(tree=HOME, screens=[PROFILE, more, most, most])
+    engine = _engine(tmp_path, controller)
+    engine.graph.add_node(await engine._capture_screen())
+    controller.reads = []
+
+    node = await engine._await_outcome("home-id", native_fingerprint(HOME))
+
+    assert "Избранное" in {el.label for el in node.interactive_elements}
+    assert controller.reads[:4] == [False, False, False, False]  # read until two polls agree
+
+
+def _web_client(monkeypatch):
+    import json as _json
+
+    from explorer import axe_client
+    from explorer.axe_client import AXeExplorerClient
+
+    calls = {"tree": 0, "point": 0}
+    tree = _json.dumps([{"type": "Application", "AXLabel": "Testbed", "frame": {"x": 0, "y": 0, "width": 402, "height": 874},
+        "children": [{"type": "ScrollArea", "AXLabel": "", "frame": {"x": 0, "y": 154, "width": 402, "height": 686},
+                      "children": []}]}]).encode()
+    link = _json.dumps({"type": "Link", "AXLabel": "Открыть деталь",
+                        "frame": {"x": 16, "y": 227, "width": 146, "height": 26}}).encode()
+
+    class _Proc:
+        def __init__(self, out):
+            self.returncode, self.out = 0, out
+
+        async def communicate(self):
+            return self.out, b""
+
+    async def fake_exec(*args, **kwargs):
+        if "--point" in args:
+            calls["point"] += 1
+            return _Proc(link)
+        calls["tree"] += 1
+        return _Proc(tree)
+
+    monkeypatch.setattr(axe_client.asyncio, "create_subprocess_exec", fake_exec)
+    client = AXeExplorerClient()
+    client._udid, client._width, client._height = "SIM", 402, 874
+    return client, calls
+
+
+async def test_a_native_read_does_not_probe_web_pages(monkeypatch):
+    client, calls = _web_client(monkeypatch)
+    elements = await client.get_ui_elements(web=False)
+    assert calls["point"] == 0
+    assert "Открыть деталь" not in [e["label"] for e in elements]
+
+
+async def test_a_native_read_is_not_reused_for_a_full_one(monkeypatch):
+    client, calls = _web_client(monkeypatch)
+    await client.get_ui_elements(web=False)
+    elements = await client.get_ui_elements(reuse=True)
+    assert calls["tree"] == 2
+    assert "Открыть деталь" in [e["label"] for e in elements]
+
+
+async def test_the_first_screen_is_a_launch_screen(tmp_path):
+    controller = _CountingShots(tree=HOME)
+    engine = _engine(tmp_path, controller)
+    engine.max_steps = 0
+
+    graph = await engine.run()
+
+    assert graph.launch_screens == [next(iter(graph.nodes))]

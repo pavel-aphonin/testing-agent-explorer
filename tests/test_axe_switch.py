@@ -21,7 +21,7 @@ def _client(monkeypatch, values: list[str | None]):
 
     reads = iter(values)
 
-    async def get_ui_elements(self):
+    async def get_ui_elements(self, reuse=False):
         value = next(reads)
         if value is None:  # a permission prompt replaced the app
             return [{"type": "Application", "label": " ", "test_id": ""}]
