@@ -30,6 +30,13 @@ def record(key: str, seconds: float) -> None:
     entry[1] += seconds
 
 
+def record_caller(prefix: str, frame) -> None:
+    """Count one call under «<prefix> <module>.<function>» of ``frame``."""
+    module = frame.f_globals.get("__name__", "?").rsplit(".", 1)[-1]
+    entry = _totals[f"{prefix} {module}.{frame.f_code.co_name}"]
+    entry[0] += 1
+
+
 def command_key(args: list[str]) -> str:
     """«axe describe-ui», «axe describe-ui --point», «simctl io», …"""
     name = Path(args[0]).name if args and args[0] else "?"

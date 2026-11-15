@@ -38,3 +38,17 @@ async def test_subprocesses_are_counted(monkeypatch):
 
     assert {r["what"] for r in timing.snapshot()["rows"]} == {"echo hi"}
     assert "echo hi" in timing.report()
+
+
+def test_reads_are_counted_by_caller():
+    import sys
+
+    timing.install()
+    try:
+        def reader():
+            timing.record_caller("read by", sys._getframe(0))
+        reader()
+    finally:
+        timing.uninstall()
+    rows = {r["what"]: r for r in timing.snapshot()["rows"]}
+    assert rows["read by test_timing.reader"]["count"] == 1

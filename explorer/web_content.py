@@ -7,10 +7,9 @@ paragraph. A point query (``describe-ui --point``) does reach into the web
 page, so the empty area is probed with a grid of them and what they find is
 put back into the tree as children of that scroll view.
 
-A point query takes about 0.75 s; sixteen in parallel cover a 402×874
-screen (about 44 points) in 3–3.6 s. Points that fall inside an element
-already found are skipped. The grid is coarse on purpose: a web page
-answers a point query with the nearest element, not only one under it.
+A point query takes about 0.25 s with AXe 2; sixteen run in parallel.
+Points that fall inside an element already found are skipped; see grid for
+the layout.
 """
 
 from __future__ import annotations
@@ -22,8 +21,19 @@ from collections.abc import Awaitable, Callable
 # A scroll view at least this share of the screen with nothing in it but
 # its scroll bars is taken for a web page.
 MIN_AREA_SHARE = 0.15
-GRID_STEP_X = 100
-GRID_STEP_Y = 80
+# Probe layout. Web pages are mostly full-width rows, so the page is read
+# down one column at the left with a short step, plus a row across the top
+# and the bottom (bars: «Filter», tabs) and a sparse column at the right
+# (two cards side by side). On Ionic's schedule this found 29 of the 30
+# elements a 50×40 grid finds (the miss: an unlabelled button), with 37
+# queries in 1.6 s; the old 100×80 grid took 44 queries and 2.5 s and lost
+# 6 session titles — the very items to tap.
+LEFT_X = 100
+RIGHT_X = 300
+COLUMN_STEP_Y = 30
+RIGHT_STEP_Y = 60
+BAR_STEP_X = 60
+BAR_BAND = 50   # the top and bottom bands read across
 GRID_MARGIN = 16
 PARALLEL_PROBES = 16
 # The status bar: probes there hit SpringBoard's clock, signal and battery
@@ -95,20 +105,40 @@ def hollow_areas(roots: list, width: float, height: float) -> list[dict]:
 
 
 def grid(frame: dict, width: float, height: float) -> list[tuple[int, int]]:
-    """Probe points inside ``frame`` clipped to the screen, row by row."""
+    """Probe points inside ``frame`` clipped to the screen, in the order they
+    are probed: top bar, left column, bottom bar, right column. Later points
+    falling inside elements found earlier are skipped (see scan)."""
     left = max(0.0, frame.get("x", 0)) + GRID_MARGIN
     top = max(STATUS_BAR_PT, frame.get("y", 0)) + GRID_MARGIN / 2
     right = min(width, frame.get("x", 0) + frame.get("width", 0)) - GRID_MARGIN
     bottom = min(height, frame.get("y", 0) + frame.get("height", 0)) - GRID_MARGIN / 2
-    points = []
-    y = top
-    while y <= bottom:
-        x = left
-        while x <= right:
-            points.append((int(x), int(y)))
-            x += GRID_STEP_X
-        y += GRID_STEP_Y
+    if right < left or bottom < top:
+        return []
+
+    def across(y: float) -> list[tuple[int, int]]:
+        return [(int(x), int(y)) for x in _steps(left, right, BAR_STEP_X)]
+
+    def down(x: float, step: float, start: float, stop: float) -> list[tuple[int, int]]:
+        x = min(max(x, left), right)
+        return [(int(x), int(y)) for y in _steps(start, stop, step)]
+
+    body_top = min(top + BAR_BAND, bottom)
+    body_bottom = max(bottom - BAR_BAND, body_top)
+    points = across(top + BAR_BAND / 2)
+    points += down(frame.get("x", 0) + LEFT_X, COLUMN_STEP_Y, body_top, body_bottom)
+    if body_bottom > body_top:
+        points += across(bottom - BAR_BAND / 2)
+    points += down(frame.get("x", 0) + RIGHT_X, RIGHT_STEP_Y, body_top, body_bottom)
     return points
+
+
+def _steps(start: float, stop: float, step: float) -> list[float]:
+    values = []
+    value = start
+    while value <= stop:
+        values.append(value)
+        value += step
+    return values
 
 
 def _inside(point: tuple[int, int], frame: dict) -> bool:

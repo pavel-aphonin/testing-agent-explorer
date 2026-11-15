@@ -241,3 +241,19 @@ async def test_an_old_read_is_not_kept(monkeypatch):
     first, second = await _count_scans(monkeypatch, age=web_content.CACHE_SECONDS + 1)
     assert second == first
 
+
+
+def test_the_grid_reads_the_page_down_a_column_and_across_its_bars():
+    points = web_content.grid({"x": 0, "y": 0, "width": 402, "height": 874}, 402, 874)
+    left = sorted(y for x, y in points if x == web_content.LEFT_X)
+    # Session rows on Ionic's schedule are ~45 pt apart: the column step
+    # must be shorter (a 80 pt step lost 6 of 30 elements).
+    assert max(b - a for a, b in zip(left, left[1:])) <= web_content.COLUMN_STEP_Y
+    top_bar = [x for x, y in points if y == min(y for _, y in points)]
+    bottom_bar = [x for x, y in points if y == max(y for _, y in points)]
+    assert len(top_bar) >= 5 and len(bottom_bar) >= 5  # «Filter» at the top right, tabs at the bottom
+    assert any(x == web_content.RIGHT_X for x, _ in points)
+
+
+def test_an_area_too_small_for_a_grid_gets_none():
+    assert web_content.grid({"x": 0, "y": 900, "width": 402, "height": 40}, 402, 874) == []

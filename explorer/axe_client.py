@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import shutil
+import sys
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -976,6 +977,7 @@ class AXeExplorerClient:
         Now we surface ``SimulatorDownError`` so the worker can fail
         the run quickly instead of looping for 18 minutes.
         """
+        timing.record_caller("read by", sys._getframe(1))
         code, stdout, stderr = await _run([
             AXE, "describe-ui", "--udid", self._udid
         ])
