@@ -16,6 +16,7 @@ answers a point query with the nearest element, not only one under it.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable
 
 # A scroll view at least this share of the screen with nothing in it but
@@ -35,6 +36,17 @@ _SKIP_TYPES = frozenset({"Slider", "ScrollArea", "Group", "Application", "Window
 _SCROLL_BAR_TYPES = frozenset({"Slider"})
 
 Probe = Callable[[int, int], Awaitable["dict | None"]]
+
+# A page read stays valid until the next input or this many seconds. The
+# testbed's web screen was scanned 9 times in 42 steps (404 point queries):
+# every capture, every settle re-check, every scroll lookup read it again.
+CACHE_SECONDS = 10.0
+_cache: dict[tuple, tuple[float, list[dict]]] = {}
+
+
+def forget() -> None:
+    """Something was tapped, typed or swiped: pages may have changed."""
+    _cache.clear()
 
 
 def _frame(node: dict) -> dict:
@@ -150,7 +162,15 @@ async def fill_hollow_areas(roots: list, probe: Probe, width: float, height: flo
     number of elements added."""
     added = 0
     for area in hollow_areas(roots, width, height):
-        elements = await scan(area, probe, width, height)
+        key = tuple(round(_frame(area).get(k, 0)) for k in ("x", "y", "width", "height"))
+        cached = _cache.get(key)
+        if cached and time.monotonic() - cached[0] < CACHE_SECONDS:
+            elements = cached[1]
+        else:
+            elements = await scan(area, probe, width, height)
+            # An empty read may be a page still loading: read it again.
+            if elements:
+                _cache[key] = (time.monotonic(), elements)
         area.setdefault("children", []).extend(elements)
         added += len(elements)
     return added

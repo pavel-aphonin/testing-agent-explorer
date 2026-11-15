@@ -30,6 +30,7 @@ internal API; CLI / tests can pass any callable or None.
 from __future__ import annotations
 
 import asyncio
+import time as _time
 import logging
 import random
 import re
@@ -95,6 +96,18 @@ NEW_SCREEN_RECHECKS = 3
 NEW_SCREEN_RECHECK_DELAY_S = 1.0
 SPARSE_SCREEN_RECHECK_DELAY_S = 2.5
 
+# After a tap the screen is polled instead of waited for: most taps land
+# within a second, but a fixed 1.5 s wait plus a re-check cost 7.8 + 23
+# minutes of aweassist run 9. A tap with no visible effect is given up to
+# OUTCOME_MAX_S: «Открыть настройки iOS» switches apps after ~2 s, and a
+# shorter window let the next tap land inside iOS Settings (testbed run 26).
+OUTCOME_POLL_S = 0.3
+OUTCOME_MAX_S = 3.5
+
+
+def _clock() -> float:
+    return _time.monotonic()
+
 # PIN keypads: digits are never explored one by one — a few random codes
 # can lock a test account. The PIN from test data («pin») is entered as a
 # whole; after this many rejected entries in a row the agent stops trying.
@@ -119,6 +132,10 @@ OUTAGE_NAV_FAILURES = 3
 # Waits before retrying while the environment is down; then the run stops.
 OUTAGE_WAITS_S = (60.0, 120.0, 240.0)
 ENVIRONMENT_DOWN_REASON = "Environment unavailable"
+
+# Undelivered taps (simulator errors) before the element counts as tried.
+MAX_TAP_FAILURES = 2
+TAP_RETRY_DELAY_S = 2.0
 
 # Type aliases for the optional engine callbacks.
 PriorProvider = Callable[[ScreenNode], "dict[str, float] | Awaitable[dict[str, float]]"]
@@ -281,6 +298,8 @@ class ExplorationEngine:
         self._failed_navs = 0
         self._streak_screens: list[str] = []
         self._outage_waits = 0
+        # Taps the simulator failed to deliver, per element; see _tap_failed.
+        self._tap_failures: dict[tuple, int] = {}
 
         # PUCT selector and Go-Explore archive are the brains of the loop.
         # Both are stateful and live for the duration of one engine run.
@@ -788,12 +807,18 @@ class ExplorationEngine:
                     self.controller.tap_at(x, y), timeout=10
                 )
             if result.error:
+                # The simulator sometimes refuses input for a moment
+                # («Timed out creating the simulator remote automation
+                # session»); one more try before giving up on this tap.
+                await asyncio.sleep(TAP_RETRY_DELAY_S)
+                result = await asyncio.wait_for(self.controller.tap_at(x, y), timeout=10)
+            if result.error:
                 print(f"    ! Tap failed: {result.error}", flush=True)
-                self._record_self_loop(element, ActionType.TAP)
+                self._tap_failed(element, before_screen)
                 return
         except asyncio.TimeoutError:
             print(f"    ! Tap timed out", flush=True)
-            self._record_self_loop(element, ActionType.TAP)
+            self._tap_failed(element, before_screen)
             return
         except Exception as e:
             print(f"    ! Tap exception: {e}", flush=True)
@@ -808,11 +833,8 @@ class ExplorationEngine:
                 TAB_VISITED_WEIGHT / TAB_BAR_PRIOR_WEIGHT,
             )
 
-        print(f"    Waiting {SETTLE_DELAY}s for UI to settle...")
-        await asyncio.sleep(SETTLE_DELAY)
-
-        print(f"    Capturing screen...")
-        new_node = await self._capture_settled_screen(before=before_screen)
+        print(f"    Watching for the outcome...")
+        new_node = await self._await_outcome(before_screen)
         is_new = self.graph.add_node(new_node)
 
         # Record edge
@@ -1332,6 +1354,43 @@ class ExplorationEngine:
                 print(f"    [auto-dismiss] Failed: {exc}", flush=True)
             return
 
+    def _differs(self, node: ScreenNode, before: str | None) -> bool:
+        return node.screen_id != before and not (before and self._same_screen(node.screen_id, before))
+
+    async def _await_outcome(self, before: str | None) -> ScreenNode:
+        """The screen a tap led to, as soon as it is there.
+
+        Polls every OUTCOME_POLL_S. A changed screen is accepted once two
+        reads in a row agree (a screen still loading changes between them);
+        a screen that does not change for OUTCOME_MAX_S is a self-loop. A
+        new screen offering only one action is given longer to load, as in
+        _capture_settled_screen.
+        """
+        deadline = _clock() + OUTCOME_MAX_S
+        reads_left = round(OUTCOME_MAX_S / OUTCOME_POLL_S)  # and a bound on reads
+
+        def over() -> bool:
+            return _clock() >= deadline or reads_left <= 0
+
+        await asyncio.sleep(OUTCOME_POLL_S)
+        node = await self._capture_screen()
+        while True:
+            reads_left -= 1
+            if self._differs(node, before):
+                if node.screen_id not in self.graph.nodes and len(node.interactive_elements) <= 1:
+                    await asyncio.sleep(SPARSE_SCREEN_RECHECK_DELAY_S)
+                else:
+                    await asyncio.sleep(OUTCOME_POLL_S)
+                again = await self._capture_screen()
+                if again.screen_id == node.screen_id or over():
+                    return again
+                node = again
+                continue
+            if over():
+                return node
+            await asyncio.sleep(OUTCOME_POLL_S)
+            node = await self._capture_screen()
+
     async def _capture_settled_screen(self, before: str | None = None) -> ScreenNode:
         """Capture after an action, re-checking results that may be early.
 
@@ -1414,18 +1473,14 @@ class ExplorationEngine:
             t1 = time.monotonic()
             print(f"      [capture] Found {len(elements)} elements ({t1-t0:.1f}s)", flush=True)
 
-            # Use cached screenshot from vision client if available
-            cached = getattr(self.controller, '_last_screenshot_b64', None)
-            if cached:
-                screenshot = cached
+            # Use cached screenshot from vision client if available. Other
+            # screenshots are only taken for screens the graph does not have
+            # yet (below): a known screen already has one, and taking it on
+            # every read cost 8.6 of 102 minutes in aweassist run 9.
+            screenshot = getattr(self.controller, '_last_screenshot_b64', None)
+            if screenshot:
                 self.controller._last_screenshot_b64 = None
-                t2 = time.monotonic()
                 print(f"      [capture] Using cached screenshot", flush=True)
-            else:
-                print(f"      [capture] Taking screenshot...", flush=True)
-                screenshot = await self.controller.take_screenshot()
-                t2 = time.monotonic()
-                print(f"      [capture] Screenshot done ({t2-t1:.1f}s)", flush=True)
 
             node = analyze_screen(
                 elements=elements,
@@ -1458,8 +1513,12 @@ class ExplorationEngine:
                     el for el in node.interactive_elements
                     if not (el.element_type == "Button" and el.label in KEYPAD_DIGITS)
                 ]
+            node = self._merge_into_known_variant(node)
+            if node.screen_id not in self.graph.nodes and not node.screenshot_b64:
+                node.screenshot_b64 = await self.controller.take_screenshot()
+            t2 = time.monotonic()
             print(f"      [capture] Analyzed: {node.name!r}, {len(node.interactive_elements)} interactive ({t2-t0:.1f}s total)", flush=True)
-            return self._merge_into_known_variant(node)
+            return node
         except Exception as e:
             import traceback
             print(f"      [capture] ERROR: {e}", flush=True)
@@ -1531,6 +1590,15 @@ class ExplorationEngine:
         # Stored frames are from another layout; look elements up live.
         self._scrolled_screens.add(known.screen_id)
         return known
+
+    def _tap_failed(self, element: ElementSnapshot, screen_id: str | None) -> None:
+        """A tap the simulator never delivered says nothing about the
+        element: it stays untried, up to MAX_TAP_FAILURES times (testbed
+        run 25 lost both ways out of the web detail to two such taps)."""
+        key = (screen_id, element.element_type, element.label, element.test_id)
+        self._tap_failures[key] = self._tap_failures.get(key, 0) + 1
+        if self._tap_failures[key] >= MAX_TAP_FAILURES:
+            self._record_self_loop(element, ActionType.TAP)
 
     def _is_forbidden(self, element: ElementSnapshot) -> bool:
         names = [n for n in (element.label, element.test_id) if n]

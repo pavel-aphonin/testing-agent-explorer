@@ -75,7 +75,10 @@ async def _explore_axe(bundle_id, device_id, output, resume, test_data, forbidde
     from explorer.engine import ExplorationEngine
     from explorer.visualizer import export_all
 
+    from explorer import timing
+
     client = AXeExplorerClient()
+    timing.install()
     try:
         print(f">>> Connecting via AXe + idb...", flush=True)
         await client.connect(udid=device_id)
@@ -91,6 +94,9 @@ async def _explore_axe(bundle_id, device_id, output, resume, test_data, forbidde
         print(f"\n{'='*50}\nExploration complete!\n{'='*50}", flush=True)
         export_all(graph, output)
     finally:
+        print(timing.report(), flush=True)
+        timing.save(f"{output}/timing.json")
+        timing.uninstall()
         await client.disconnect()
 
 

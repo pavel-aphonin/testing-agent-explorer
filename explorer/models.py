@@ -114,6 +114,9 @@ class GraphEdge(BaseModel):
     timestamp: datetime = Field(default_factory=datetime.now)
     success: bool = True
     notes: str = ""
+    # Failed to replay: the element it taps is gone. One-shot screens leave
+    # such edges behind (Wikipedia: «Enable location» answered once).
+    stale: bool = False
 
 
 class AppGraph(BaseModel):
@@ -203,13 +206,22 @@ class AppGraph(BaseModel):
         return {sid for sid in self.nodes if self.get_unexplored_actions(sid)}
 
     def find_path(self, from_id: str, to_id: str) -> list[GraphEdge] | None:
-        """BFS shortest path between two screens. Returns list of edges or None."""
+        """BFS shortest path between two screens. Returns list of edges or None.
+
+        Stale edges are avoided while any other way exists."""
+        return self._find_path(from_id, to_id, avoid_stale=True) or self._find_path(
+            from_id, to_id, avoid_stale=False
+        )
+
+    def _find_path(self, from_id: str, to_id: str, avoid_stale: bool) -> list[GraphEdge] | None:
         if from_id == to_id:
             return []
 
         # Build adjacency: screen_id -> [(edge, target_screen_id)]
         adj: dict[str, list[tuple[GraphEdge, str]]] = {}
         for e in self.edges:
+            if avoid_stale and e.stale:
+                continue
             if e.source_screen_id not in adj:
                 adj[e.source_screen_id] = []
             adj[e.source_screen_id].append((e, e.target_screen_id))

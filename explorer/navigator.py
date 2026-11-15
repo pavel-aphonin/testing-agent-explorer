@@ -13,6 +13,8 @@ logger = logging.getLogger("explorer.navigator")
 
 # Timing constants (seconds)
 SETTLE_DELAY = 1.5
+# Detours tried when a step of a path no longer replays.
+MAX_REROUTES = 2
 LAUNCH_DELAY = 3.0
 BACK_DELAY = 1.0
 MAX_BACK_ATTEMPTS = 5
@@ -79,7 +81,7 @@ async def go_back_to_screen(
                     f"Found path from {new_screen_id[:8]} to {target_screen_id[:8]} "
                     f"({len(path)} steps)"
                 )
-                result = await replay_path(controller, path, capture_fn, replay_input)
+                result = await replay_path(controller, path, capture_fn, replay_input, graph)
                 if result == target_screen_id:
                     return result
                 if result:
@@ -121,7 +123,7 @@ async def relaunch_and_navigate(
         )
         return start_screen_id  # Return where we are, caller decides
 
-    return await replay_path(controller, path, capture_fn, replay_input)
+    return await replay_path(controller, path, capture_fn, replay_input, graph)
 
 
 async def replay_path(
@@ -129,6 +131,7 @@ async def replay_path(
     path: list[GraphEdge],
     capture_fn,
     replay_input=None,
+    graph: AppGraph | None = None,
 ) -> str | None:
     """Replay a sequence of actions to navigate along a known path.
 
@@ -138,7 +141,11 @@ async def replay_path(
     so typing it back can never get past a login screen. The engine
     passes a callback that refills the form from test data and submits.
     """
-    for edge in path:
+    target = path[-1].target_screen_id if path else None
+    reroutes = MAX_REROUTES
+    remaining = list(path)
+    while remaining:
+        edge = remaining.pop(0)
         if edge.action.action_type == "input" and replay_input is not None:
             success = await replay_input(edge.action)
         else:
@@ -146,7 +153,17 @@ async def replay_path(
         if not success:
             logger.warning(f"Failed to replay action: {edge.action}")
             current_id, _ = await capture_fn()
-            return current_id
+            # The element is gone; find another way from here, once or
+            # twice (Wikipedia run: «Map» and «Search» written off because
+            # their only path went through «Enable location»).
+            edge.stale = True
+            detour = graph.find_path(current_id, target) if graph is not None and target else None
+            if reroutes <= 0 or not detour or any(e.stale for e in detour):
+                return current_id
+            reroutes -= 1
+            logger.info(f"Rerouting from {current_id[:8]} to {target[:8]} ({len(detour)} steps)")
+            remaining = list(detour)
+            continue
         await asyncio.sleep(SETTLE_DELAY)
 
     current_id, _ = await capture_fn()

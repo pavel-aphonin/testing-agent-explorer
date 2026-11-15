@@ -16,10 +16,11 @@ import logging
 import os
 import re
 import shutil
+import time
 import unicodedata
 from dataclasses import dataclass
 
-from explorer import web_content
+from explorer import timing, web_content
 
 logger = logging.getLogger("explorer.axe_client")
 
@@ -443,6 +444,9 @@ async def _run(args: list[str], timeout: float = 15) -> tuple[int, str, str]:
         env.setdefault("AXE_HID_STABILIZATION_MS", _AXE_HID_STABILIZATION_MS)
         if len(args) > 1 and args[1] in _HID_SUBCOMMANDS:
             await _note_hid_connection(args)
+    if not (len(args) > 1 and args[1] == "describe-ui"):
+        web_content.forget()  # input or a relaunch may change any page
+    started = time.monotonic()
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
@@ -455,6 +459,8 @@ async def _run(args: list[str], timeout: float = 15) -> tuple[int, str, str]:
     except asyncio.TimeoutError:
         proc.kill()
         return -1, "", "TIMEOUT"
+    finally:
+        timing.record(timing.command_key(args), time.monotonic() - started)
 
 
 @dataclass

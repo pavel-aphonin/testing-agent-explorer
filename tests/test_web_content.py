@@ -8,6 +8,15 @@ import json
 from explorer import axe_client, web_content
 from explorer.axe_client import AXeExplorerClient
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _fresh_cache():
+    web_content.forget()
+    yield
+    web_content.forget()
+
 
 def _node(type_, label="", children=(), frame=(0, 0, 402, 874), value=""):
     x, y, w, h = frame
@@ -146,3 +155,55 @@ def test_a_scroll_container_does_not_change_the_screen():
     with_container = [{"type": "ScrollArea", "label": None, "frame": {"x": 0, "y": 0, "width": 402, "height": 874}}, *rows]
 
     assert compute_screen_id(rows) == compute_screen_id(with_container)
+
+
+async def _count_scans(monkeypatch, *, between=None, empty=False, age=0.0):
+    web_content.forget()
+    calls = []
+
+    async def probe(x, y):
+        calls.append((x, y))
+        return None if empty else LINK
+
+    async def read():
+        await web_content.fill_hollow_areas(_app(_web_view()), probe, 402, 874)
+
+    await read()
+    first = len(calls)
+    if between:
+        await between()
+    if age:
+        monkeypatch.setattr(web_content.time, "monotonic", lambda real=web_content.time.monotonic: real() + age)
+    await read()
+    return first, len(calls) - first
+
+
+async def test_a_page_is_not_scanned_twice_without_input(monkeypatch):
+    first, second = await _count_scans(monkeypatch)
+    assert first > 0 and second == 0
+
+
+async def test_input_makes_the_page_scanned_again(monkeypatch):
+    async def tap():
+        async def ok(*args, **kwargs):
+            class P:
+                returncode = 0
+                async def communicate(self):
+                    return b"", b""
+            return P()
+        monkeypatch.setattr(axe_client.asyncio, "create_subprocess_exec", ok)
+        await axe_client._run([axe_client.AXE or "axe", "tap", "-x", "1", "-y", "1"])
+
+    first, second = await _count_scans(monkeypatch, between=tap)
+    assert second == first
+
+
+async def test_an_empty_read_is_not_kept(monkeypatch):
+    first, second = await _count_scans(monkeypatch, empty=True)
+    assert second == first
+
+
+async def test_an_old_read_is_not_kept(monkeypatch):
+    first, second = await _count_scans(monkeypatch, age=web_content.CACHE_SECONDS + 1)
+    assert second == first
+
