@@ -113,6 +113,9 @@ def _clock() -> float:
 # whole; after this many rejected entries in a row the agent stops trying.
 MAX_PIN_FAILURES = 2
 PIN_DIGIT_DELAY_S = 0.3
+# The app may check the PIN on a server; see _await_pin_verdict.
+PIN_VERIFY_POLL_S = 0.5
+PIN_VERIFY_MAX_S = 15.0
 KEYPAD_DIGITS = frozenset("0123456789")
 
 # SpringBoard alerts cleared on launch before the first capture.
@@ -298,6 +301,9 @@ class ExplorationEngine:
         self._failed_navs = 0
         self._streak_screens: list[str] = []
         self._outage_waits = 0
+        # Screens (PIN pads aside) passed during the current trip to a
+        # frontier screen; see _navigation_failed.
+        self._screens_seen_in_trip: set[str] = set()
         # Taps the simulator failed to deliver, per element; see _tap_failed.
         self._tap_failures: dict[tuple, int] = {}
 
@@ -425,6 +431,7 @@ class ExplorationEngine:
                         f"(unexplored={frontier.unexplored_count}, "
                         f"visits={frontier.visit_count})"
                     )
+                    self._screens_seen_in_trip = set()
                     result = await go_back_to_screen(
                         self.controller,
                         self.graph,
@@ -984,7 +991,7 @@ class ExplorationEngine:
         print(f"    PIN keypad on {self._screen_name()!r}; entering PIN from test data", flush=True)
         if not await self._type_pin():
             return False
-        new_node = await self._capture_settled_screen(before=before)
+        new_node = await self._await_pin_verdict()
         is_new = self.graph.add_node(new_node)
         self.graph.add_edge(GraphEdge(
             source_screen_id=before,
@@ -997,7 +1004,7 @@ class ExplorationEngine:
             ),
         ))
         self.current_screen_id = new_node.screen_id
-        if new_node.screen_id == before:
+        if new_node.screen_id in self._keypad_screens:
             self._pin_failures += 1
             logger.warning(
                 "[Step %d] PIN not accepted (%d/%d)",
@@ -1007,6 +1014,24 @@ class ExplorationEngine:
         self._pin_failures = 0
         await self._on_screen_landed(new_node, is_new=is_new, step=step)
         return True
+
+    async def _await_pin_verdict(self) -> ScreenNode:
+        """The screen after the PIN, once the app has decided.
+
+        aweassist checks the code on its server with a spinner over the
+        keypad. With faster reads (AXe 2, run 10) the agent took the keypad
+        under the spinner for a rejection and typed the PIN again over the
+        running check, twice: «PIN not accepted» 2/2 and the run was over.
+        The keypad still showing after PIN_VERIFY_MAX_S is a rejection.
+        """
+        deadline = _clock() + PIN_VERIFY_MAX_S
+        reads_left = round(PIN_VERIFY_MAX_S / PIN_VERIFY_POLL_S)
+        while True:
+            await asyncio.sleep(PIN_VERIFY_POLL_S)
+            node = await self._capture_screen()
+            reads_left -= 1
+            if node.screen_id not in self._keypad_screens or _clock() >= deadline or reads_left <= 0:
+                return node
 
     async def _fill_form_happy_path(
         self,
@@ -1532,6 +1557,8 @@ class ExplorationEngine:
             node = await self._capture_screen()
             self.graph.add_node(node)
             self.current_screen_id = node.screen_id
+            if node.screen_id not in self._keypad_screens:
+                self._screens_seen_in_trip.add(node.screen_id)
             return (node.screen_id, [])
         except Exception as e:
             logger.error(f"Capture failed: {e}")
@@ -1621,6 +1648,11 @@ class ExplorationEngine:
         backend is down: those write-offs are undone, the agent waits and
         tries again, and stops if the environment does not come back.
         """
+        if len(self._screens_seen_in_trip) >= 2:
+            # The app moved between screens on the way: it is up, only this
+            # target is out of reach (Wikipedia run 2 stopped as «down» while
+            # its feed kept changing under recorded paths).
+            self._app_responds()
         self._failed_navs += 1
         if self._failed_navs < OUTAGE_NAV_FAILURES:
             self._note_unreachable(screen_id, step)

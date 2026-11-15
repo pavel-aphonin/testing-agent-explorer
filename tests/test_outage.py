@@ -180,3 +180,48 @@ async def test_a_number_pad_under_a_text_field_is_not_a_pin_pad(tmp_path):
     node = await engine._capture_screen()
 
     assert node.screen_id not in engine._keypad_screens
+
+
+async def test_a_trip_through_several_screens_is_not_an_outage(tmp_path, waits):
+    # Wikipedia run 2: paths replayed, the app moved from screen to screen,
+    # only the targets (a changing feed) were never found again.
+    engine = _engine(tmp_path)
+    for target in ["accounts", "payments", "profile", "cards"]:
+        engine._screens_seen_in_trip = {"home", "map"}
+        await engine._navigation_failed(target, step=1)
+
+    assert waits == []
+    assert engine.graph.stop_reason is None
+
+
+async def test_pin_pads_do_not_count_as_movement(tmp_path, waits):
+    engine = _engine(tmp_path)
+    for target in ["accounts", "payments", "profile"]:
+        engine._screens_seen_in_trip = {"home"}
+        await engine._navigation_failed(target, step=1)
+
+    assert waits == [OUTAGE_WAITS_S[0]]
+
+
+async def test_each_trip_counts_its_own_screens(tmp_path, waits, monkeypatch):
+    async def nowhere(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(engine_module, "go_back_to_screen", nowhere)
+    engine = _engine(tmp_path)
+    engine.controller.tree = _app("Деньги", _button("Числовой код", 230))
+    engine.max_steps = 50
+    engine._screens_seen_in_trip = {"left", "over"}  # from an earlier trip
+
+    graph = await engine.run()
+
+    assert graph.stop_reason == ENVIRONMENT_DOWN_REASON
+
+
+async def test_a_pin_pad_passed_on_the_way_is_not_movement(tmp_path):
+    from tests.test_engine import _keypad_engine, _keypad_tree, _KeypadController
+
+    engine = _keypad_engine(tmp_path, _KeypadController(), test_data={})
+    await engine._capture_screen_id()
+
+    assert engine._screens_seen_in_trip == set()

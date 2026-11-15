@@ -189,3 +189,65 @@ async def test_a_variant_of_the_same_screen_is_no_change(tmp_path, monkeypatch):
     await engine._await_outcome(main.screen_id)
 
     assert clock["t"] >= OUTCOME_MAX_S
+
+
+async def test_the_pin_is_not_typed_again_while_the_app_checks_it(tmp_path, monkeypatch):
+    # aweassist run 10: a spinner over the keypad while the server checked
+    # the code; the agent typed the PIN twice more and spent its budget.
+    from tests.test_engine import _KeypadController, _keypad_engine, _keypad_tree, _no_sleep
+
+    monkeypatch.setattr("explorer.engine.asyncio.sleep", _no_sleep)
+
+    class _SlowServer(_KeypadController):
+        checks = 0
+
+        async def get_ui_elements(self):
+            if len(self.typed) == 4 and self.checks < 5:
+                self.checks += 1
+                checking = _keypad_tree()
+                checking[0]["children"] = []
+                checking.append({"type": "GenericElement", "label": "Числовой код", "value": "Введено символов 4",
+                                 "test_id": "", "enabled": True,
+                                 "frame": {"x": 100, "y": 250, "width": 200, "height": 20}, "children": []})
+                return checking
+            return self.tree
+
+        async def tap_by_id(self, test_id):
+            self.taps_by_id.append(test_id)
+            self.typed += test_id
+            if len(self.typed) == 4 and self.typed == self.pin:
+                self.tree = _app("Деньги", _button("Главная", 200))
+            from tests.test_engine import _Result
+            return _Result()
+
+    controller = _SlowServer()
+    engine = _keypad_engine(tmp_path, controller, test_data={"pin": "1234"})
+    node = await engine._capture_screen()
+    engine.graph.add_node(node)
+    engine.current_screen_id = node.screen_id
+
+    assert await engine._enter_pin_here(step=1)
+
+    assert controller.taps_by_id == list("1234")
+    assert engine._pin_failures == 0
+    assert [el.label for el in engine.graph.nodes[engine.current_screen_id].interactive_elements] == ["Главная"]
+
+
+async def test_a_keypad_that_comes_back_changed_is_still_a_rejection(tmp_path, monkeypatch):
+    from tests.test_engine import _KeypadController, _keypad_engine, _keypad_tree, _no_sleep
+
+    monkeypatch.setattr("explorer.engine.asyncio.sleep", _no_sleep)
+    controller = _KeypadController()
+    engine = _keypad_engine(tmp_path, controller, test_data={"pin": "9999"})
+    node = await engine._capture_screen()
+    engine.graph.add_node(node)
+    engine.current_screen_id = node.screen_id
+    rejected = _keypad_tree()
+    rejected.append({"type": "Heading", "label": "Неверный код", "value": None, "test_id": "", "enabled": True,
+                     "frame": {"x": 100, "y": 150, "width": 200, "height": 30}, "children": []})
+    controller.tree = rejected
+
+    await engine._enter_pin_here(step=1)
+
+    assert engine.current_screen_id != node.screen_id
+    assert engine._pin_failures == 1

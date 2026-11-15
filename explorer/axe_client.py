@@ -396,6 +396,18 @@ _HID_SUBCOMMANDS = frozenset({
     "tap", "type", "swipe", "drag", "button", "key", "key-sequence",
     "key-combo", "touch", "gesture", "slider", "batch",
 })
+# simctl commands that change what is on screen. A screenshot does not:
+# forgetting web pages on it made the cache useless (testbed run 27, 360
+# point queries in 42 steps).
+_SIMCTL_SCREEN_CHANGES = frozenset({"launch", "terminate", "openurl", "install", "uninstall"})
+
+
+def _changes_screen(args: list[str]) -> bool:
+    if args and args[0] == AXE:
+        return len(args) > 1 and args[1] in _HID_SUBCOMMANDS
+    return len(args) > 2 and args[1] == "simctl" and args[2] in _SIMCTL_SCREEN_CHANGES
+
+
 _DTUHIDD_RESTART_EVERY = 80
 _DTUHIDD_LABEL = "system/com.apple.coredevice.dtuhidd"
 _hid_connections: dict[str, int] = {}
@@ -444,7 +456,7 @@ async def _run(args: list[str], timeout: float = 15) -> tuple[int, str, str]:
         env.setdefault("AXE_HID_STABILIZATION_MS", _AXE_HID_STABILIZATION_MS)
         if len(args) > 1 and args[1] in _HID_SUBCOMMANDS:
             await _note_hid_connection(args)
-    if not (len(args) > 1 and args[1] == "describe-ui"):
+    if _changes_screen(args):
         web_content.forget()  # input or a relaunch may change any page
     started = time.monotonic()
     proc = await asyncio.create_subprocess_exec(

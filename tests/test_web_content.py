@@ -178,9 +178,43 @@ async def _count_scans(monkeypatch, *, between=None, empty=False, age=0.0):
     return first, len(calls) - first
 
 
-async def test_a_page_is_not_scanned_twice_without_input(monkeypatch):
+async def test_a_page_is_reused_once_two_scans_agree(monkeypatch):
     first, second = await _count_scans(monkeypatch)
-    assert first > 0 and second == 0
+    assert second == first  # the second scan confirms the first
+
+    calls = []
+
+    async def probe(x, y):
+        calls.append((x, y))
+        return LINK
+
+    await web_content.fill_hollow_areas(_app(_web_view()), probe, 402, 874)
+    assert calls == []  # the third read is served from the cache
+
+
+async def test_a_half_loaded_page_is_not_reused(monkeypatch):
+    seen = []
+
+    async def probe(x, y):
+        return LINK if len(seen) < 1 else TEXT
+
+    async def read():
+        tree = _app(_web_view())
+        await web_content.fill_hollow_areas(tree, probe, 402, 874)
+        seen.append(1)
+        return [n["AXLabel"] for n in tree[0]["children"][0]["children"][0]["children"][3:]]
+
+    assert await read() == ["Открыть деталь"]
+    assert await read() == ["Содержимое веб-страницы"]  # rescanned: the first read was not confirmed
+
+
+async def test_a_screenshot_does_not_make_pages_stale(monkeypatch):
+    from explorer.axe_client import _changes_screen
+
+    assert not _changes_screen(["xcrun", "simctl", "io", "SIM", "screenshot", "-"])
+    assert not _changes_screen([axe_client.AXE, "describe-ui", "--point", "1,2", "--udid", "SIM"])
+    assert _changes_screen([axe_client.AXE, "tap", "-x", "1", "-y", "2", "--udid", "SIM"])
+    assert _changes_screen(["xcrun", "simctl", "launch", "SIM", "com.app"])
 
 
 async def test_input_makes_the_page_scanned_again(monkeypatch):

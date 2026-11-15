@@ -40,8 +40,11 @@ Probe = Callable[[int, int], Awaitable["dict | None"]]
 # A page read stays valid until the next input or this many seconds. The
 # testbed's web screen was scanned 9 times in 42 steps (404 point queries):
 # every capture, every settle re-check, every scroll lookup read it again.
+# A read is reused only once two scans in a row agree: the first scan of a
+# page still loading found 1 of its 2 elements (testbed run 27), and reusing
+# it would make the next read «agree» with a half-loaded page.
 CACHE_SECONDS = 10.0
-_cache: dict[tuple, tuple[float, list[dict]]] = {}
+_cache: dict[tuple, tuple[float, list[dict], bool]] = {}
 
 
 def forget() -> None:
@@ -164,13 +167,15 @@ async def fill_hollow_areas(roots: list, probe: Probe, width: float, height: flo
     for area in hollow_areas(roots, width, height):
         key = tuple(round(_frame(area).get(k, 0)) for k in ("x", "y", "width", "height"))
         cached = _cache.get(key)
-        if cached and time.monotonic() - cached[0] < CACHE_SECONDS:
+        fresh = cached is not None and time.monotonic() - cached[0] < CACHE_SECONDS
+        if fresh and cached[2]:
             elements = cached[1]
         else:
             elements = await scan(area, probe, width, height)
             # An empty read may be a page still loading: read it again.
             if elements:
-                _cache[key] = (time.monotonic(), elements)
+                confirmed = fresh and cached[1] == elements
+                _cache[key] = (time.monotonic(), elements, confirmed)
         area.setdefault("children", []).extend(elements)
         added += len(elements)
     return added
