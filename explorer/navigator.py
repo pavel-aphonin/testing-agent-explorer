@@ -26,6 +26,16 @@ BACK_DELAY = 1.0
 CHANGE_POLL_S = 0.3
 BACK_MAX_S = 1.5
 STEP_MAX_S = 3.5
+# Polls start every CHANGE_POLL_S and slow down by POLL_GROWTH up to
+# POLL_MAX_S: a screen that does not change is not read 11 times in 3.5 s.
+POLL_GROWTH = 1.5
+POLL_MAX_S = 1.0
+# Between replayed steps the next step's element is waited for (it is
+# looked up anyway) instead of the whole screen settling; only a short
+# pause lets the transition animation finish first.
+STEP_ANIMATION_S = 0.4
+ELEMENT_WAIT_S = 3.5
+ELEMENT_TRIES = 6
 MAX_BACK_ATTEMPTS = 5
 # Consecutive back presses that leave the screen unchanged before giving
 # up on back navigation for this trip.
@@ -39,6 +49,7 @@ async def go_back_to_screen(
     target_screen_id: str,
     capture_fn,
     replay_input=None,
+    diagnose=None,
 ) -> str | None:
     """
     Navigate from current screen to target screen.
@@ -91,7 +102,7 @@ async def go_back_to_screen(
                     f"Found path from {new_screen_id[:8]} to {target_screen_id[:8]} "
                     f"({len(path)} steps)"
                 )
-                result = await replay_path(controller, path, capture_fn, replay_input, graph)
+                result = await replay_path(controller, path, capture_fn, replay_input, graph, diagnose)
                 if result == target_screen_id:
                     return result
                 if result:
@@ -100,7 +111,7 @@ async def go_back_to_screen(
     # Strategy 2: Relaunch app + replay
     logger.info("Back button failed, relaunching app")
     return await relaunch_and_navigate(
-        controller, graph, target_screen_id, capture_fn, replay_input
+        controller, graph, target_screen_id, capture_fn, replay_input, diagnose
     )
 
 
@@ -110,6 +121,7 @@ async def relaunch_and_navigate(
     target_screen_id: str,
     capture_fn,
     replay_input=None,
+    diagnose=None,
 ) -> str | None:
     """Kill app, relaunch, navigate to target via known path."""
     try:
@@ -144,7 +156,7 @@ async def relaunch_and_navigate(
         )
         return start_screen_id  # Return where we are, caller decides
 
-    return await replay_path(controller, path, capture_fn, replay_input, graph)
+    return await replay_path(controller, path, capture_fn, replay_input, graph, diagnose)
 
 
 async def replay_path(
@@ -153,6 +165,7 @@ async def replay_path(
     capture_fn,
     replay_input=None,
     graph: AppGraph | None = None,
+    diagnose=None,
 ) -> str | None:
     """Replay a sequence of actions to navigate along a known path.
 
@@ -174,6 +187,10 @@ async def replay_path(
             success = await replay_action(controller, edge.action)
         if not success:
             logger.warning(f"Failed to replay action: {edge.action}")
+            if diagnose is not None:
+                # What was on screen instead (Wikipedia run 4: the «Places»
+                # tab did not replay on a screen whose saved tree has it).
+                await diagnose("replay-failed", edge)
             current_id, _ = await capture_fn()
             # The element is gone; find another way from here, once or
             # twice (Wikipedia run: «Map» and «Search» written off because
@@ -186,7 +203,10 @@ async def replay_path(
             logger.info(f"Rerouting from {current_id[:8]} to {target[:8]} ({len(detour)} steps)")
             remaining = list(detour)
             continue
-        await _await_change(controller, before, STEP_MAX_S, SETTLE_DELAY)
+        if remaining and before is not None:
+            await asyncio.sleep(STEP_ANIMATION_S)
+        else:
+            await _await_change(controller, before, STEP_MAX_S, SETTLE_DELAY)
 
     current_id, _ = await capture_fn()
     return current_id
@@ -212,13 +232,29 @@ async def _await_change(controller, before: str | None, max_s: float, fallback_s
     deadline = time.monotonic() + max_s
     reads_left = round(max_s / CHANGE_POLL_S)
     previous = before
+    delay = CHANGE_POLL_S
     while reads_left > 0 and time.monotonic() < deadline:
-        await asyncio.sleep(CHANGE_POLL_S)
+        await asyncio.sleep(delay)
         current = await _fingerprint(controller)
         reads_left -= 1
         if current != before and current == previous:
             return
+        # Changing: confirm soon. Still the same: look again less often.
+        delay = CHANGE_POLL_S if current != previous else min(delay * POLL_GROWTH, POLL_MAX_S)
         previous = current
+
+
+async def _await_element(scroll, action: ActionDetail) -> dict | None:
+    """The element of a replayed tap, once the screen shows it."""
+    deadline = time.monotonic() + ELEMENT_WAIT_S
+    delay = CHANGE_POLL_S
+    for _ in range(ELEMENT_TRIES):
+        frame = await scroll(None, action.target_label, action.target_test_id, action.target_frame)
+        if frame is not None or time.monotonic() >= deadline:
+            return frame
+        await asyncio.sleep(delay)
+        delay = min(delay * POLL_GROWTH, POLL_MAX_S)
+    return None
 
 
 async def replay_action(controller, action: ActionDetail) -> bool:
@@ -230,9 +266,7 @@ async def replay_action(controller, action: ActionDetail) -> bool:
                 if action.target_frame and scroll:
                     # The recorded frame may be below the fold or stale
                     # (the screen was scrolled when it was recorded).
-                    frame = await scroll(
-                        None, action.target_label, action.target_test_id, action.target_frame,
-                    )
+                    frame = await _await_element(scroll, action)
                     if frame is None:
                         return False
                     result = await controller.tap_at(

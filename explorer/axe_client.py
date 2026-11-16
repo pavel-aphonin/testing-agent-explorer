@@ -722,7 +722,8 @@ class AXeExplorerClient:
         deadline = _time.monotonic() + (timeout_ms / 1000.0)
         poll_ms = 100
         while _time.monotonic() < deadline:
-            elems = await self.get_ui_elements()
+            # The keyboard is native: no need to probe web pages here.
+            elems = await self.get_ui_elements(web=False)
             for el in elems:
                 kind = (el.get("type") or el.get("kind") or "")
                 if "Keyboard" in kind:
@@ -861,7 +862,7 @@ class AXeExplorerClient:
     async def _field_holds(self, test_id: str, text: str) -> bool:
         """True iff the field's AX value equals ``text``. Secure fields
         expose one bullet per character, so only the length is checked."""
-        for el in await self.get_ui_elements():
+        for el in await self.get_ui_elements(web=False):
             if el.get("test_id") != test_id:
                 continue
             value = el.get("value") or ""

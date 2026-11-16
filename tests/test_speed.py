@@ -444,3 +444,44 @@ async def test_the_first_screen_is_a_launch_screen(tmp_path):
     graph = await engine.run()
 
     assert graph.launch_screens == [next(iter(graph.nodes))]
+
+
+async def test_a_diagnostic_keeps_the_tree_and_a_screenshot(tmp_path):
+    import base64
+    import json as _json
+
+    from explorer.models import ActionDetail, ActionType, GraphEdge
+
+    controller = _CountingShots(tree=HOME)
+    controller._last_read = (0, 0.0, [{"type": "Button", "label": "Places"}], True)
+
+    async def png():
+        return base64.b64encode(b"PNG").decode()
+
+    controller.take_screenshot = png
+    engine = _engine(tmp_path, controller)
+    edge = GraphEdge(source_screen_id="a", target_screen_id="b",
+                     action=ActionDetail(action_type=ActionType.TAP, target_label="Places"))
+
+    await engine._diagnose("replay-failed", edge)
+
+    folder = tmp_path / "diagnostics"
+    record = _json.loads((folder / "001-replay-failed.json").read_text())
+    assert record["tree"] == [{"type": "Button", "label": "Places"}]
+    assert record["edge"]["action"]["target_label"] == "Places"
+    assert (folder / "001-replay-failed.png").read_bytes() == b"PNG"
+
+
+async def test_a_tap_without_effect_is_read_only_a_few_times(tmp_path, monkeypatch):
+    from explorer.engine import native_fingerprint
+
+    _clocked(monkeypatch)
+    controller = _AxeLike(tree=HOME, screens=[HOME])
+    engine = _engine(tmp_path, controller)
+    home = await engine._capture_screen()
+    engine.graph.add_node(home)
+    controller.reads = []
+
+    await engine._await_outcome(home.screen_id, native_fingerprint(HOME))
+
+    assert len(controller.reads) <= 7  # was 12: a read every 0.3 s for 3.5 s

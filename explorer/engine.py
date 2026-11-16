@@ -30,6 +30,8 @@ internal API; CLI / tests can pass any callable or None.
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import time as _time
 import logging
 import random
@@ -103,6 +105,8 @@ SPARSE_SCREEN_RECHECK_DELAY_S = 2.5
 # shorter window let the next tap land inside iOS Settings (testbed run 26).
 OUTCOME_POLL_S = 0.3
 OUTCOME_MAX_S = 3.5
+OUTCOME_POLL_GROWTH = 1.5
+OUTCOME_POLL_MAX_S = 1.0
 
 
 def _clock() -> float:
@@ -135,6 +139,9 @@ OUTAGE_NAV_FAILURES = 3
 # Waits before retrying while the environment is down; then the run stops.
 OUTAGE_WAITS_S = (60.0, 120.0, 240.0)
 ENVIRONMENT_DOWN_REASON = "Environment unavailable"
+
+# Failure snapshots kept per run (see _diagnose).
+MAX_DIAGNOSTICS = 30
 
 # Undelivered taps (simulator errors) before the element counts as tried.
 MAX_TAP_FAILURES = 2
@@ -304,6 +311,8 @@ class ExplorationEngine:
         # Screens (PIN pads aside) passed during the current trip to a
         # frontier screen; see _navigation_failed.
         self._screens_seen_in_trip: set[str] = set()
+        # Diagnostics written so far; see _diagnose.
+        self._diagnostics = 0
         # Taps the simulator failed to deliver, per element; see _tap_failed.
         self._tap_failures: dict[tuple, int] = {}
 
@@ -441,6 +450,7 @@ class ExplorationEngine:
                         frontier.state_id,
                         self._capture_screen_id,
                         replay_input=self._replay_form,
+                        diagnose=self._diagnose,
                     )
                     if result:
                         self.current_screen_id = result
@@ -1439,6 +1449,7 @@ class ExplorationEngine:
         def over() -> bool:
             return _clock() >= deadline or reads_left <= 0
 
+        idle_delay = OUTCOME_POLL_S
         await asyncio.sleep(OUTCOME_POLL_S)
         fp = native_fingerprint(await self._peek())
         while True:
@@ -1453,7 +1464,10 @@ class ExplorationEngine:
                 continue
             if over():
                 break
-            await asyncio.sleep(OUTCOME_POLL_S)
+            # Nothing yet: look again less and less often (a self-loop was
+            # read 11 times in 3.5 s).
+            idle_delay = min(idle_delay * OUTCOME_POLL_GROWTH, OUTCOME_POLL_MAX_S)
+            await asyncio.sleep(idle_delay)
             fp = native_fingerprint(await self._peek())
         node = await self._capture_screen()
         if (
@@ -1680,6 +1694,31 @@ class ExplorationEngine:
         return any(n in self.forbidden for n in names) or any(
             part in n.casefold() for n in names for part in self.forbidden_parts
         )
+
+    async def _diagnose(self, kind: str, edge: GraphEdge) -> None:
+        """Keep what was on screen when ``edge`` failed: the tree the
+        controller last read and a screenshot, in diagnostics/ next to the
+        graph. At most MAX_DIAGNOSTICS per run."""
+        if self._diagnostics >= MAX_DIAGNOSTICS:
+            return
+        self._diagnostics += 1
+        folder = self.output_dir / "diagnostics"
+        folder.mkdir(exist_ok=True)
+        stem = folder / f"{self._diagnostics:03d}-{kind}"
+        last = getattr(self.controller, "_last_read", None)
+        record = {
+            "step": self.step_idx,
+            "kind": kind,
+            "edge": edge.model_dump(mode="json"),
+            "tree": last[2] if last else None,
+        }
+        stem.with_suffix(".json").write_text(json.dumps(record, ensure_ascii=False, indent=1))
+        try:
+            shot = await self.controller.take_screenshot()
+            if shot:
+                stem.with_suffix(".png").write_bytes(base64.b64decode(shot))
+        except Exception as e:  # a diagnostic must never break the run
+            logger.warning(f"Diagnostic screenshot failed: {e}")
 
     def _app_responds(self) -> None:
         """The app reached another screen: whatever failed before was not
