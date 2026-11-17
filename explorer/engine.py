@@ -142,6 +142,10 @@ ENVIRONMENT_DOWN_REASON = "Environment unavailable"
 
 # Failure snapshots kept per run (see _diagnose).
 MAX_DIAGNOSTICS = 30
+# Elements that could not be brought on screen (wikipedia-6: 71 «keys»
+# below the screen): enough to see what the tree held, apart from the
+# replay diagnostics' budget.
+MAX_UNREACHABLE_DIAGNOSTICS = 5
 
 # Undelivered taps (simulator errors) before the element counts as tried.
 MAX_TAP_FAILURES = 2
@@ -313,6 +317,7 @@ class ExplorationEngine:
         self._screens_seen_in_trip: set[str] = set()
         # Diagnostics written so far; see _diagnose.
         self._diagnostics = 0
+        self._unreachable_diagnostics = 0
         # Taps the simulator failed to deliver, per element; see _tap_failed.
         self._tap_failures: dict[tuple, int] = {}
 
@@ -793,6 +798,7 @@ class ExplorationEngine:
             stuck = getattr(self.controller, "scroll_stuck", False)
             if frame is None:
                 print(f"    ! Could not bring {element.label!r} on screen, skipping", flush=True)
+                await self._diagnose_unreachable(element)
                 self._record_self_loop(element, ActionType.TAP)
             if stuck:
                 self._write_off_below(element, before_screen)
@@ -1710,6 +1716,30 @@ class ExplorationEngine:
             "step": self.step_idx,
             "kind": kind,
             "edge": edge.model_dump(mode="json"),
+            "tree": last[2] if last else None,
+        }
+        stem.with_suffix(".json").write_text(json.dumps(record, ensure_ascii=False, indent=1))
+        try:
+            shot = await self.controller.take_screenshot()
+            if shot:
+                stem.with_suffix(".png").write_bytes(base64.b64decode(shot))
+        except Exception as e:  # a diagnostic must never break the run
+            logger.warning(f"Diagnostic screenshot failed: {e}")
+
+    async def _diagnose_unreachable(self, element: ElementSnapshot) -> None:
+        """Keep the tree and a screenshot of a screen with an element that
+        could not be scrolled into view, a few times per run."""
+        if self._unreachable_diagnostics >= MAX_UNREACHABLE_DIAGNOSTICS:
+            return
+        self._unreachable_diagnostics += 1
+        folder = self.output_dir / "diagnostics"
+        folder.mkdir(exist_ok=True)
+        stem = folder / f"{self._unreachable_diagnostics:03d}-not-on-screen"
+        last = getattr(self.controller, "_last_read", None)
+        record = {
+            "step": self.step_idx,
+            "kind": "not-on-screen",
+            "element": element.model_dump(mode="json"),
             "tree": last[2] if last else None,
         }
         stem.with_suffix(".json").write_text(json.dumps(record, ensure_ascii=False, indent=1))

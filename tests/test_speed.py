@@ -485,3 +485,37 @@ async def test_a_tap_without_effect_is_read_only_a_few_times(tmp_path, monkeypat
     await engine._await_outcome(home.screen_id, native_fingerprint(HOME))
 
     assert len(controller.reads) <= 7  # was 12: a read every 0.3 s for 3.5 s
+
+
+async def test_an_element_that_cannot_be_brought_on_screen_leaves_a_diagnostic(tmp_path):
+    """wikipedia-6: 71 taps on «keys» below the screen failed without a trace
+    of what the tree held; the tree and a screenshot are kept now, a few times."""
+    import json as _json
+
+    controller = _CountingShots(tree=HOME)
+    controller._last_read = (0, 0.0, [{"type": "Button", "label": "z"}], True)
+    engine = _engine(tmp_path, controller)
+    element = _snapshot("z")
+
+    for _ in range(9):
+        await engine._diagnose_unreachable(element)
+
+    files = sorted(p.name for p in (tmp_path / "diagnostics").glob("*.json"))
+    assert files == [f"{n:03d}-not-on-screen.json" for n in range(1, 6)]
+    record = _json.loads((tmp_path / "diagnostics" / files[0]).read_text())
+    assert record["element"]["label"] == "z" and record["tree"] == [{"type": "Button", "label": "z"}]
+
+
+async def test_unreachable_diagnostics_do_not_use_up_the_replay_ones(tmp_path):
+    controller = _CountingShots(tree=HOME)
+    engine = _engine(tmp_path, controller)
+    for _ in range(9):
+        await engine._diagnose_unreachable(_snapshot("z"))
+    assert engine._diagnostics == 0
+
+
+def _snapshot(label):
+    from explorer.models import ElementSnapshot
+
+    return ElementSnapshot(kind="button", element_type="Button", label=label, test_id=label,
+                           frame={"x": 5, "y": 898, "width": 40, "height": 54})
