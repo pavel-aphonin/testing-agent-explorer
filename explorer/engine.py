@@ -1849,11 +1849,52 @@ class ExplorationEngine:
             "[Step %d] %s unreachable after %d tries; writing off its actions",
             step, screen_id[:8], failures,
         )
+        self._hand_over_to_sibling(screen_id)
         self._mark_screen_fully_explored(screen_id)
         # The archive only refreshes on landing, which never happens for an
         # unreachable screen; without this it stays the best frontier
         # (aweassist run 2: four more 1–2 min trips after the write-off).
         self._update_archive_for(screen_id)
+
+    def _reachable_sibling(self, screen_id: str) -> ScreenNode | None:
+        """Another state of the same screen that a path from a launch screen
+        leads to (Wikipedia run 5: 22 of 25 written-off screens had one)."""
+        node = self.graph.nodes.get(screen_id)
+        if node is None:
+            return None
+        for other in self.graph.nodes.values():
+            if other.screen_id == screen_id or not is_variant(node, other):
+                continue
+            if any(
+                self.graph.find_path(start, other.screen_id) is not None
+                for start in self.graph.launch_screens
+            ):
+                return other
+        return None
+
+    def _hand_over_to_sibling(self, screen_id: str) -> None:
+        """Before a screen is written off, give its unexplored actions to a
+        reachable sibling, which can still be visited."""
+        sibling = self._reachable_sibling(screen_id)
+        if sibling is None:
+            return
+        keys = {action_key(el) for el in sibling.interactive_elements}
+        moved = 0
+        for el in self.graph.get_unexplored_actions(screen_id):
+            if action_key(el) in keys:
+                continue
+            sibling.interactive_elements.append(el)
+            self.puct.add_action_if_missing(sibling.screen_id, action_id_for(el))
+            keys.add(action_key(el))
+            moved += 1
+        if moved:
+            # Stored frames are from another layout; look elements up live.
+            self._scrolled_screens.add(sibling.screen_id)
+            self._update_archive_for(sibling.screen_id)
+        logger.info(
+            "%s unreachable; %d actions handed to its sibling %s",
+            screen_id[:8], moved, sibling.screen_id[:8],
+        )
 
     def _write_off_below(self, element: ElementSnapshot, screen_id: str) -> None:
         """Scrolling ended above ``element``: what lies below it is out of

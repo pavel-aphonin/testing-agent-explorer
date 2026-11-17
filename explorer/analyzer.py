@@ -118,6 +118,60 @@ def _content_actions(node: ScreenNode) -> set[tuple[str, str]]:
     }
 
 
+# Fields whose presence is structure, not content.
+_INPUT_TYPES = frozenset({"TextField", "SecureTextField", "TextArea", "SearchField"})
+# A tab bar this big is a fixed frame of the app, not a segmented control.
+MIN_FAMILY_TABS = 3
+# Overlap of two same-named screens without a tab bar.
+FAMILY_JACCARD = 0.5
+
+
+def _tab_bar(node: ScreenNode) -> frozenset[tuple[str, str]]:
+    return frozenset(
+        action_key(s) for s in node.interactive_elements
+        if s.element_type in TAB_BAR_TYPES and (s.label or "").strip()
+    )
+
+
+def _selected_tabs(node: ScreenNode) -> frozenset[str]:
+    return frozenset(
+        normalize_label(s.label or "") for s in node.elements
+        if s.element_type in TAB_BAR_TYPES and s.value == "1"
+    )
+
+
+def _has_input(node: ScreenNode) -> bool:
+    return any(s.element_type in _INPUT_TYPES for s in node.interactive_elements)
+
+
+def is_same_family(a: ScreenNode, b: ScreenNode) -> bool:
+    """Two states of one live screen (a feed, a map, a search page).
+
+    Their content (cards, article lists) differs on every visit, so the
+    action overlap of is_variant says nothing. What stays is the frame:
+    the same name, the same tab bar with the same tab selected, the same
+    depth (back button or not), both or neither a sheet, and an input
+    field on both or neither. Wikipedia run 5 had «Community» as 21 nodes
+    and wrote off 22 of 25 unreachable screens that had a reachable
+    sibling. Without a tab bar the name is weak evidence (testbed screens
+    with one name are different screens), so half of the actions must
+    agree as well.
+    """
+    if not a.name or a.name == a.app_label or normalize_label(a.name) != normalize_label(b.name):
+        return False
+    if a.is_modal != b.is_modal or _has_back(a) != _has_back(b) or _has_input(a) != _has_input(b):
+        return False
+    tabs = _tab_bar(a)
+    if len(tabs) >= MIN_FAMILY_TABS:
+        return tabs == _tab_bar(b) and _selected_tabs(a) == _selected_tabs(b)
+    # No tab bar (a sheet, a pushed page): the name alone is weak, so the
+    # actions must still half agree. A list of topics gains and loses rows.
+    ka, kb = _content_actions(a), _content_actions(b)
+    if min(len(ka), len(kb)) < MIN_VARIANT_ACTIONS:
+        return False
+    return len(ka & kb) / len(ka | kb) >= FAMILY_JACCARD
+
+
 def is_variant(a: ScreenNode, b: ScreenNode) -> bool:
     """Two fingerprints of one screen: a card more, a banner, a title that
     collapsed on scroll, an error with a «reload» button.
@@ -127,6 +181,8 @@ def is_variant(a: ScreenNode, b: ScreenNode) -> bool:
     in the tree; its back button is what gives it away. Two sheets can
     offer the same buttons under different titles.
     """
+    if is_same_family(a, b):
+        return True
     ka, kb = _content_actions(a), _content_actions(b)
     if min(len(ka), len(kb)) < MIN_VARIANT_ACTIONS or _has_back(a) != _has_back(b):
         return False
