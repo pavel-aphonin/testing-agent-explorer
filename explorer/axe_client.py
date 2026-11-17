@@ -1321,7 +1321,26 @@ class AXeExplorerClient:
                 and not el.get("obscured")
             )
 
-        elements = [el for el in await self.get_ui_elements(reuse=True) if same(el)]
+        # An explicit accessibility id (one that is not just the label) names
+        # the element even when its label changed: a back button is labelled
+        # with the title of the screen before it, so «Back» recorded on one
+        # path reads «Home» on the next (wikipedia-6: 2 of 10 failed replays,
+        # wikipedia-5: ~11 of 43). Such elements are looked for by id, and by
+        # label only when none carries the id.
+        explicit_id = test_id if test_id and test_id != label else None
+
+        def by_id(el: dict) -> bool:
+            return (
+                explicit_id is not None
+                and el.get("test_id") == explicit_id
+                and (element_type is None or el.get("type") == element_type)
+                and not el.get("obscured")
+            )
+
+        tree = await self.get_ui_elements(reuse=True)
+        if explicit_id is not None and any(by_id(el) for el in tree):
+            same = by_id  # noqa: F811 — every re-read below looks up by id too
+        elements = [el for el in tree if same(el)]
         if not elements:
             return None
         elements.sort(key=_reading_order)

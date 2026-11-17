@@ -345,3 +345,33 @@ async def test_watchdog_counts_explored_actions_as_progress(tmp_path, monkeypatc
     await engine.run()
 
     assert len(set(controller.taps)) == 40
+
+
+# ------------------------------------------------- replay: label changed
+
+@pytest.mark.asyncio
+async def test_scroll_into_view_finds_a_back_button_whose_label_changed(monkeypatch):
+    """The back button is labelled with the previous screen's title: «Back»
+    recorded on one path reads «Home» on another. Its id is the same."""
+    client, _, _ = _client(monkeypatch, [[
+        _el("Button", "Home", 62, test_id="BackButton", x=16, width=98, height=44),
+    ]])
+
+    frame = await client.scroll_into_view(None, "Back", "BackButton",
+                                          {"x": 16, "y": 62, "width": 44, "height": 44})
+
+    assert frame is not None and frame["x"] == 16
+
+
+@pytest.mark.asyncio
+async def test_scroll_into_view_does_not_take_another_label_for_a_label_only_id(monkeypatch):
+    """An id equal to the label (the analyzer's fallback) carries no more
+    than the label: a different label is a different element."""
+    client, _, _ = _client(monkeypatch, [[
+        _el("Button", "Saved. Activate to unsave.", 507, test_id="Saved. Activate to unsave."),
+    ]])
+
+    frame = await client.scroll_into_view(None, "Save for later", "Save for later",
+                                          {"x": 19, "y": 507, "width": 132, "height": 48})
+
+    assert frame is None
