@@ -1313,8 +1313,11 @@ class AXeExplorerClient:
                 (element_type is None or el.get("type") == element_type)
                 and (el.get("label") or None) == (label or None)
                 # ElementSnapshot falls back to the label when there is no
-                # accessibility id (analyzer.classify_element).
-                and (el.get("test_id") or el.get("label") or None) == (test_id or None)
+                # accessibility id (analyzer.classify_element). A live
+                # element with no id at all is still the one recorded under
+                # an id when type and label agree: the tree names the same
+                # tab bar items only some of the time (wikipedia-7).
+                and (not el.get("test_id") or el.get("test_id") == (test_id or None))
                 and not el.get("obscured")
             )
 
