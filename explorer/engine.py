@@ -59,6 +59,7 @@ from explorer.modes import ExplorationMode, ModeConfig, get_mode_config
 from explorer.navigator import (
     SETTLE_DELAY,
     find_nearest_unexplored,
+    add_replay_edge,
     go_back_to_screen,
 )
 from explorer.screen_id import compute_screen_id, native_fingerprint
@@ -456,6 +457,7 @@ class ExplorationEngine:
                         self._capture_screen_id,
                         replay_input=self._replay_form,
                         diagnose=self._diagnose,
+                        on_transition=self._record_replay_edge,
                     )
                     if result:
                         self.current_screen_id = result
@@ -1657,6 +1659,11 @@ class ExplorationEngine:
             success=False,
             notes=notes,
         ))
+
+    def _record_replay_edge(self, source_id: str, action: ActionDetail, landed_id: str) -> None:
+        """Navigation landed somewhere no edge leads to: record how."""
+        if add_replay_edge(self.graph, source_id, action, landed_id):
+            logger.info("Replay: %s -> %s recorded", source_id[:8], landed_id[:8])
 
     def _same_screen(self, a: str, b: str) -> bool:
         """Navigation accepts a variant of the target as the target."""

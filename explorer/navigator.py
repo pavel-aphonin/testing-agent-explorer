@@ -5,12 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import TYPE_CHECKING
-
+from explorer.analyzer import is_variant
+from explorer.models import ActionDetail, ActionType, AppGraph, GraphEdge
 from explorer.screen_id import native_fingerprint
-
-if TYPE_CHECKING:
-    from explorer.models import ActionDetail, AppGraph, GraphEdge
 
 logger = logging.getLogger("explorer.navigator")
 
@@ -50,6 +47,7 @@ async def go_back_to_screen(
     capture_fn,
     replay_input=None,
     diagnose=None,
+    on_transition=None,
 ) -> str | None:
     """
     Navigate from current screen to target screen.
@@ -61,6 +59,9 @@ async def go_back_to_screen(
     Returns the screen_id we ended up on, or None on failure.
     capture_fn: async () -> (screen_id, elements) - captures current screen state.
     replay_input: optional async (ActionDetail) -> bool, see replay_path.
+    on_transition: optional (source_id, action, landed_id) -> None, called
+    for a Back or replayed step that landed somewhere the graph has no edge
+    to (see add_replay_edge).
     """
     if current_screen_id == target_screen_id:
         return current_screen_id
@@ -92,6 +93,8 @@ async def go_back_to_screen(
                 break
         else:
             stalled = 0
+        if on_transition is not None and new_screen_id != here:
+            on_transition(here, ActionDetail(action_type=ActionType.BACK), new_screen_id)
         here = new_screen_id
         if new_screen_id == target_screen_id:
             logger.info(f"Reached target screen via back button")
@@ -106,7 +109,9 @@ async def go_back_to_screen(
                     f"Found path from {new_screen_id[:8]} to {target_screen_id[:8]} "
                     f"({len(path)} steps)"
                 )
-                result = await replay_path(controller, path, capture_fn, replay_input, graph, diagnose)
+                result = await replay_path(
+                    controller, path, capture_fn, replay_input, graph, diagnose, on_transition
+                )
                 if result == target_screen_id:
                     return result
                 if result:
@@ -115,7 +120,7 @@ async def go_back_to_screen(
     # Strategy 2: Relaunch app + replay
     logger.info("Back button failed, relaunching app")
     return await relaunch_and_navigate(
-        controller, graph, target_screen_id, capture_fn, replay_input, diagnose
+        controller, graph, target_screen_id, capture_fn, replay_input, diagnose, on_transition
     )
 
 
@@ -126,6 +131,7 @@ async def relaunch_and_navigate(
     capture_fn,
     replay_input=None,
     diagnose=None,
+    on_transition=None,
 ) -> str | None:
     """Kill app, relaunch, navigate to target via known path."""
     try:
@@ -160,7 +166,7 @@ async def relaunch_and_navigate(
         )
         return start_screen_id  # Return where we are, caller decides
 
-    return await replay_path(controller, path, capture_fn, replay_input, graph, diagnose)
+    return await replay_path(controller, path, capture_fn, replay_input, graph, diagnose, on_transition)
 
 
 async def replay_path(
@@ -170,6 +176,7 @@ async def replay_path(
     replay_input=None,
     graph: AppGraph | None = None,
     diagnose=None,
+    on_transition=None,
 ) -> str | None:
     """Replay a sequence of actions to navigate along a known path.
 
@@ -178,8 +185,16 @@ async def replay_path(
     and stores only the trigger field's text — redacted for passwords —
     so typing it back can never get past a login screen. The engine
     passes a callback that refills the form from test data and submits.
+
+    ``on_transition(source_id, action, landed_id)`` is told when a step
+    landed on a screen that is neither the edge's target nor a variant of
+    it (a modal variant, an article reached through a replayed form). The
+    screen would otherwise have no incoming edge: find_path never reaches
+    it and its actions get written off. It costs one capture per step.
     """
     target = path[-1].target_screen_id if path else None
+    here = path[0].source_screen_id if path else None
+    landed_id = None
     reroutes = MAX_REROUTES
     remaining = list(path)
     while remaining:
@@ -211,9 +226,47 @@ async def replay_path(
             await asyncio.sleep(STEP_ANIMATION_S)
         else:
             await _await_change(controller, before, STEP_MAX_S, SETTLE_DELAY)
+        landed_id = None
+        if on_transition is not None:
+            landed_id, _ = await capture_fn()
+            if landed_id != edge.target_screen_id and not _is_variant_of(
+                graph, landed_id, edge.target_screen_id
+            ):
+                on_transition(here, edge.action, landed_id)
+            here = landed_id
 
+    if landed_id is not None:
+        return landed_id
     current_id, _ = await capture_fn()
     return current_id
+
+
+def _is_variant_of(graph: AppGraph | None, a: str, b: str) -> bool:
+    na, nb = (graph.nodes.get(a), graph.nodes.get(b)) if graph is not None else (None, None)
+    return bool(na and nb and is_variant(na, nb))
+
+
+def add_replay_edge(graph: AppGraph, source_id: str, action: ActionDetail, landed_id: str) -> bool:
+    """Record a transition seen while navigating, so ``landed_id`` is reachable.
+
+    Navigation creates nodes without recording how they were reached. A
+    landing on a near-duplicate of the source or of a known target is not
+    a new place (the screen-family rule), and an existing edge needs no twin.
+    """
+    if source_id not in graph.nodes or landed_id not in graph.nodes or landed_id == source_id:
+        return False
+    if _is_variant_of(graph, landed_id, source_id):
+        return False
+    signature = action.signature()
+    for e in graph.edges:
+        if e.source_screen_id == source_id and e.action.signature() == signature and (
+            e.target_screen_id == landed_id or _is_variant_of(graph, landed_id, e.target_screen_id)
+        ):
+            return False
+    graph.add_edge(GraphEdge(
+        source_screen_id=source_id, target_screen_id=landed_id, action=action, notes="replay",
+    ))
+    return True
 
 
 async def _fingerprint(controller, fresh: bool = True) -> str | None:
