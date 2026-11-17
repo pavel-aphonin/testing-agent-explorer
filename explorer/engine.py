@@ -1771,11 +1771,15 @@ class ExplorationEngine:
         the PIN budget not spent (a pad or a spent PIN is how an outage
         looks). A failed relaunch or a trip that captured nothing gives
         ``None`` and stays an outage candidate."""
+        return self._is_live_screen(landed, target) and not self.graph.find_path(landed, target)
+
+    def _is_live_screen(self, landed: str | None, target: str) -> bool:
+        """The trip ended on a screen we captured, other than the target,
+        and it is not a PIN pad with the PIN budget unspent: the app is up
+        and answering, whatever made the trip fail."""
         if not landed or landed == target:
             return False
-        if landed in self._keypad_screens or self._pin_failures >= MAX_PIN_FAILURES:
-            return False
-        return not self.graph.find_path(landed, target)
+        return landed not in self._keypad_screens and self._pin_failures < MAX_PIN_FAILURES
 
     async def _navigation_failed(self, screen_id: str, step: int, landed: str | None = None) -> bool:
         """Record a failed trip to ``screen_id``. False: stop exploring.
@@ -1790,6 +1794,17 @@ class ExplorationEngine:
             # just had no path from it. Six such trips ended the run as an
             # «outage». Write the target off; the streak is untouched.
             logger.info("[Step %d] No path from live screen %s; not an outage", step, landed[:8])
+            self._note_unreachable(screen_id, step)
+            return True
+        if self._is_live_screen(landed, screen_id):
+            # Wikipedia run 9: the app sat on 'Community' (114 elements)
+            # while a replayed step ('Save for later') kept failing; six such
+            # trips stopped the run as an «outage». A failed replay on a
+            # responding screen is a stale path, not a dead environment.
+            logger.info(
+                "[Step %d] Replay to %s failed on live screen %s; not an outage",
+                step, screen_id[:8], landed[:8],
+            )
             self._note_unreachable(screen_id, step)
             return True
         if len(self._screens_seen_in_trip) >= 2:

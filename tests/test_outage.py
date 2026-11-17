@@ -11,7 +11,7 @@ import pytest
 
 from explorer import engine as engine_module
 from explorer.engine import ENVIRONMENT_DOWN_REASON, MAX_PIN_FAILURES, OUTAGE_WAITS_S, ExplorationEngine
-from explorer.models import WRITTEN_OFF_NOTE, ElementKind, ElementSnapshot, ScreenNode
+from explorer.models import WRITTEN_OFF_NOTE, ActionDetail, ActionType, ElementKind, ElementSnapshot, ScreenNode
 from explorer.modes import ExplorationMode
 from explorer.visualizer import generate_stats_report
 from tests.test_engine import _app, _button, _PopupController
@@ -255,3 +255,23 @@ async def test_trip_that_captured_nothing_is_still_an_outage(tmp_path, waits):
     for target in ["accounts", "payments", "profile"]:
         await engine._navigation_failed(target, step=1, landed=None)
     assert waits == [OUTAGE_WAITS_S[0]]
+
+
+async def test_failed_replay_on_a_live_screen_is_not_an_outage(tmp_path, waits):
+    # Wikipedia run 9: the app showed 'Community' after every relaunch and a
+    # path to the target existed, but a replayed step kept failing; six trips
+    # in a row stopped the run as «Environment unavailable».
+    engine = _engine(tmp_path)
+    engine.graph.add_node(_node("start"))
+    for target in ["accounts", "payments", "profile", "cards", "chats"]:
+        # The graph knows a path, so this is no dead-end start: the replay
+        # itself failed.
+        engine._record_replay_edge(
+            "start", ActionDetail(action_type=ActionType.TAP, target_label=target), target
+        )
+    for target in ["accounts", "payments", "profile", "cards", "chats", "accounts"]:
+        assert await engine._navigation_failed(target, step=1, landed="start")
+
+    assert waits == []
+    assert engine.graph.stop_reason is None
+    assert engine._failed_navs == 0
