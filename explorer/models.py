@@ -132,6 +132,10 @@ class AppGraph(BaseModel):
     stop_reason: str | None = None
     # Screens the app opened on after a (re)launch, oldest first.
     launch_screens: list[str] = Field(default_factory=list)
+    # Screens the Back button did not leave when tried (tab roots): not
+    # tried again, a trip from them goes straight to a relaunch. Per run,
+    # not saved with the graph.
+    back_futile: set[str] = Field(default_factory=set, exclude=True)
 
     def add_node(self, node: ScreenNode) -> bool:
         """Add a node. Returns True if this is a NEW screen."""

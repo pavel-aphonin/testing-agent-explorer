@@ -68,7 +68,10 @@ async def go_back_to_screen(
     # Strategy 1: Try back button
     here = current_screen_id
     stalled = 0
-    for attempt in range(MAX_BACK_ATTEMPTS):
+    attempts = 0 if current_screen_id in graph.back_futile else MAX_BACK_ATTEMPTS
+    if not attempts:
+        logger.info(f"Back does not leave {current_screen_id[:8]} (seen before); relaunching")
+    for attempt in range(attempts):
         logger.info(f"Back attempt {attempt + 1}/{MAX_BACK_ATTEMPTS}")
         before = await _fingerprint(controller, fresh=False)
         try:
@@ -85,6 +88,7 @@ async def go_back_to_screen(
             stalled += 1
             if stalled >= MAX_BACK_STALLS:
                 logger.info("Back does not leave this screen; relaunching")
+                graph.back_futile.add(here)
                 break
         else:
             stalled = 0

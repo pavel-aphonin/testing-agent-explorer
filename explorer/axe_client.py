@@ -344,6 +344,23 @@ _AXE_HID_STABILIZATION_MS = "600"
 
 # Verified text entry (see AXeExplorerClient.set_text_in_field).
 _TYPE_ATTEMPTS = 3
+# What the iOS keyboard does to typed text on its own: smart quotes,
+# smart dashes, the ellipsis. Autocapitalisation is undone by casefold.
+_KEYBOARD_EDITS = (
+    ("\u2018", "'"), ("\u2019", "'"), ("\u201c", '"'), ("\u201d", '"'),
+    ("\u2014", "--"), ("\u2013", "-"), ("\u2026", "..."),
+)
+
+
+def _as_typed(text: str) -> str:
+    """``text`` with the keyboard's own edits undone, for comparing a
+    field's value with what was typed into it (wikipedia-5: «test query»
+    read back as «Test query», «' OR 1=1 --» as «‘ OR 1=1 —»)."""
+    for shown, typed in _KEYBOARD_EDITS:
+        text = text.replace(shown, typed)
+    return text.casefold()
+
+
 # Extra wait after the keyboard is up: when moving between fields the
 # keyboard is already visible, but focus has not moved yet.
 _FOCUS_SETTLE_S = 0.8
@@ -868,7 +885,7 @@ class AXeExplorerClient:
             value = el.get("value") or ""
             if value and set(value) == {"•"}:
                 return len(value) == len(text)
-            return value == text
+            return _as_typed(value) == _as_typed(text)
         return False
 
     async def _device_logical_size(self, udid: str) -> tuple[int, int] | tuple[None, None]:
