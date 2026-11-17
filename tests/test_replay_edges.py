@@ -146,8 +146,11 @@ async def test_each_step_of_a_longer_path_is_checked(monkeypatch):
 
     await replay_path(phone, [ab, bc], capture, graph=graph, on_transition=record)
 
+    # The first step landed off the path (B2, not B): the second is not tapped
+    # blindly on it, the replay stops there.
     pairs = {(e.source_screen_id, e.target_screen_id) for e in graph.edges if e.notes == "replay"}
-    assert pairs == {("A", "B2"), ("B2", "C2")}
+    assert pairs == {("A", "B2")}
+    assert phone.here == "B2"
 
 
 async def test_a_relaunch_landing_gets_no_edge(monkeypatch):
@@ -214,3 +217,74 @@ def test_the_engine_records_the_edge_and_the_screen_is_no_dead_end(tmp_path):
     engine._record_replay_edge("A", ActionDetail(action_type=ActionType.TAP, target_label="Go"), "B2")
 
     assert not engine._is_dead_end_start("A", "B2")
+
+
+class _CountingPhone(_Phone):
+    taps = 0
+
+    async def tap_at(self, x, y):
+        type(self).taps += 1
+        return await super().tap_at(x, y)
+
+
+async def test_replay_does_not_tap_on_a_screen_other_than_the_step_source(monkeypatch):
+    # A tap recorded for screen A must not hit screen X.
+    edge = _tap("A", "B")
+    graph = _graph([edge], "X")
+    phone = _CountingPhone({"A": "B", "X": "B"}, here="X")
+    _CountingPhone.taps = 0
+    capture, record = _run(monkeypatch, graph, phone, [edge])
+
+    landed = await replay_path(phone, [edge], capture, graph=graph, on_transition=record)
+
+    assert landed == "X"
+    assert _CountingPhone.taps == 0
+    assert phone.here == "X"
+
+
+async def test_replay_stops_midway_when_a_step_lands_off_the_path(monkeypatch):
+    first, second = _tap("A", "B", "One"), _tap("B", "C", "Two")
+    graph = _graph([first, second], "X")
+    phone = _CountingPhone({"A": "X", "X": "X"})
+    _CountingPhone.taps = 0
+    capture, record = _run(monkeypatch, graph, phone, [first, second])
+
+    landed = await replay_path(phone, [first, second], capture, graph=graph)
+
+    assert landed == "X"
+    assert _CountingPhone.taps == 1  # the second tap was not made
+    assert graph.failed_edge is first
+
+
+async def test_replay_accepts_a_variant_of_the_source(monkeypatch):
+    a = _screen("A", ["Статья про кошек", "Новость дня", "Игра"])
+    a2 = _screen("A2", ["Статья про лес", "Другая новость", "Фото дня", "Ещё"])
+    assert is_variant(a, a2)
+    edge = _tap("A", "B")
+    graph = _graph([edge], "A2", nodes={"A": a, "A2": a2})
+    phone = _Phone({"A2": "B"}, here="A2")
+    capture, record = _run(monkeypatch, graph, phone, [edge])
+
+    assert await replay_path(phone, [edge], capture, graph=graph, on_transition=record) == "B"
+
+
+async def test_a_stale_edge_that_works_again_is_reset(monkeypatch):
+    edge = _tap("A", "B")
+    edge.stale = True
+    graph = _graph([edge])
+    phone = _Phone({"A": "B"})
+    capture, record = _run(monkeypatch, graph, phone, [edge])
+
+    await replay_path(phone, [edge], capture, graph=graph, on_transition=record)
+
+    assert edge.stale is False
+
+
+async def test_a_stale_twin_is_reset_when_the_transition_is_seen_again():
+    edge = _tap("A", "B")
+    edge.stale = True
+    graph = _graph([edge])
+
+    assert not add_replay_edge(graph, "A", edge.action, "B")
+
+    assert edge.stale is False

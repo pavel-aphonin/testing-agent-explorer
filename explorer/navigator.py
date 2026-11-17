@@ -166,7 +166,10 @@ async def relaunch_and_navigate(
         )
         return start_screen_id  # Return where we are, caller decides
 
-    return await replay_path(controller, path, capture_fn, replay_input, graph, diagnose, on_transition)
+    return await replay_path(
+        controller, path, capture_fn, replay_input, graph, diagnose, on_transition,
+        start_as=start_screen_id,
+    )
 
 
 async def replay_path(
@@ -177,8 +180,15 @@ async def replay_path(
     graph: AppGraph | None = None,
     diagnose=None,
     on_transition=None,
+    start_as: str | None = None,
 ) -> str | None:
     """Replay a sequence of actions to navigate along a known path.
+
+    Before each step the live screen must be the step's source (or a variant
+    of it); otherwise the replay stops without tapping and returns the live
+    screen. ``start_as`` names one more screen accepted as the first step's
+    source: a relaunch lands on a new variant of the launch screen whose
+    recorded paths are tried (see relaunch_and_navigate).
 
     ``replay_input`` replaces the replay of ``input`` edges. One such edge
     stands for a whole submitted form (login: email + password + submit)
@@ -197,8 +207,30 @@ async def replay_path(
     landed_id = None
     reroutes = MAX_REROUTES
     remaining = list(path)
+    previous: GraphEdge | None = None
+    if graph is not None:
+        graph.failed_edge = None
     while remaining:
         edge = remaining.pop(0)
+        # A tap recorded for screen A must not land on screen B. The capture
+        # after the previous step is reused; the first step needs its own.
+        live = landed_id
+        if live is None:
+            live, _ = await capture_fn()
+        if (
+            live != edge.source_screen_id
+            and not (start_as is not None and previous is None and live == start_as)
+            and not _is_variant_of(graph, live, edge.source_screen_id)
+        ):
+            logger.warning(
+                "Replay stopped: step expects %s but the live screen is %s; not tapping",
+                edge.source_screen_id[:8], live[:8],
+            )
+            if graph is not None:
+                # The step that brought us here led off the path; with no
+                # previous step the start itself was wrong: nothing to blame.
+                graph.failed_edge = previous
+            return live
         before = await _fingerprint(controller, fresh=False)
         if edge.action.action_type == "input" and replay_input is not None:
             success = await replay_input(edge.action)
@@ -215,6 +247,9 @@ async def replay_path(
             # twice (Wikipedia run: «Map» and «Search» written off because
             # their only path went through «Enable location»).
             edge.stale = True
+            if graph is not None:
+                graph.failed_edge = edge
+            landed_id = current_id
             detour = graph.find_path(current_id, target) if graph is not None and target else None
             if reroutes <= 0 or not detour or any(e.stale for e in detour):
                 return current_id
@@ -233,7 +268,10 @@ async def replay_path(
                 graph, landed_id, edge.target_screen_id
             ):
                 on_transition(here, edge.action, landed_id)
+            else:
+                edge.stale = False  # it worked after all
             here = landed_id
+        previous = edge
 
     if landed_id is not None:
         return landed_id
@@ -262,6 +300,7 @@ def add_replay_edge(graph: AppGraph, source_id: str, action: ActionDetail, lande
         if e.source_screen_id == source_id and e.action.signature() == signature and (
             e.target_screen_id == landed_id or _is_variant_of(graph, landed_id, e.target_screen_id)
         ):
+            e.stale = False  # seen working again
             return False
     graph.add_edge(GraphEdge(
         source_screen_id=source_id, target_screen_id=landed_id, action=action, notes="replay",

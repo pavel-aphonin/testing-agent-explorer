@@ -60,6 +60,7 @@ from explorer.navigator import (
     SETTLE_DELAY,
     find_nearest_unexplored,
     add_replay_edge,
+    replay_path,
     go_back_to_screen,
 )
 from explorer.screen_id import compute_screen_id, native_fingerprint
@@ -129,6 +130,8 @@ MAX_LAUNCH_ALERTS = 3
 # Failed navigations to one frontier screen before its remaining actions
 # are written off (see _note_unreachable).
 MAX_NAV_FAILURES = 2
+# Other routes tried from a live screen after the recorded one failed.
+MAX_ALTERNATIVE_ROUTES = 2
 
 # Failed navigations in a row, with no action reaching another screen in
 # between, that mean the environment is down rather than one screen being
@@ -1805,6 +1808,8 @@ class ExplorationEngine:
                 "[Step %d] Replay to %s failed on live screen %s; not an outage",
                 step, screen_id[:8], landed[:8],
             )
+            if await self._try_alternative_routes(screen_id, landed, step):
+                return True
             self._note_unreachable(screen_id, step)
             return True
         if len(self._screens_seen_in_trip) >= 2:
@@ -1839,6 +1844,37 @@ class ExplorationEngine:
         )
         await asyncio.sleep(wait)
         return True
+
+    async def _try_alternative_routes(self, target: str, landed: str, step: int) -> bool:
+        """The route to ``target`` failed on a live screen: mark the edge
+        that failed stale and try other routes from where we stand, at most
+        MAX_ALTERNATIVE_ROUTES of them. True: the target was reached (the
+        engine is on it)."""
+        for _ in range(MAX_ALTERNATIVE_ROUTES):
+            failed = self.graph.failed_edge
+            self.graph.failed_edge = None
+            if failed is None:
+                return False  # nothing to route around: the same path would come back
+            failed.stale = True
+            path = self.graph.find_path(landed, target, allow_stale=False)
+            if not path:
+                return False
+            logger.info(
+                "[Step %d] Trying another route %s -> %s (%d steps)",
+                step, landed[:8], target[:8], len(path),
+            )
+            result = await replay_path(
+                self.controller, path, self._capture_screen_id, self._replay_form,
+                self.graph, self._diagnose, self._record_replay_edge,
+            )
+            if result and (result == target or self._same_screen(result, target)):
+                self.current_screen_id = target
+                self._app_responds()
+                return True
+            if not result or not self._is_live_screen(result, target):
+                return False
+            landed = result
+        return False
 
     def _undo_streak_write_offs(self) -> None:
         """Give back the actions written off during a run of failures that

@@ -136,6 +136,10 @@ class AppGraph(BaseModel):
     # tried again, a trip from them goes straight to a relaunch. Per run,
     # not saved with the graph.
     back_futile: set[str] = Field(default_factory=set, exclude=True)
+    # The edge the last replay failed on (its tap did not work, or the step
+    # before it landed off the path), for the engine to mark stale and route
+    # around. Per run, not saved.
+    failed_edge: GraphEdge | None = Field(default=None, exclude=True)
 
     def add_node(self, node: ScreenNode) -> bool:
         """Add a node. Returns True if this is a NEW screen."""
@@ -211,13 +215,18 @@ class AppGraph(BaseModel):
         """Return set of screen IDs that have unexplored actions."""
         return {sid for sid in self.nodes if self.get_unexplored_actions(sid)}
 
-    def find_path(self, from_id: str, to_id: str) -> list[GraphEdge] | None:
+    def find_path(
+        self, from_id: str, to_id: str, allow_stale: bool = True
+    ) -> list[GraphEdge] | None:
         """BFS shortest path between two screens. Returns list of edges or None.
 
-        Stale edges are avoided while any other way exists."""
-        return self._find_path(from_id, to_id, avoid_stale=True) or self._find_path(
-            from_id, to_id, avoid_stale=False
-        )
+        Stale edges are avoided while any other way exists; with
+        ``allow_stale=False`` they are never used (looking for an alternative
+        to a route that just failed)."""
+        path = self._find_path(from_id, to_id, avoid_stale=True)
+        if path or not allow_stale:
+            return path
+        return self._find_path(from_id, to_id, avoid_stale=False)
 
     def _find_path(self, from_id: str, to_id: str, avoid_stale: bool) -> list[GraphEdge] | None:
         if from_id == to_id:

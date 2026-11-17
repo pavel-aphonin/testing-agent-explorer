@@ -88,7 +88,7 @@ async def test_replay_uses_form_callback_for_input_edges(monkeypatch):
         return True
 
     async def capture():
-        return ("home", [])
+        return ("home" if replayed else "login", [])
 
     landed = await replay_path(controller, [login_submit], capture, replay_input=replay_form)
 

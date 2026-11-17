@@ -11,7 +11,7 @@ import pytest
 
 from explorer import engine as engine_module
 from explorer.engine import ENVIRONMENT_DOWN_REASON, MAX_PIN_FAILURES, OUTAGE_WAITS_S, ExplorationEngine
-from explorer.models import WRITTEN_OFF_NOTE, ActionDetail, ActionType, ElementKind, ElementSnapshot, ScreenNode
+from explorer.models import WRITTEN_OFF_NOTE, ActionDetail, ActionType, ElementKind, ElementSnapshot, GraphEdge, ScreenNode
 from explorer.modes import ExplorationMode
 from explorer.visualizer import generate_stats_report
 from tests.test_engine import _app, _button, _PopupController
@@ -275,3 +275,64 @@ async def test_failed_replay_on_a_live_screen_is_not_an_outage(tmp_path, waits):
     assert waits == []
     assert engine.graph.stop_reason is None
     assert engine._failed_navs == 0
+
+
+def _route(engine, source, target, via=None, label="go"):
+    """Edges source -> target (directly or through ``via``); returns them."""
+    hops = [source, via, target] if via else [source, target]
+    edges = []
+    for a, b in zip(hops, hops[1:]):
+        edge = GraphEdge(source_screen_id=a, target_screen_id=b,
+                         action=ActionDetail(action_type=ActionType.TAP, target_label=f"{label}-{a}-{b}"))
+        engine.graph.add_edge(edge)
+        edges.append(edge)
+    return edges
+
+
+async def test_failed_route_on_a_live_screen_tries_another_before_giving_up(tmp_path, waits, monkeypatch):
+    engine = _engine(tmp_path)
+    for sid in ("start", "mid"):
+        engine.graph.add_node(_node(sid))
+    (direct,) = _route(engine, "start", "accounts")
+    alternative = _route(engine, "start", "accounts", via="mid")
+    direct.stale = False
+    engine.graph.failed_edge = direct
+    replayed = []
+
+    async def replay(controller, path, *args, **kwargs):
+        replayed.append(path)
+        return "accounts"
+
+    monkeypatch.setattr(engine_module, "replay_path", replay)
+
+    assert await engine._navigation_failed("accounts", step=1, landed="start")
+
+    assert direct.stale
+    assert replayed == [alternative]
+    assert engine.current_screen_id == "accounts"
+    assert engine._nav_failures.get("accounts") is None
+    assert engine.graph.written_off_count == 0
+
+
+async def test_alternative_routes_are_bounded_and_then_the_target_is_unreachable(tmp_path, waits, monkeypatch):
+    engine = _engine(tmp_path)
+    for sid in ("start", "m1", "m2", "m3"):
+        engine.graph.add_node(_node(sid))
+    (direct,) = _route(engine, "start", "accounts")
+    for mid in ("m1", "m2", "m3"):
+        _route(engine, "start", "accounts", via=mid)
+    engine.graph.failed_edge = direct
+    replayed = []
+
+    async def replay(controller, path, *args, **kwargs):
+        replayed.append(path)
+        engine.graph.failed_edge = path[0]  # the first step of each fails
+        return "start"
+
+    monkeypatch.setattr(engine_module, "replay_path", replay)
+
+    assert await engine._navigation_failed("accounts", step=1, landed="start")
+
+    assert len(replayed) == engine_module.MAX_ALTERNATIVE_ROUTES == 2  # a third route exists, not tried
+    assert engine._nav_failures["accounts"] == 1  # only now counted as a failed trip
+    assert engine.graph.stop_reason is None
