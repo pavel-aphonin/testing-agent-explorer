@@ -225,3 +225,33 @@ async def test_a_pin_pad_passed_on_the_way_is_not_movement(tmp_path):
     await engine._capture_screen_id()
 
     assert engine._screens_seen_in_trip == set()
+
+
+async def test_no_path_from_a_live_start_screen_is_not_an_outage(tmp_path, waits):
+    # Wikipedia run 7: after each relaunch the app showed its start screen,
+    # the graph had no path from it; six trips in a row stopped the run.
+    engine = _engine(tmp_path)
+    engine.graph.add_node(_node("start"))
+    for target in ["accounts", "payments", "profile", "cards", "chats", "accounts"]:
+        assert await engine._navigation_failed(target, step=1, landed="start")
+
+    assert waits == []
+    assert engine.graph.stop_reason is None
+    assert engine._failed_navs == 0
+    assert engine.graph.written_off_count > 0
+
+
+async def test_dead_end_start_that_is_a_pin_pad_is_an_outage(tmp_path, waits):
+    engine = _engine(tmp_path)
+    engine.graph.add_node(_node("start"))
+    engine._keypad_screens.add("start")
+    for target in ["accounts", "payments", "profile"]:
+        await engine._navigation_failed(target, step=1, landed="start")
+    assert waits == [OUTAGE_WAITS_S[0]]
+
+
+async def test_trip_that_captured_nothing_is_still_an_outage(tmp_path, waits):
+    engine = _engine(tmp_path)
+    for target in ["accounts", "payments", "profile"]:
+        await engine._navigation_failed(target, step=1, landed=None)
+    assert waits == [OUTAGE_WAITS_S[0]]

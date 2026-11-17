@@ -480,7 +480,7 @@ class ExplorationEngine:
                         )
                         self.current_screen_id = frontier.state_id
                     elif result != frontier.state_id:
-                        if not await self._navigation_failed(frontier.state_id, step):
+                        if not await self._navigation_failed(frontier.state_id, step, landed=result):
                             break
                         continue
                     self._app_responds()
@@ -1757,7 +1757,20 @@ class ExplorationEngine:
         self._streak_screens.clear()
         self._outage_waits = 0
 
-    async def _navigation_failed(self, screen_id: str, step: int) -> bool:
+    def _is_dead_end_start(self, landed: str | None, target: str) -> bool:
+        """The trip ended on a live screen from which the graph has no path
+        to ``target``: a reachability problem, not an outage. «Alive» means
+        the app showed a screen we could capture that is not a PIN pad, with
+        the PIN budget not spent (a pad or a spent PIN is how an outage
+        looks). A failed relaunch or a trip that captured nothing gives
+        ``None`` and stays an outage candidate."""
+        if not landed or landed == target:
+            return False
+        if landed in self._keypad_screens or self._pin_failures >= MAX_PIN_FAILURES:
+            return False
+        return not self.graph.find_path(landed, target)
+
+    async def _navigation_failed(self, screen_id: str, step: int, landed: str | None = None) -> bool:
         """Record a failed trip to ``screen_id``. False: stop exploring.
 
         One screen out of reach is written off (_note_unreachable). Several
@@ -1765,6 +1778,13 @@ class ExplorationEngine:
         backend is down: those write-offs are undone, the agent waits and
         tries again, and stops if the environment does not come back.
         """
+        if self._is_dead_end_start(landed, screen_id):
+            # Wikipedia run 7: the app was up on its start screen, the graph
+            # just had no path from it. Six such trips ended the run as an
+            # «outage». Write the target off; the streak is untouched.
+            logger.info("[Step %d] No path from live screen %s; not an outage", step, landed[:8])
+            self._note_unreachable(screen_id, step)
+            return True
         if len(self._screens_seen_in_trip) >= 2:
             # The app moved between screens on the way: it is up, only this
             # target is out of reach (Wikipedia run 2 stopped as «down» while
