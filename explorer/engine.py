@@ -150,6 +150,13 @@ MAX_DIAGNOSTICS = 30
 # below the screen): enough to see what the tree held, apart from the
 # replay diagnostics' budget.
 MAX_UNREACHABLE_DIAGNOSTICS = 5
+# Failed «bring on screen» attempts for one element on one screen before it
+# is written off (per-element, not per-screen: a Map's markers outside the
+# scrollable frame kept cycling as self-loops, 56 «could not bring on
+# screen» lines in wikipedia-10). Two agrees with MAX_TAP_FAILURES and
+# MAX_NAV_FAILURES: one miss can be a scroll that settled late, two in a
+# row on the same screen means the element is not coming into view.
+MAX_UNREACHABLE_ATTEMPTS = 2
 
 # Undelivered taps (simulator errors) before the element counts as tried.
 MAX_TAP_FAILURES = 2
@@ -324,6 +331,8 @@ class ExplorationEngine:
         self._unreachable_diagnostics = 0
         # Taps the simulator failed to deliver, per element; see _tap_failed.
         self._tap_failures: dict[tuple, int] = {}
+        # Failed «bring on screen» attempts per element; see MAX_UNREACHABLE_ATTEMPTS.
+        self._unreachable_attempts: dict[tuple, int] = {}
 
         # PUCT selector and Go-Explore archive are the brains of the loop.
         # Both are stateful and live for the duration of one engine run.
@@ -798,13 +807,30 @@ class ExplorationEngine:
             before_screen in self._scrolled_screens
             or needs_scroll(element.element_type, element.frame)
         ):
+            attempt_key = (before_screen, element.element_type, element.label, element.test_id)
+            if self._unreachable_attempts.get(attempt_key, 0) >= MAX_UNREACHABLE_ATTEMPTS:
+                # Already written off: the element came back in a capture with
+                # another frame, so it is not scrolled for again.
+                self._record_self_loop(element, ActionType.TAP, before_screen, notes=UNREACHABLE_NOTE)
+                return
             frame = await scroll(element.element_type, element.label, element.test_id, element.frame or {})
             self._scrolled_screens.add(before_screen)
             stuck = getattr(self.controller, "scroll_stuck", False)
             if frame is None:
+                attempts = self._unreachable_attempts.get(attempt_key, 0) + 1
+                self._unreachable_attempts[attempt_key] = attempts
                 print(f"    ! Could not bring {element.label!r} on screen, skipping", flush=True)
                 await self._diagnose_unreachable(element)
-                self._record_self_loop(element, ActionType.TAP)
+                if attempts >= MAX_UNREACHABLE_ATTEMPTS:
+                    self._record_self_loop(element, ActionType.TAP, before_screen, notes=UNREACHABLE_NOTE)
+                    print(
+                        f"    ! {element.label!r} not on screen after {attempts} attempts; written off",
+                        flush=True,
+                    )
+                else:
+                    self._record_self_loop(element, ActionType.TAP)
+            else:
+                self._unreachable_attempts.pop(attempt_key, None)
             if stuck:
                 self._write_off_below(element, before_screen)
             if frame is None:
