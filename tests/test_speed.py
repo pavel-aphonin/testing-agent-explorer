@@ -519,3 +519,36 @@ def _snapshot(label):
 
     return ElementSnapshot(kind="button", element_type="Button", label=label, test_id=label,
                            frame={"x": 5, "y": 898, "width": 40, "height": 54})
+
+
+async def test_a_native_read_of_a_screen_without_a_page_serves_a_full_one(monkeypatch):
+    # Wikipedia run 10: the capture after every settled tap read again the
+    # tree the last poll had just read (574 of 1924 reads, 0.8 s each).
+    client, reads = _reading_client(monkeypatch)
+    await client.get_ui_elements(web=False)
+    await client.get_ui_elements(reuse=True)
+    assert len(reads) == 1
+
+
+@dataclass
+class _ReuseRecorder(_AxeLike):
+    reuses: list = None
+
+    async def get_ui_elements(self, reuse=False, web=True):
+        self.reuses = (self.reuses or []) + [reuse]
+        return await super().get_ui_elements(reuse=reuse, web=web)
+
+
+async def test_the_capture_after_settled_polls_reuses_their_read(tmp_path, monkeypatch):
+    from explorer.engine import native_fingerprint
+
+    _clocked(monkeypatch)
+    controller = _ReuseRecorder(tree=HOME, screens=[PROFILE])
+    engine = _engine(tmp_path, controller)
+    engine.graph.add_node(await engine._capture_screen())
+    controller.reuses = []
+
+    await engine._await_outcome("home-id", native_fingerprint(HOME))
+
+    assert controller.reuses[-1] is True          # the final capture
+    assert not any(controller.reuses[:-1])        # polls read afresh

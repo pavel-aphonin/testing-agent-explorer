@@ -1035,9 +1035,18 @@ class AXeExplorerClient:
                 added = await web_content.fill_hollow_areas(roots, self._probe_point, self._width, self._height)
                 if added:
                     logger.info("Web content: %d elements found by point queries", added)
+            # A read is complete when nothing is left out: the web scan ran,
+            # or there is no page it would read. A native read of a screen
+            # without a page then serves a full read too (Wikipedia run 10:
+            # the capture after every settled tap re-read the tree it had
+            # just read, 0.8 s each).
+            complete = (
+                web or not self.scan_web_content or not self._width
+                or not web_content.hollow_areas(roots, self._width, self._height)
+            )
             elements = []
             self._flatten(roots, elements)
-            self._last_read = (epoch, time.monotonic(), elements, web and self.scan_web_content)
+            self._last_read = (epoch, time.monotonic(), elements, complete)
             self._tab_bar_visible = any(
                 el["type"] in _TAB_BAR_TYPES and not el.get("obscured")
                 and self.is_on_screen(el.get("frame"))

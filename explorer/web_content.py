@@ -18,6 +18,8 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 
+from explorer import timing
+
 # A scroll view at least this share of the screen with nothing in it but
 # its scroll bars is taken for a web page.
 MIN_AREA_SHARE = 0.15
@@ -202,7 +204,11 @@ async def fill_hollow_areas(roots: list, probe: Probe, width: float, height: flo
         if fresh and cached[2]:
             elements = cached[1]
         else:
+            started = time.monotonic()
             elements = await scan(area, probe, width, height)
+            # Point queries run in parallel: their summed time overstates
+            # what a scan costs; this is the wall time.
+            timing.record("web scan (wall)", time.monotonic() - started)
             # An empty read may be a page still loading: read it again.
             if elements:
                 confirmed = fresh and cached[1] == elements

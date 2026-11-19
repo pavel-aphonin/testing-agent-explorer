@@ -1532,7 +1532,9 @@ class ExplorationEngine:
             idle_delay = min(idle_delay * OUTCOME_POLL_GROWTH, OUTCOME_POLL_MAX_S)
             await asyncio.sleep(idle_delay)
             fp = native_fingerprint(await self._peek())
-        node = await self._capture_screen()
+        # The last poll has just read the settled screen: no second read
+        # unless it left a web page out.
+        node = await self._capture_screen(reuse=True)
         if (
             self._differs(node, before) and node.screen_id not in self.graph.nodes
             and len(node.interactive_elements) <= 1
@@ -1566,7 +1568,7 @@ class ExplorationEngine:
             node = again
         return node
 
-    async def _capture_screen(self, return_to_app: bool = True) -> ScreenNode:
+    async def _capture_screen(self, return_to_app: bool = True, reuse: bool = False) -> ScreenNode:
         """Capture the current screen state from the device.
 
         If an action took us into another app (testbed run 2: «Открыть
@@ -1574,7 +1576,7 @@ class ExplorationEngine:
         back to the foreground and capture that instead. ``launch_app``
         on a running app only foregrounds it, so the session survives.
         """
-        node = await self._capture_screen_once()
+        node = await self._capture_screen_once(reuse=reuse)
         label = (node.app_label or "").strip()
         if self._app_label is None:
             self._app_label = label or None
@@ -1605,13 +1607,18 @@ class ExplorationEngine:
         await asyncio.sleep(SETTLE_DELAY)
         return await self._capture_screen(return_to_app=False)
 
-    async def _capture_screen_once(self) -> ScreenNode:
+    async def _capture_screen_once(self, reuse: bool = False) -> ScreenNode:
+        """``reuse``: a read of this screen taken a moment ago serves, if it
+        left nothing out (AXe client only; see get_ui_elements)."""
         import time
         try:
             t0 = time.monotonic()
 
             print(f"      [capture] Getting UI elements...", flush=True)
-            elements = await self.controller.get_ui_elements()
+            if reuse and getattr(self.controller, "scan_web_content", None) is not None:
+                elements = await self.controller.get_ui_elements(reuse=True)
+            else:
+                elements = await self.controller.get_ui_elements()
             for delay in EMPTY_CAPTURE_RETRY_DELAYS:
                 if elements:
                     break
