@@ -102,6 +102,8 @@ class ActionDetail(BaseModel):
 # for "nothing left here", not taps.
 WRITTEN_OFF_NOTE = "Written off untried"
 UNREACHABLE_NOTE = "Below the end of scrolling"
+# Failed replays after which an edge is never used again (see GraphEdge.dead).
+MAX_EDGE_FAILURES = 2
 
 
 class GraphEdge(BaseModel):
@@ -117,7 +119,23 @@ class GraphEdge(BaseModel):
     # Failed to replay: the element it taps is gone. One-shot screens leave
     # such edges behind (Wikipedia: «Enable location» answered once).
     stale: bool = False
+    # Replays that failed on this edge since it last worked. At
+    # MAX_EDGE_FAILURES it is dead: no path uses it, not even as the only
+    # way (Wikipedia run 10: «Add some interests» was gone once the agent
+    # had picked interests, and the edge failed 8 times in 4 trips).
+    failures: int = 0
 
+    @property
+    def dead(self) -> bool:
+        return self.failures >= MAX_EDGE_FAILURES
+
+    def replay_failed(self) -> None:
+        self.stale = True
+        self.failures += 1
+
+    def replay_worked(self) -> None:
+        self.stale = False
+        self.failures = 0
 
 class AppGraph(BaseModel):
     """Complete state machine graph of the explored app."""
@@ -222,11 +240,29 @@ class AppGraph(BaseModel):
 
         Stale edges are avoided while any other way exists; with
         ``allow_stale=False`` they are never used (looking for an alternative
-        to a route that just failed)."""
+        to a route that just failed). Dead edges are never used."""
         path = self._find_path(from_id, to_id, avoid_stale=True)
         if path or not allow_stale:
             return path
         return self._find_path(from_id, to_id, avoid_stale=False)
+
+    def reachable_from(self, starts: set[str], include_dead: bool = False) -> set[str]:
+        """Screens some path of live (not dead, unless ``include_dead``)
+        edges leads to from ``starts``, the starts included. Modal closing
+        is not modelled: this is an upper bound, for telling apart screens
+        no route can ever reach."""
+        adj: dict[str, list[str]] = {}
+        for e in self.edges:
+            if include_dead or not e.dead:
+                adj.setdefault(e.source_screen_id, []).append(e.target_screen_id)
+        seen = set(starts)
+        queue = deque(starts)
+        while queue:
+            for target in adj.get(queue.popleft(), []):
+                if target not in seen:
+                    seen.add(target)
+                    queue.append(target)
+        return seen
 
     def _find_path(self, from_id: str, to_id: str, avoid_stale: bool) -> list[GraphEdge] | None:
         if from_id == to_id:
@@ -235,7 +271,7 @@ class AppGraph(BaseModel):
         # Build adjacency: screen_id -> [(edge, target_screen_id)]
         adj: dict[str, list[tuple[GraphEdge, str]]] = {}
         for e in self.edges:
-            if avoid_stale and e.stale:
+            if e.dead or (avoid_stale and e.stale):
                 continue
             if e.source_screen_id not in adj:
                 adj[e.source_screen_id] = []

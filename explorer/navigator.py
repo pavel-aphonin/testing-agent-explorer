@@ -245,8 +245,9 @@ async def replay_path(
             current_id, _ = await capture_fn()
             # The element is gone; find another way from here, once or
             # twice (Wikipedia run: «Map» and «Search» written off because
-            # their only path went through «Enable location»).
-            edge.stale = True
+            # their only path went through «Enable location»). Twice gone
+            # and the edge is dead: no route uses it again (Wikipedia run 10).
+            edge.replay_failed()
             if graph is not None:
                 graph.failed_edge = edge
             landed_id = current_id
@@ -269,7 +270,7 @@ async def replay_path(
             ):
                 on_transition(here, edge.action, landed_id)
             else:
-                edge.stale = False  # it worked after all
+                edge.replay_worked()  # it worked after all
             here = landed_id
         previous = edge
 
@@ -300,7 +301,7 @@ def add_replay_edge(graph: AppGraph, source_id: str, action: ActionDetail, lande
         if e.source_screen_id == source_id and e.action.signature() == signature and (
             e.target_screen_id == landed_id or _is_variant_of(graph, landed_id, e.target_screen_id)
         ):
-            e.stale = False  # seen working again
+            e.replay_worked()  # seen working again
             return False
     graph.add_edge(GraphEdge(
         source_screen_id=source_id, target_screen_id=landed_id, action=action, notes="replay",

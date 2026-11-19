@@ -82,3 +82,33 @@ async def test_new_content_under_the_same_id_is_not_added(tmp_path):
 
     if second.screen_id == first.screen_id:
         assert len(engine.graph.nodes[first.screen_id].interactive_elements) == before
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_pin_on_launch_is_the_stop_reason(tmp_path, monkeypatch):
+    # aweassist run 10: the PIN was «not accepted» twice on the launch
+    # screen; two screens were found and the report said «Stopped early: no».
+    from dataclasses import dataclass
+
+    from explorer.engine import PIN_REJECTED_REASON
+    from tests.test_engine import _KeypadController, _keypad_engine, _no_sleep
+
+    @dataclass
+    class _Locked(_KeypadController):
+        async def terminate_app(self, bundle_id):
+            pass
+
+        async def launch_app(self, bundle_id):
+            pass
+
+        async def go_back(self):
+            return True
+
+    monkeypatch.setattr("explorer.engine.asyncio.sleep", _no_sleep)
+    monkeypatch.setattr("explorer.navigator.asyncio.sleep", _no_sleep)
+    engine = _keypad_engine(tmp_path, _Locked(), test_data={"pin": "9999"})
+    engine.max_steps = 20
+
+    graph = await engine.run()
+
+    assert graph.stop_reason == PIN_REJECTED_REASON

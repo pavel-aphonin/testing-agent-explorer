@@ -143,6 +143,7 @@ OUTAGE_NAV_FAILURES = 3
 # Waits before retrying while the environment is down; then the run stops.
 OUTAGE_WAITS_S = (60.0, 120.0, 240.0)
 ENVIRONMENT_DOWN_REASON = "Environment unavailable"
+PIN_REJECTED_REASON = "PIN not accepted"
 
 # Failure snapshots kept per run (see _diagnose).
 MAX_DIAGNOSTICS = 30
@@ -450,7 +451,32 @@ class ExplorationEngine:
                     frontier = self.archive.best_frontier(
                         exclude_current=self.current_screen_id
                     )
+                    cut_off: set[str] = set()
+                    while (
+                        frontier is not None
+                        and frontier.state_id not in cut_off
+                        and self._cut_off_by_dead_edges(frontier.state_id)
+                    ):
+                        # Only dead edges led there: a trip would fail on
+                        # them again. Settled without one, in this step.
+                        logger.info(
+                            "[Step %d] %s is cut off by dead edges; writing it off without a trip",
+                            step, frontier.state_id[:8],
+                        )
+                        cut_off.add(frontier.state_id)
+                        self._nav_failures[frontier.state_id] = MAX_NAV_FAILURES - 1
+                        self._note_unreachable(frontier.state_id, step)
+                        frontier = self.archive.best_frontier(
+                            exclude_current=self.current_screen_id
+                        )
                     if frontier is None and not unexplored:
+                        if self._pin_failures >= MAX_PIN_FAILURES:
+                            # aweassist run 10: the PIN was «not accepted»
+                            # twice on the launch screen, two screens were
+                            # found and the report said «Stopped early: no».
+                            self.graph.stop_reason = PIN_REJECTED_REASON
+                            logger.warning("PIN not accepted; nothing past the keypad was explored")
+                            break
                         logger.info("No frontier remaining anywhere. Done.")
                         break
                 if frontier is not None:
@@ -1925,6 +1951,21 @@ class ExplorationEngine:
                 return False
             landed = result
         return False
+
+    def _cut_off_by_dead_edges(self, target: str) -> bool:
+        """No live route leads to ``target`` (nor to a variant of it) from
+        here or a launch screen, while routes through dead edges do. Screens
+        no recorded route reaches at all are left to the trip and its Back
+        presses, as before."""
+        if not any(e.dead for e in self.graph.edges):
+            return False
+        starts = set(self.graph.launch_screens)
+        if self.current_screen_id:
+            starts.add(self.current_screen_id)
+        live = self.graph.reachable_from(starts)
+        if target in live or any(self._same_screen(sid, target) for sid in live):
+            return False
+        return target in self.graph.reachable_from(starts, include_dead=True)
 
     def _undo_streak_write_offs(self) -> None:
         """Give back the actions written off during a run of failures that
