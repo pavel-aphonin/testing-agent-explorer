@@ -123,10 +123,17 @@ async def go_back_to_screen(
                 result = await replay_path(
                     controller, path, capture_fn, replay_input, graph, diagnose, on_transition
                 )
-                if result == target_screen_id:
+                if result == target_screen_id or (
+                    result and _is_variant_of(graph, result, target_screen_id)
+                ):
                     return result
-                if result:
-                    here = result
+                # One failed replay per trip from here. Pressing Back again
+                # and replaying from the next screen repeated the same broken
+                # step (Wikipedia run 10: «Add some interests» failed three
+                # times in one step); the relaunch below routes around the
+                # step, now stale.
+                logger.info("Replay from %s did not reach the target; relaunching", new_screen_id[:8])
+                break
 
     # Strategy 2: Relaunch app + replay
     logger.info("Back button failed, relaunching app")

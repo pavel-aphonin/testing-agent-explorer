@@ -288,3 +288,33 @@ async def test_a_stale_twin_is_reset_when_the_transition_is_seen_again():
     assert not add_replay_edge(graph, "A", edge.action, "B")
 
     assert edge.stale is False
+
+
+async def test_a_failed_replay_after_back_goes_to_a_relaunch(monkeypatch):
+    # Wikipedia run 10: Back, replay, the same broken step; Back again,
+    # replay again — «Add some interests» failed three times in one step.
+    class _Counting(_Phone):
+        taps = 0
+        launches = 0
+
+        async def tap_at(self, x, y):
+            self.taps += 1
+            return await super().tap_at(x, y)
+
+        async def launch_app(self, bundle_id):
+            self.launches += 1
+            await super().launch_app(bundle_id)
+
+    graph = _graph([_tap("P", "T")], "C", "Q", "X")
+    phone = _Counting({"P": "X", "Q": "X"}, here="C", back_to={"C": "P", "X": "P"})
+    capture, _ = _run(monkeypatch, graph, phone, [])
+
+    async def fast(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(navigator, "_await_change", fast)
+    monkeypatch.setattr(navigator, "_await_launch", fast)
+    await go_back_to_screen(phone, graph, "C", "T", capture)
+
+    assert phone.taps == 1
+    assert phone.launches == 1
