@@ -16,6 +16,17 @@ SETTLE_DELAY = 1.5
 # Detours tried when a step of a path no longer replays.
 MAX_REROUTES = 2
 LAUNCH_DELAY = 3.0
+# A relaunch waited 1 + 3 s every time: 63 relaunches, 4.2 of 57.7 min on
+# Wikipedia run 10. Now the app's first screen is polled for (_await_launch):
+# its own tree with something to tap, the same in two reads in a row.
+TERMINATE_DELAY = 0.5
+LAUNCH_MIN_S = 1.0
+LAUNCH_POLL_S = 0.5
+LAUNCH_MAX_S = 6.0
+# What a first screen offers; a launch storyboard (splash) offers none.
+_LAUNCH_ACTION_TYPES = frozenset({
+    "Button", "Cell", "Link", "TextField", "SecureTextField", "Switch", "RadioButton", "Tab",
+})
 BACK_DELAY = 1.0
 # Instead of BACK_DELAY and SETTLE_DELAY the screen is polled until it has
 # changed and holds (see _await_change). Fixed waits on replayed steps and
@@ -136,9 +147,9 @@ async def relaunch_and_navigate(
     """Kill app, relaunch, navigate to target via known path."""
     try:
         await controller.terminate_app(graph.app_bundle_id)
-        await asyncio.sleep(1)
+        await asyncio.sleep(TERMINATE_DELAY)
         await controller.launch_app(graph.app_bundle_id)
-        await asyncio.sleep(LAUNCH_DELAY)
+        await _await_launch(controller)
     except Exception as e:
         logger.error(f"Relaunch failed: {e}")
         return None
@@ -170,6 +181,33 @@ async def relaunch_and_navigate(
         controller, path, capture_fn, replay_input, graph, diagnose, on_transition,
         start_as=start_screen_id,
     )
+
+
+async def _await_launch(controller) -> None:
+    """Return once the relaunched app shows its first screen: an app root
+    with a label (SpringBoard's is blank), something to tap (a splash has
+    nothing), and the same native fingerprint in two reads in a row. At
+    most LAUNCH_MAX_S; a controller that cannot read waits LAUNCH_DELAY."""
+    read = getattr(controller, "get_ui_elements", None)
+    if read is None:
+        await asyncio.sleep(LAUNCH_DELAY)
+        return
+    web_scan = getattr(controller, "scan_web_content", None) is not None
+    await asyncio.sleep(LAUNCH_MIN_S)
+    deadline = time.monotonic() + LAUNCH_MAX_S - LAUNCH_MIN_S
+    reads_left = round((LAUNCH_MAX_S - LAUNCH_MIN_S) / LAUNCH_POLL_S)  # and a bound on reads
+    previous = None
+    while time.monotonic() < deadline and reads_left > 0:
+        reads_left -= 1
+        elements = await (read(web=False) if web_scan else read())
+        up = any(
+            e.get("type") == "Application" and (e.get("label") or "").strip() for e in elements
+        ) and any(e.get("type") in _LAUNCH_ACTION_TYPES for e in elements)
+        current = native_fingerprint(elements) if up else None
+        if current is not None and current == previous:
+            return
+        previous = current
+        await asyncio.sleep(LAUNCH_POLL_S)
 
 
 async def replay_path(
