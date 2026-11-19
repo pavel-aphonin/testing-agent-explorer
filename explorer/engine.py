@@ -1708,6 +1708,7 @@ class ExplorationEngine:
         screens) and can be written off as unreachable.
         """
         if node.screen_id in self.graph.nodes:
+            self._add_enabled_actions(self.graph.nodes[node.screen_id], node)
             return node
         known = next((n for n in self.graph.nodes.values() if is_variant(node, n)), None)
         if known is None:
@@ -1721,6 +1722,29 @@ class ExplorationEngine:
         # Stored frames are from another layout; look elements up live.
         self._scrolled_screens.add(known.screen_id)
         return known
+
+    def _add_enabled_actions(self, known: ScreenNode, node: ScreenNode) -> None:
+        """Buttons of a known screen that were disabled when it was recorded
+        and are enabled now become its actions.
+
+        The fingerprint ignores enabled state, so filling a field keeps the
+        screen id and the stored node keeps its old actions (testbed
+        «Поиск»: «Найти» lit up after typing, was never tapped, and the
+        results screen stayed unfound). Only elements the stored node
+        already lists as disabled are added: a feed's new rows under the
+        same id are content, not new actions.
+        """
+        disabled = {action_key(el) for el in known.elements if not el.enabled}
+        if not disabled:
+            return
+        keys = {action_key(el) for el in known.interactive_elements}
+        for el in node.interactive_elements:
+            key = action_key(el)
+            if key in disabled and key not in keys:
+                known.interactive_elements.append(el)
+                self.puct.add_action_if_missing(known.screen_id, action_id_for(el))
+                keys.add(key)
+                print(f"      [capture] {el.label!r} enabled on {known.name!r}", flush=True)
 
     def _tap_failed(self, element: ElementSnapshot, screen_id: str | None) -> None:
         """A tap the simulator never delivered says nothing about the

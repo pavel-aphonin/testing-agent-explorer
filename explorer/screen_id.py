@@ -39,6 +39,9 @@ STRUCTURAL_TYPES = {
 # number of rows still counts.
 LABEL_FREE_TYPES = {"Cell"}
 
+# Tab bar items: AXe reports the selected one with value "1".
+SELECTABLE_TAB_TYPES = {"RadioButton", "Tab"}
+
 # Text that tells one modal from another (see compute_screen_id).
 MODAL_TEXT_TYPES = {"StaticText", "Heading"}
 
@@ -179,6 +182,12 @@ def compute_screen_id(elements: list[dict]) -> str:
         # For structural elements: use type + (normalised) label.
         el_label = el.get("label", "") or ""
         fingerprint_parts.append((el_type, normalize_label(el_label)))
+        if el_type in SELECTABLE_TAB_TYPES and str(el.get("value")) == "1":
+            # The selected tab says which tab root this is. Two roots with
+            # nothing but text of their own (testbed «Лента» / «Избранное»)
+            # were one screen: switching tabs looked like a self-loop and
+            # the second tab was never recorded.
+            fingerprint_parts.append(("SelectedTab", normalize_label(el_label)))
 
     fingerprint_parts.sort()
     canonical = json.dumps(fingerprint_parts, sort_keys=True, separators=(",", ":"))
