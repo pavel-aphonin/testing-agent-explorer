@@ -93,6 +93,8 @@ _TITLE_MAX_LEN = 40
 VARIANT_JACCARD = 0.85
 # Below this many actions a card more or less is a different screen.
 MIN_VARIANT_ACTIONS = 5
+# Fewer actions are one screen only when all of them agree (is_same_family).
+MIN_SAME_ACTIONS = 3
 
 
 def _has_back(node: ScreenNode) -> bool:
@@ -167,6 +169,13 @@ def is_same_family(a: ScreenNode, b: ScreenNode) -> bool:
     # No tab bar (a sheet, a pushed page): the name alone is weak, so the
     # actions must still half agree. A list of topics gains and loses rows.
     ka, kb = _content_actions(a), _content_actions(b)
+    if len(ka) >= MIN_SAME_ACTIONS and ka == kb:
+        # A small sheet with the very same actions (Wikipedia run 11:
+        # «Activity», 4 actions, two ids by its text): too few actions for
+        # the overlap rule, so a replay refused to tap on it 7 times. Not
+        # one or two: a sheet's name often comes from the tab under it, and
+        # two alerts with one «Close» each are not one screen.
+        return True
     if min(len(ka), len(kb)) < MIN_VARIANT_ACTIONS:
         return False
     return len(ka & kb) / len(ka | kb) >= FAMILY_JACCARD

@@ -175,3 +175,20 @@ def test_testbed_screens_are_never_merged(tmp_path):
 
     assert total == 15
     assert merged == [] and kept == 15
+
+
+def test_a_small_sheet_with_the_same_actions_is_one_screen():
+    # Wikipedia run 11: «Activity», 4 actions, two ids; a replay refused to
+    # tap on the second one 7 times.
+    actions = ["Customize", "Done", "Edit", "Learn more"]
+    a = _screen("a", actions, name="Activity", tabs=[], modal=True)
+    b = _screen("b", actions, name="Activity", tabs=[], modal=True)
+
+    assert is_variant(a, b)
+
+
+def test_one_or_two_equal_actions_are_not_enough():
+    a = _screen("a", ["Close"], name="Activity", tabs=[], modal=True)
+    b = _screen("b", ["Close"], name="Activity", tabs=[], modal=True)
+
+    assert not is_variant(a, b)
